@@ -67,6 +67,7 @@ local FocusFeedback = WidgetContainer:extend{
     task = nil,
     last_input_wall = nil,
     last_event_wall = nil,
+    last_page_turn_wall = nil,  -- V9: 仅翻页/标注更新，用于精确判定真正阅读
     last_quote = nil,
     current_banner = nil,
     adoption_page = nil,
@@ -3901,10 +3902,11 @@ function FocusFeedback:_isActiveReading(now)
     if Device.screen_saver_mode then
         return false
     end
-    if not self.last_input_wall then
+    -- V9: 仅翻页/标注视为真正阅读，排除插件交互、调试等非阅读操作
+    if not self.last_page_turn_wall then
         return false
     end
-    return (now - self.last_input_wall) <= IDLE_TIMEOUT_SECONDS
+    return (now - self.last_page_turn_wall) <= IDLE_TIMEOUT_SECONDS
 end
 
 function FocusFeedback:_onActivity(now)
@@ -4161,7 +4163,26 @@ function FocusFeedback:onInputEvent()
     self.last_input_wall = now
     -- 持久化最后阅读时间（用于跨会话弃养检查）
     self:_saveLastReadTime(now)
-    -- V8: 翻页检测（每日任务 l2 判定）
+    -- V8: 翻页检测（每日任务 l2 判定）+ V9: 翻页更新阅读活动时间
+    pcall(function()
+        if self.ui and self.ui.document then
+            local page = self.ui.document:getCurrentPage()
+            if page and page ~= self._last_page then
+                self._last_page = page
+                self.last_page_turn_wall = now  -- V9: 翻页更新阅读活动时间
+                local stat = self:_getDailyStat()
+                stat.pages = (stat.pages or 0) + 1
+                self:_saveDailyStat(stat)
+            end
+        end
+    end)
+    -- V8: 轮询标注数量（onAnnotationsUpdated 在某些阅读器不触发）
+    self:_checkAnnotationCount()
+end
+
+-- V9: 翻页事件（page 模式）— 更可靠地捕获翻页
+function FocusFeedback:onPageUpdate()
+    self.last_page_turn_wall = os.time()
     pcall(function()
         if self.ui and self.ui.document then
             local page = self.ui.document:getCurrentPage()
@@ -4173,12 +4194,16 @@ function FocusFeedback:onInputEvent()
             end
         end
     end)
-    -- V8: 轮询标注数量（onAnnotationsUpdated 在某些阅读器不触发）
-    self:_checkAnnotationCount()
+end
+
+-- V9: 滚动事件（scroll 模式）— 滚动也算阅读活动
+function FocusFeedback:onPosUpdate()
+    self.last_page_turn_wall = os.time()
 end
 
 -- V8: 标注事件回调（每日任务 n3/r2/s5 判定）
 function FocusFeedback:onAnnotationsUpdated()
+    self.last_page_turn_wall = os.time()  -- V9: 标注也算阅读活动
     local stat = self:_getDailyStat()
     stat.notes = (stat.notes or 0) + 1
     self:_saveDailyStat(stat)
@@ -4211,6 +4236,8 @@ function FocusFeedback:onResume()
         -- 更新心情时间戳，防止 _updateMood 重复计算休眠期间的衰减
         self:_saveLastMoodUpdate(os.time())
     end
+    -- V9: 唤醒后需翻页才恢复计时，避免休眠后短暂操作被计入阅读
+    self.last_page_turn_wall = nil
     self:_startTimer()
 end
 
