@@ -1,0 +1,12 @@
+{
+  "version": 10,
+  "files": [
+    "main.lua",
+    "_meta.lua",
+    "event_data.lua",
+    "dialogue_data.lua",
+    "book_data.lua",
+    "sentence_pool.lua",
+    "bookmark_quotes.lua"
+  ]
+}
