@@ -20,7 +20,7 @@ V3 新增：
 - 图鉴双页面：养成书籍 / 读完书籍
 
 V4 新增：
-- 积分系统：里程碑获得积分（1小时前1分，1小时后2分），替代旧食物掉落
+- 积分系统：里程碑获得积分（1小时前1分，1~3h2分，3~5h3分，5h后4分），替代旧食物掉落
 - 商超系统：用积分购买棉花糖/饼干/废纸篓/逗书棒
 - 心情值系统：抚摸/阅读/玩耍增加心情，休眠/碎纸屑衰减心情，10%持续30天弃养
 - 睡觉系统：10%酣睡（需阅读1h苏醒）/20%小盹（需阅读30min苏醒）
@@ -101,7 +101,9 @@ local IDLE_1WEEK_SECONDS = 7 * 24 * 3600
 
 -- V4 积分系统
 local POINTS_BEFORE_1H = 1   -- 1小时前每次里程碑1积分
-local POINTS_AFTER_1H = 2    -- 1小时后每次里程碑2积分
+local POINTS_1H_TO_3H = 2    -- 1~3小时每次里程碑2积分
+local POINTS_3H_TO_5H = 3    -- 3~5小时每次里程碑3积分
+local POINTS_AFTER_5H = 4    -- 5小时后每次里程碑4积分
 
 -- V4 商超价格
 local PRICE_COTTON = 2
@@ -111,7 +113,7 @@ local PRICE_TOY = 5
 
 -- V4 心情值
 local MOOD_PER_PET = 0.1        -- 抚摸+0.1%
-local MOOD_PER_READ_MIN = 0.2   -- 阅读1分钟+0.2%
+local MOOD_PER_READ_MIN = 0.4   -- 阅读1分钟+0.4%
 local MOOD_PER_TOY = 5          -- 逗书棒+5%
 local MOOD_DECAY_SUSPEND = 6    -- 休眠每小时-6%
 local MOOD_DECAY_SCRAPS = 20    -- 碎纸屑时每小时-20%
@@ -168,7 +170,7 @@ local DAILY_TASKS = {
         {id = "n7",  desc = "使用咖啡唤醒书一次"},
         {id = "n8",  desc = "抚摸书5次"},
         {id = "n9",  desc = "使用一次逗书棒"},
-        {id = "n10", desc = "保持今日心情值不低于50%"},
+        {id = "n10", desc = "保持今日心情值≥50%的时间≥14h"},
     },
     rare = {
         {id = "r1",  desc = "今日阅读时长达3h"},
@@ -582,9 +584,25 @@ function FocusFeedback:_readMood()
 end
 function FocusFeedback:_saveMood(m)
     m = math.max(MOOD_MIN, math.min(100, m or 50))
+    local now = os.time()
+    local stat = self:_getDailyStat()
+
+    -- V11: 累计心情≥50%的时长（每日任务 n10）
+    local prev_mood = self:_readMood()
+    local last_accum = G_reader_settings:readSetting(settingKey("v8_mood_last_accum"), 0) or 0
+    if last_accum > 0 then
+        local t = os.date("*t", now)
+        local today_midnight = os.time({year=t.year, month=t.month, day=t.day, hour=0})
+        local start_ts = math.max(last_accum, today_midnight)
+        local elapsed = now - start_ts
+        if elapsed > 0 and prev_mood >= 50 then
+            stat.mood_above_50_secs = (stat.mood_above_50_secs or 0) + elapsed
+        end
+    end
+    G_reader_settings:saveSetting(settingKey("v8_mood_last_accum"), now)
+
     G_reader_settings:saveSetting(settingKey("v4_mood"), m)
     -- V8: 记录当日心情极值（每日任务 n5/n10 判定）
-    local stat = self:_getDailyStat()
     stat.mood_min = math.min(stat.mood_min or m, m)
     stat.mood_max = math.max(stat.mood_max or m, m)
     self:_saveDailyStat(stat)
@@ -870,6 +888,7 @@ function FocusFeedback:_getDailyStat()
             feed_start = self:_readProgress(),  -- 当日初始进度
             mood_min = self:_readMood(),        -- 当日最低心情
             mood_max = self:_readMood(),        -- 当日最高心情
+            mood_above_50_secs = 0,  -- V11: 当日心情≥50%的累计秒数
             session_cur = 0,     -- 当前进行中的单次不间断阅读秒
             session_max = 0,     -- 当日最长单次不间断阅读秒
             pages = 0,           -- 今日翻页数
@@ -971,7 +990,19 @@ function FocusFeedback:_isDailyTaskDone(t, stat, stat_date)
     if id == "n7" then return (stat.coffee or 0) >= 1 end
     if id == "n8" then return (stat.pets or 0) >= 5 end
     if id == "n9" then return (stat.toy or 0) >= 1 end
-    if id == "n10" then return (stat.mood_min or 0) >= 50 end
+    if id == "n10" then
+        -- V11: 心情≥50%的累计时长≥14小时
+        local now = os.time()
+        local last_accum = G_reader_settings:readSetting(settingKey("v8_mood_last_accum"), 0) or 0
+        local extra = 0
+        if last_accum > 0 and self:_readMood() >= 50 then
+            local t = os.date("*t", now)
+            local today_midnight = os.time({year=t.year, month=t.month, day=t.day, hour=0})
+            local start_ts = math.max(last_accum, today_midnight)
+            extra = now - start_ts
+        end
+        return ((stat.mood_above_50_secs or 0) + extra) >= 14 * 3600
+    end
     if id == "r1" then return reading_secs >= sec(3) end
     if id == "r2" then return (stat.notes or 0) >= 5 end
     if id == "r3" then return (stat.session_max or 0) >= sec(2) end
@@ -1369,7 +1400,16 @@ end
 -- 里程碑时获得积分（替换原 _awardFood）
 function FocusFeedback:_awardPoints(minute)
     if not self:_readAdopted() then return end
-    local points = (minute <= 60) and POINTS_BEFORE_1H or POINTS_AFTER_1H
+    local points
+    if minute <= 60 then
+        points = POINTS_BEFORE_1H
+    elseif minute <= 180 then
+        points = POINTS_1H_TO_3H
+    elseif minute <= 300 then
+        points = POINTS_3H_TO_5H
+    else
+        points = POINTS_AFTER_5H
+    end
     -- V7: 小猫在身边时，40%概率积分入账+1
     local pet = self:_readPet()
     if pet.cat and math.random() < 0.4 then
@@ -3934,7 +3974,7 @@ function FocusFeedback:_onActivity(now)
                     local lstat = self:_readLongStat()
                     lstat.read_seconds = (lstat.read_seconds or 0) + diff
                     self:_saveLongStat(lstat)
-                    -- V4: 阅读增加心情值 0.2%/分钟
+                    -- V4: 阅读增加心情值 0.4%/分钟
                     local mood = self:_readMood()
                     mood = math.min(100, mood + (diff / 60) * MOOD_PER_READ_MIN)
                     self:_saveMood(mood)
@@ -4220,17 +4260,46 @@ function FocusFeedback:onResume()
     -- V4: 休眠期间心情衰减
     local suspend_ts = self:_readSuspendTs()
     if suspend_ts and suspend_ts > 0 then
-        local hours = (os.time() - suspend_ts) / 3600
+        local now = os.time()
+        local duration = now - suspend_ts
+        local hours = duration / 3600
         if hours > 0 then
-            local mood = self:_readMood()
+            local start_mood = self:_readMood()
             -- V6: 小兔在身边时，心情值掉落速度×0.5
             local decay = MOOD_DECAY_SUSPEND
             local pet = self:_readPet()
             if pet.rabbit then
                 decay = decay * 0.5
             end
-            mood = math.max(MOOD_MIN, mood - hours * decay)
-            self:_saveMood(mood)
+            local end_mood = math.max(MOOD_MIN, start_mood - hours * decay)
+
+            -- V11: 精确计算休眠期间心情≥50%的时长（线性衰减）
+            local time_above_50 = 0
+            if end_mood >= 50 then
+                time_above_50 = duration
+            elseif start_mood > 50 then
+                -- 心情在休眠中途跌破50%，计算前半段时间
+                time_above_50 = (start_mood - 50) / (start_mood - end_mood) * duration
+            end
+            if time_above_50 > 0 then
+                local stat = self:_getDailyStat()
+                -- 只统计今天的部分（跨午夜时截掉昨天的部分）
+                local t = os.date("*t", now)
+                local today_midnight = os.time({year=t.year, month=t.month, day=t.day, hour=0})
+                if suspend_ts < today_midnight then
+                    -- 休眠跨午夜，只算从午夜开始的部分
+                    local today_duration = now - today_midnight
+                    if time_above_50 > today_duration then
+                        time_above_50 = today_duration
+                    end
+                end
+                stat.mood_above_50_secs = (stat.mood_above_50_secs or 0) + time_above_50
+                self:_saveDailyStat(stat)
+                -- 更新累计时间戳，避免 _saveMood 重复累计
+                G_reader_settings:saveSetting(settingKey("v8_mood_last_accum"), now)
+            end
+
+            self:_saveMood(end_mood)
         end
         self:_saveSuspendTs(0)
         -- 更新心情时间戳，防止 _updateMood 重复计算休眠期间的衰减
@@ -5179,34 +5248,74 @@ function FocusFeedback:_getLocalVersion()
     return 0
 end
 
--- HTTP GET 请求（带超时）
+-- V10: HTTP GET 请求（pcall防崩溃 + 超时设置 + 自动重试）
 function FocusFeedback:_httpGet(url, timeout_sec)
-    local socket = require("socket")
-    local http = require("socket.http")
-    local https = require("ssl.https")
-    local ltn12 = require("ltn12")
-
     timeout_sec = timeout_sec or 15
-    local result = {}
+    local max_retries = 3  -- 共尝试 3 次，解决 Kindle 网络不稳定导致的偶发超时
+    local last_err = "未知错误"
 
-    -- 判断 http 还是 https
-    local request_fn = http.request
-    if url:match("^https://") and https then
-        request_fn = https.request
+    for attempt = 1, max_retries do
+        -- 全程 pcall 包裹，任何异常都不会导致闪退
+        local ok, ret_or_err = pcall(function()
+            local ltn12 = require("ltn12")
+            local http = require("socket.http")
+            local result = {}
+
+            -- 设置网络超时（防止卡死，失败快速返回）
+            pcall(function()
+                local socketutil = require("socketutil")
+                socketutil:set_timeout(timeout_sec, timeout_sec * 2)
+            end)
+
+            -- 判断 http/https
+            local request_fn = http.request
+            if url:match("^https://") then
+                local https_ok, https = pcall(require, "ssl.https")
+                if https_ok and https then
+                    request_fn = https.request
+                end
+            end
+
+            local r, code = request_fn{
+                url = url,
+                sink = ltn12.sink.table(result),
+                method = "GET",
+                headers = { ["User-Agent"] = "KOReader-FocusFeedback" },
+            }
+
+            -- 重置超时
+            pcall(function()
+                local socketutil = require("socketutil")
+                socketutil:reset_timeout()
+            end)
+
+            if code == 200 then
+                return table.concat(result), nil
+            else
+                return nil, string.format("HTTP %s", tostring(code))
+            end
+        end)
+
+        if ok then
+            local body, err = ret_or_err
+            if body then
+                return body, nil
+            end
+            last_err = err or "未知错误"
+        else
+            last_err = tostring(ret_or_err)
+        end
+
+        -- 失败后等待 1 秒再重试（用 socket.select 等待，不阻塞 UI 事件）
+        if attempt < max_retries then
+            pcall(function()
+                local socket = require("socket")
+                socket.select(nil, nil, 1)
+            end)
+        end
     end
 
-    local r, code, headers, status = request_fn{
-        url = url,
-        sink = ltn12.sink.table(result),
-        method = "GET",
-        headers = { ["User-Agent"] = "KOReader-FocusFeedback" },
-    }
-
-    if code == 200 then
-        return table.concat(result), nil
-    else
-        return nil, string.format("HTTP %s", tostring(code))
-    end
+    return nil, string.format("%s\n已自动重试%d次，请检查网络后重试。", last_err, max_retries)
 end
 
 -- 检查更新
