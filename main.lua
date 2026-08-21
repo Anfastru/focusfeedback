@@ -5415,7 +5415,7 @@ function FocusFeedback:addToMainMenu(menu_items)
             {
                 text = "模式",
                 separator = true,
-                sub_item_table = function()
+                sub_item_table_func = function()
                     return self:_buildModeSubmenuItems()
                 end,
             },
@@ -6014,7 +6014,7 @@ function FocusFeedback:_buildModeSubmenuItems()
     -- 长期模式（嵌套菜单，单独存储，可与其他模式共存）
     table.insert(items, {
         text = "长期模式",
-        sub_item_table = function()
+        sub_item_table_func = function()
             return self:_buildLongModeItems()
         end,
     })
@@ -6026,29 +6026,30 @@ function FocusFeedback:_buildModeSubmenuItems()
         {key = MODE_HEARTBEAT, text = "心跳模式"},
     }
     for _, e in ipairs(mode_entries) do
+        local k = e.key  -- Lua5.1: 循环变量共享，必须复制到局部变量供闭包捕获
         table.insert(items, {
             text = e.text,
-            checked_func = function() return self:_getActiveMode() == e.key end,
+            checked_func = function() return self:_getActiveMode() == k end,
             callback = function()
-                if e.key == MODE_CHALLENGE then
+                if k == MODE_CHALLENGE then
                     self:_toggleChallengeMode()
-                elseif e.key == MODE_SLACK then
+                elseif k == MODE_SLACK then
                     self:_toggleSlackMode()
-                elseif e.key == MODE_NIGHT then
+                elseif k == MODE_NIGHT then
                     self:_toggleNightMode()
-                elseif e.key == MODE_HEARTBEAT then
+                elseif k == MODE_HEARTBEAT then
                     self:_toggleHeartbeatMode()
                 end
             end,
         })
         local status
-        if e.key == MODE_CHALLENGE and mode == MODE_CHALLENGE then
+        if k == MODE_CHALLENGE and mode == MODE_CHALLENGE then
             status = self:_getChallengeStatusText()
-        elseif e.key == MODE_SLACK and mode == MODE_SLACK then
+        elseif k == MODE_SLACK and mode == MODE_SLACK then
             status = self:_getSlackStatusText()
-        elseif e.key == MODE_NIGHT and mode == MODE_NIGHT then
+        elseif k == MODE_NIGHT and mode == MODE_NIGHT then
             status = self:_getNightStatusText()
-        elseif e.key == MODE_HEARTBEAT and mode == MODE_HEARTBEAT then
+        elseif k == MODE_HEARTBEAT and mode == MODE_HEARTBEAT then
             status = self:_getHeartbeatStatusText()
         end
         if status then
@@ -6164,7 +6165,7 @@ function FocusFeedback:_settleChallenge()
     else
         -- 失败：寄存积分没收，心情跌落至10
         self:_saveMood(10)
-        self:_showMessage(string.format("挑战失败……\n阅读时长 %s < 目标 %s\n寄存积分%d已被扣除\n心情跌落至10%。",
+        self:_showMessage(string.format("挑战失败……\n阅读时长 %s < 目标 %s\n寄存积分%d已被扣除\n心情跌落至10%%。",
             secondsToText(read), secondsToText(goal), escrow), 10)
     end
     local cd = self:_readCooldowns()
