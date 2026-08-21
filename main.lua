@@ -5412,12 +5412,13 @@ function FocusFeedback:addToMainMenu(menu_items)
                 },
             },
             -- V14: 模式系统
+            -- 注意：旧版 KOReader（v2026.07.2 及更早）的 touchmenu.lua:onMenuSelect 会直接对
+            -- item.sub_item_table 取长度，不支持 sub_item_table_func 字段（点了会崩溃），
+            -- 因此这里必须传入构建好的 table，动态部分用 text_func/checked_func 实现。
             {
                 text = "模式",
                 separator = true,
-                sub_item_table_func = function()
-                    return self:_buildModeSubmenuItems()
-                end,
+                sub_item_table = self:_buildModeSubmenuItems(),
             },
         },
     }
@@ -5971,7 +5972,8 @@ function FocusFeedback:_getCooldownRemain(mode)
     end
     if cooldown <= 0 then return 0 end
     local cd = self:_readCooldowns()
-    local ended = cd[mode] or 0
+    -- 防御：设置里可能是脏数据（字符串时间戳），tonumber 归一化，避免算术/比较崩溃
+    local ended = tonumber(cd[mode]) or 0
     if ended <= 0 then return 0 end
     return math.max(0, ended + cooldown - os.time())
 end
@@ -5979,7 +5981,8 @@ end
 -- 冷却提示弹窗
 function FocusFeedback:_showCooldownMsg(mode, remain)
     local cd = self:_readCooldowns()
-    local ended = cd[mode] or 0
+    -- 防御：脏字符串时间戳归一化，避免算术崩溃
+    local ended = tonumber(cd[mode]) or 0
     local cooldown = 0
     if mode == MODE_CHALLENGE then cooldown = CHALLENGE_COOLDOWN
     elseif mode == MODE_SLACK then cooldown = SLACK_COOLDOWN
@@ -6009,14 +6012,12 @@ end
 
 function FocusFeedback:_buildModeSubmenuItems()
     local items = {}
-    local mode = self:_getActiveMode()
 
     -- 长期模式（嵌套菜单，单独存储，可与其他模式共存）
+    -- 同样避免 sub_item_table_func（旧版 KOReader 不支持），直接传构建好的 table
     table.insert(items, {
         text = "长期模式",
-        sub_item_table_func = function()
-            return self:_buildLongModeItems()
-        end,
+        sub_item_table = self:_buildLongModeItems(),
     })
 
     local mode_entries = {
@@ -6027,8 +6028,28 @@ function FocusFeedback:_buildModeSubmenuItems()
     }
     for _, e in ipairs(mode_entries) do
         local k = e.key  -- Lua5.1: 循环变量共享，必须复制到局部变量供闭包捕获
+        local entry_text = e.text
         table.insert(items, {
-            text = e.text,
+            -- 用 text_func 动态显示状态文本（子菜单只构建一次，必须保证文本实时刷新）
+            text_func = function()
+                local t = entry_text
+                if self:_getActiveMode() == k then
+                    local status
+                    if k == MODE_CHALLENGE then
+                        status = self:_getChallengeStatusText()
+                    elseif k == MODE_SLACK then
+                        status = self:_getSlackStatusText()
+                    elseif k == MODE_NIGHT then
+                        status = self:_getNightStatusText()
+                    elseif k == MODE_HEARTBEAT then
+                        status = self:_getHeartbeatStatusText()
+                    end
+                    if status then
+                        t = t .. "（" .. status .. "）"
+                    end
+                end
+                return t
+            end,
             checked_func = function() return self:_getActiveMode() == k end,
             callback = function()
                 if k == MODE_CHALLENGE then
@@ -6042,19 +6063,6 @@ function FocusFeedback:_buildModeSubmenuItems()
                 end
             end,
         })
-        local status
-        if k == MODE_CHALLENGE and mode == MODE_CHALLENGE then
-            status = self:_getChallengeStatusText()
-        elseif k == MODE_SLACK and mode == MODE_SLACK then
-            status = self:_getSlackStatusText()
-        elseif k == MODE_NIGHT and mode == MODE_NIGHT then
-            status = self:_getNightStatusText()
-        elseif k == MODE_HEARTBEAT and mode == MODE_HEARTBEAT then
-            status = self:_getHeartbeatStatusText()
-        end
-        if status then
-            table.insert(items, {text = "· " .. status})
-        end
     end
     return items
 end
@@ -6407,30 +6415,40 @@ function FocusFeedback:_saveLongMode(long)
 end
 
 -- 长期模式子菜单（4个周期）
+-- 注意：旧版 KOReader 不支持 sub_item_table_func，本函数只会被构建一次，
+-- 因此“进行中/禁用/回调分支”等状态全部改为运行时实时读取
+-- （text_func/enabled_func/callback 在每次渲染或点击时才被调用）。
 function FocusFeedback:_buildLongModeItems()
     local items = {}
-    local long = self:_readLongMode()
-    local active_cycle = long.cycle
-    local is_active = active_cycle ~= nil and not long.settled
 
     for i, cfg in ipairs(LONG_CYCLES) do
         local cycle_idx = i
-        local item = { text = LONG_CYCLE_NAMES[i] }
-        if is_active and cycle_idx == active_cycle then
-            item.text = "▶ " .. LONG_CYCLE_NAMES[i] .. "（进行中）"
-        end
-        if is_active and cycle_idx ~= active_cycle then
-            item.disabled = true
-        end
-        item.callback = function()
-            if is_active and cycle_idx == active_cycle then
-                self:_showLongProgress(cycle_idx)
-            elseif is_active then
-                self:_showMessage("已有长期挑战进行中。\n需等待其结束后才能开启其他周期。", 5)
-            else
-                self:_showLongConfirm(cycle_idx)
-            end
-        end
+        local item = {
+            text_func = function()
+                local long = self:_readLongMode()
+                local is_active = long.cycle ~= nil and not long.settled
+                if is_active and cycle_idx == long.cycle then
+                    return "▶ " .. LONG_CYCLE_NAMES[cycle_idx] .. "（进行中）"
+                end
+                return LONG_CYCLE_NAMES[cycle_idx]
+            end,
+            enabled_func = function()
+                local long = self:_readLongMode()
+                local is_active = long.cycle ~= nil and not long.settled
+                return not (is_active and cycle_idx ~= long.cycle)
+            end,
+            callback = function()
+                local long = self:_readLongMode()
+                local is_active = long.cycle ~= nil and not long.settled
+                if is_active and cycle_idx == long.cycle then
+                    self:_showLongProgress(cycle_idx)
+                elseif is_active then
+                    self:_showMessage("已有长期挑战进行中。\n需等待其结束后才能开启其他周期。", 5)
+                else
+                    self:_showLongConfirm(cycle_idx)
+                end
+            end,
+        }
         table.insert(items, item)
     end
 
@@ -6438,8 +6456,10 @@ function FocusFeedback:_buildLongModeItems()
         text = "查看当前进度",
         separator = true,
         callback = function()
+            local long = self:_readLongMode()
+            local is_active = long.cycle ~= nil and not long.settled
             if is_active then
-                self:_showLongProgress(active_cycle)
+                self:_showLongProgress(long.cycle)
             else
                 self:_showMessage("当前没有进行中的长期挑战。", 4)
             end
