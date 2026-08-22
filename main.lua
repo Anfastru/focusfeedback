@@ -5660,7 +5660,9 @@ function FocusFeedback:_httpGet(url, timeout_sec)
 
     for attempt = 1, max_retries do
         -- 全程 pcall 包裹，任何异常都不会导致闪退
-        local ok, ret_or_err = pcall(function()
+        -- 注意：必须捕获 pcall 的多个返回值（函数可能返回 nil, "HTTP xxx"），
+        -- 否则真实错误码会被丢弃，只显示兜底的"未知错误"
+        local ok, ret1, ret2 = pcall(function()
             local ltn12 = require("ltn12")
             local http = require("socket.http")
             local result = {}
@@ -5701,13 +5703,12 @@ function FocusFeedback:_httpGet(url, timeout_sec)
         end)
 
         if ok then
-            local body, err = ret_or_err
-            if body then
-                return body, nil
+            if ret1 then
+                return ret1, nil
             end
-            last_err = err or "未知错误"
+            last_err = ret2 or "未知错误"
         else
-            last_err = tostring(ret_or_err)
+            last_err = tostring(ret1)
         end
 
         -- 失败后等待 1 秒再重试（用 socket.select 等待，不阻塞 UI 事件）
@@ -5844,19 +5845,39 @@ function FocusFeedback:_httpGetAsync(url, timeout_sec, attempts, on_result)
     try(attempts)
 end
 
--- 检查更新
+-- 检查更新（先弹确认框，可取消）
 function FocusFeedback:_checkUpdate()
     if self.update_busy then
         self:_showMessage("更新操作正在进行中，请稍候…", 3)
         return
     end
-    local ok, err = pcall(function()
-        local base_url = self:_getUpdateSource()
-        if not base_url or base_url == "" then
-            self:_showMessage("未设置更新源。\n请在菜单中设置 GitHub 仓库地址。", 5)
-            return
-        end
+    local base_url = self:_getUpdateSource()
+    if not base_url or base_url == "" then
+        self:_showMessage("未设置更新源。\n请在菜单中设置 GitHub 仓库地址。", 5)
+        return
+    end
+    local local_version = self:_getLocalVersion()
+    local dialog
+    dialog = ButtonDialog:new{
+        title = string.format("检查更新？\n当前版本 V%d\n更新源：\n%s\n\n将连接更新源检查是否有新版本。",
+            local_version, base_url),
+        title_align = "center",
+        buttons = {
+            {
+                {text = "取消", callback = function() UIManager:close(dialog) end},
+                {text = "检查", callback = function()
+                    UIManager:close(dialog)
+                    self:_doCheckUpdate(base_url)
+                end},
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
 
+-- 执行检查（用户在确认框点"检查"后）
+function FocusFeedback:_doCheckUpdate(base_url)
+    local ok, err = pcall(function()
         -- 去掉末尾斜杠
         base_url = base_url:gsub("/$", "")
 
@@ -5895,36 +5916,36 @@ function FocusFeedback:_checkUpdate()
                 return
             end
 
-            -- 发现新版本
-            local dialog
-            dialog = ButtonDialog:new{
-                title = string.format("发现新版本 V%d！\n当前版本 V%d\n是否立即更新？", remote_version, local_version),
-                title_align = "center",
-                buttons = {
-                    {
-                        {
-                            text = "稍后",
-                            callback = function()
-                                UIManager:close(dialog)
-                            end,
-                        },
-                        {
-                            text = "立即更新",
-                            callback = function()
-                                UIManager:close(dialog)
-                                self:_doUpdate(base_url, remote_version)
-                            end,
-                        },
-                    },
-                },
-            }
-            UIManager:show(dialog)
+            -- 发现新版本：先弹确认框（可取消），确认后才开始下载
+            self:_confirmUpdate(base_url, remote_version, local_version)
         end)
     end)
 
     if not ok then
         self:_showMessage(string.format("检查更新出错：\n%s", tostring(err)), 6)
     end
+end
+
+-- 发现新版本：弹确认框（明确告知将下载覆盖文件、需重启，可取消）
+function FocusFeedback:_confirmUpdate(base_url, remote_version, local_version)
+    local dialog
+    dialog = ButtonDialog:new{
+        title = string.format("发现新版本 V%d！\n当前版本 V%d\n\n将下载并覆盖插件文件，\n更新完成后需重启 KOReader 生效。\n是否立即更新？",
+            remote_version, local_version),
+        title_align = "center",
+        buttons = {
+            {
+                {text = "取消", callback = function()
+                    UIManager:close(dialog)
+                end},
+                {text = "立即更新", callback = function()
+                    UIManager:close(dialog)
+                    self:_doUpdate(base_url, remote_version)
+                end},
+            },
+        },
+    }
+    UIManager:show(dialog)
 end
 
 -- 执行更新
