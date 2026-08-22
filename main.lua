@@ -160,12 +160,22 @@ local MODE_CHALLENGE = "challenge"
 local MODE_SLACK = "slack"
 local MODE_NIGHT = "night"
 local MODE_HEARTBEAT = "heartbeat"
+local MODE_DAY = "day"
+local MODE_FLOW = "flow"
+local MODE_SPRINT = "sprint"
+local MODE_SAND = "sand"
+local MODE_DRAW = "draw"
 
 local MODE_NAMES = {
     [MODE_CHALLENGE] = "挑战模式",
     [MODE_SLACK] = "摸鱼模式",
     [MODE_NIGHT] = "夜间模式",
     [MODE_HEARTBEAT] = "心跳模式",
+    [MODE_DAY] = "白天模式",
+    [MODE_FLOW] = "心流模式",
+    [MODE_SPRINT] = "短跑模式",
+    [MODE_SAND] = "沙漏模式",
+    [MODE_DRAW] = "抽签模式",
 }
 
 -- 挑战模式常量
@@ -178,8 +188,31 @@ local SLACK_MAX_DURATION = 30 * 24 * 3600  -- 最多30天
 local SLACK_COOLDOWN = 7 * 24 * 3600        -- 冷却7天
 
 -- 夜间模式常量
-local NIGHT_DURATION = 24 * 3600            -- 承诺约24小时
+local NIGHT_DURATION = 24 * 3600            -- 一个完整昼夜周期
 local NIGHT_CLOSE_WINDOW = 1 * 3600         -- 手动关闭窗口±1小时
+
+-- 白天模式常量（镜像夜间，时段相反）
+local DAY_START_HOUR = 6                    -- 白昼区间 6:00-18:00
+local DAY_END_HOUR = 18
+local DAY_DURATION = 24 * 3600              -- 与夜间同为 24h 周期
+
+-- 心流模式常量
+local FLOW_TIER_SEC = 30 * 60               -- 每持续30分钟一档
+local FLOW_RESUME_GRACE = 2 * 60            -- 退出文档/休眠/熄屏后2分钟内回来不算断
+
+-- 短跑模式常量（挑战Lite）
+local SPRINT_GOAL_MAX_H = 5                 -- 目标时长上限随挑战规则放宽（此处为建议值）
+local SPRINT_WINDOW = 5 * 3600              -- 开启后5小时内读完目标
+local SPRINT_COOLDOWN = 72 * 3600           -- 冷却72小时
+local SPRINT_MIN_GOAL_H = 1                 -- 目标最少1小时
+
+-- 沙漏模式常量
+local SAND_MAX_GOAL_SEC = 3 * 3600          -- 目标累计时长 ≤3小时
+local SAND_DURATION = 24 * 3600             -- 周期24h倍数才可关闭
+
+-- 抽签模式常量
+local DRAW_DURATION = 7 * 86400             -- 每次开启持续7天
+local DRAW_COOLDOWN = 20 * 86400            -- 冷却20天
 
 -- 心跳模式常量
 local HEARTBEAT_DURATION = 72 * 3600        -- 72小时后自动关闭
@@ -1466,6 +1499,24 @@ function FocusFeedback:_awardPoints(minute)
         return
     end
 
+    -- V14 心流模式：里程碑停发，仅按单次持续阅读达标给分（30min=2,60min=3…每30min+1）
+    if mode == MODE_FLOW then
+        local fm = self:_readModeState()
+        local fstat = self:_getDailyStat()
+        local sess_min = math.floor((fstat.session_cur or 0) / 60)
+        local cur_level = math.floor(sess_min / 30)
+        local granted = fm.flow_awarded or 0
+        if cur_level > granted then
+            local gain = cur_level + 1
+            fm.flow_awarded = cur_level
+            self:_saveModeState(fm)
+            local fcur = self:_readPoints()
+            self:_savePoints(fcur + gain)
+            self:_showMessage(string.format("心流满分！持续阅读%d分钟，积分+%d", sess_min, gain), 4)
+        end
+        return
+    end
+
     local points
     if minute <= 60 then
         points = POINTS_BEFORE_1H
@@ -1477,6 +1528,17 @@ function FocusFeedback:_awardPoints(minute)
         points = POINTS_AFTER_5H
     end
 
+    -- 抽签当日效果（积分维度）：下签无积分 / 上上双倍 / 上吉·中下每里程碑必+1
+    -- 注：抽签与其他模式互斥，此处 mode 只会是 DRAW 或长期共存态
+    local draw_fx = self:_drawEffect()
+    if draw_fx == "no_gain" then
+        points = 0
+    elseif draw_fx == "super_double" then
+        points = points * 2
+    elseif draw_fx == "all_bonus" or draw_fx == "iron_bowl" then
+        points = points + 1
+    end
+
     -- V14 心跳模式：猜中当日里程碑大幅加成，猜错无积分
     if mode == MODE_HEARTBEAT then
         local m = self:_readModeState()
@@ -1486,28 +1548,49 @@ function FocusFeedback:_awardPoints(minute)
             logger.info("FocusFeedback V14 heartbeat: miss, no points")
             return
         end
+    elseif mode == MODE_SAND then
+        -- V14 沙漏模式：累计使用未超限量时必+1，超限后无额外加成
+        local sdm = self:_readModeState()
+        if (sdm.sand_read or 0) <= (sdm.sand_goal_sec or 0) then
+            points = points + 1
+        end
     else
-        -- V14 夜间模式：夜晚(18:00-3:00)里程碑+1（不依赖养猫）；白天猫加成被没收
-        if mode == MODE_NIGHT then
-            if self:_isNightTime() then
+        -- V14 夜间/白天模式：各自时段内里程碑+1（不依赖养猫概率），时段外无猫加成
+        if mode == MODE_NIGHT or mode == MODE_DAY then
+            local in_window = (mode == MODE_NIGHT and self:_isNightTime())
+                or (mode == MODE_DAY and self:_isDayTime())
+            if in_window then
                 points = points + 1
             end
         else
             -- V7: 小猫在身边时，40%概率积分入账+1
             -- V14: 挑战模式下小猫加成概率提到100%（必+1）
+            -- 抽签：中吉「猫之眷顾」40%→80%，中平「猫的眼神」40%→41%
             local pet = self:_readPet()
-            if pet.cat and (mode == MODE_CHALLENGE or math.random() < 0.4) then
+            local cat_chance = 0.4
+            local fxc = self:_drawEffect()
+            if fxc == "cat_love" then
+                cat_chance = 0.8
+            elseif fxc == "cat_eye" then
+                cat_chance = 0.41
+            end
+            if pet.cat and fxc ~= "no_gain" and (mode == MODE_CHALLENGE or mode == MODE_SPRINT or math.random() < cat_chance) then
                 points = points + 1
             end
         end
     end
 
-    -- V14 挑战模式：所得全部进寄存
-    if mode == MODE_CHALLENGE then
+    -- V14 挑战/短跑模式：所得全部进寄存（挑战寄存ch_escrow，短跑寄存spr_escrow）
+    if mode == MODE_CHALLENGE or mode == MODE_SPRINT then
         local m = self:_readModeState()
-        m.ch_escrow = (m.ch_escrow or 0) + points
+        if mode == MODE_CHALLENGE then
+            m.ch_escrow = (m.ch_escrow or 0) + points
+            logger.info("FocusFeedback V14 challenge: escrow +" .. points, "total:", m.ch_escrow)
+        else
+            m.spr_escrow = (m.spr_escrow or 0) + points
+            logger.info("FocusFeedback V14 sprint: escrow +" .. points, "total:", m.spr_escrow)
+        end
         self:_saveModeState(m)
-        logger.info("FocusFeedback V14 challenge: escrow +" .. points, "total:", m.ch_escrow)
         return
     end
 
@@ -1596,7 +1679,17 @@ function FocusFeedback:_updateMood()
         end
     end
 
-    -- V14 低落免疫卡：维持下限90%
+    -- 抽签当日效果（心情维度）：上上满格 / 下签锁死10% / 中吉底线50%
+    local draw_fx = self:_drawEffect()
+    if draw_fx == "happy_day" then
+        mood = 100
+    elseif draw_fx == "depression" then
+        mood = MOOD_MIN
+    elseif draw_fx == "mood_floor" then
+        mood = math.max(50, mood)
+    end
+
+    -- V14 低落免疫卡：维持下限90%（免疫卡优先于负面签运，花钱买的道具能抵抗下签）
     if immune_until > now then
         mood = math.max(90, mood)
     end
@@ -2080,6 +2173,42 @@ end
 
 -- ========== V4 商超界面 ==========
 
+-- 抽签模式动态价格覆盖（仅当日生效，猫/兔永不参与变价）
+function FocusFeedback:_shopPrice(key)
+    local fx = self:_drawEffect()
+    if key == "cat" or key == "rabbit" then
+        return (key == "cat") and PRICE_CAT or PRICE_RABBIT
+    end
+    local base = 2
+    if key == "cotton" then base = PRICE_COTTON
+    elseif key == "biscuit" then base = PRICE_BISCUIT
+    elseif key == "wastebasket" then base = PRICE_WASTEBASKET
+    elseif key == "toy" then base = PRICE_TOY
+    elseif key == "coffee" then base = PRICE_COFFEE
+    elseif key == "clover" then base = PRICE_CLOVER end
+    if fx == "black_friday" then return 1 end             -- 上上④ 全场1分
+    if fx == "rich_area" then return 100 end              -- 下④ 全场100分
+    if fx == "gray_friday" then return (base >= 3) and 3 or base end  -- 上吉④ ≥3→3
+    if fx == "ash_friday" then return (base >= 5) and 5 or base end   -- 中吉④ ≥5→5
+    if fx == "white_friday" then return (base <= 5) and 5 or base end -- 中下④ ≤5→5
+    if fx == "small_use" then
+        return self:_drawDiscountItem() == key and 5 or base          -- 中平④ 随机一件→5
+    end
+    return base  -- 十折/无事/未抽签 → 原价
+end
+
+-- 中平签「有点小用」：当日随机一件物品（除猫兔）价格变为5积分，固定当日记住
+-- 抽到高价物品是降价优惠，抽到低价物品则提价——中平签有好有坏，反而是一种平衡
+function FocusFeedback:_drawDiscountItem()
+    local d = self:_readDrawDay()
+    if not d.discount_key then
+        local pool = {"cotton", "biscuit", "wastebasket", "toy", "coffee", "clover"}
+        d.discount_key = pool[math.random(#pool)]
+        self:_saveDrawDay(d)
+    end
+    return d.discount_key
+end
+
 -- 加载商超图标
 function FocusFeedback:_loadShopIcon(filename, display_size)
     if not self.plugin_dir then return nil end
@@ -2115,16 +2244,16 @@ function FocusFeedback:_showShop()
     local points = self:_readPoints()
     local avail_w = Screen:getWidth() * 0.85
 
-    -- V6: 商超物品数据（2×4 布局，上排基础物品，下排新增）
+    -- V6: 商超物品数据（2×4 布局，上排基础物品，下排新增）；价格走抽签动态覆盖 _shopPrice
     local shop_items = {
-        {key = "cotton", name = "棉花糖", price = PRICE_COTTON, icon = "shop_cotton.jpg"},
-        {key = "biscuit", name = "饼干", price = PRICE_BISCUIT, icon = "shop_biscuit.jpg"},
-        {key = "wastebasket", name = "废纸篓", price = PRICE_WASTEBASKET, icon = "shop_wastebasket.jpg"},
-        {key = "toy", name = "逗书棒", price = PRICE_TOY, icon = "shop_toy.jpg"},
-        {key = "coffee", name = "咖啡", price = PRICE_COFFEE, icon = "shop_coffee.jpg"},
-        {key = "clover", name = "四叶草", price = PRICE_CLOVER, icon = "shop_clover.jpg"},
-        {key = "cat", name = "小猫", price = PRICE_CAT, icon = "shop_cat.jpg", pet = "cat", pet_dialogue = "我终于不是野书了，我被小猫收养了＞＜！"},
-        {key = "rabbit", name = "小兔", price = PRICE_RABBIT, icon = "shop_rabbit.jpg", pet = "rabbit", pet_dialogue = "呕兔就像喝水一样简单！"},
+        {key = "cotton", name = "棉花糖", price = self:_shopPrice("cotton"), icon = "shop_cotton.jpg"},
+        {key = "biscuit", name = "饼干", price = self:_shopPrice("biscuit"), icon = "shop_biscuit.jpg"},
+        {key = "wastebasket", name = "废纸篓", price = self:_shopPrice("wastebasket"), icon = "shop_wastebasket.jpg"},
+        {key = "toy", name = "逗书棒", price = self:_shopPrice("toy"), icon = "shop_toy.jpg"},
+        {key = "coffee", name = "咖啡", price = self:_shopPrice("coffee"), icon = "shop_coffee.jpg"},
+        {key = "clover", name = "四叶草", price = self:_shopPrice("clover"), icon = "shop_clover.jpg"},
+        {key = "cat", name = "小猫", price = self:_shopPrice("cat"), icon = "shop_cat.jpg", pet = "cat", pet_dialogue = "我终于不是野书了，我被小猫收养了＞＜！"},
+        {key = "rabbit", name = "小兔", price = self:_shopPrice("rabbit"), icon = "shop_rabbit.jpg", pet = "rabbit", pet_dialogue = "呕兔就像喝水一样简单！"},
     }
 
     -- 构建内容：标题 + 2×4图标网格
@@ -2215,16 +2344,16 @@ function FocusFeedback:_showShop()
 
     local buttons = {
         {
-            {text = "棉花糖 2", callback = function() buyItem(shop_items[1]) end},
-            {text = "饼干 3", callback = function() buyItem(shop_items[2]) end},
-            {text = "废纸篓 3", callback = function() buyItem(shop_items[3]) end},
-            {text = "逗书棒 5", callback = function() buyItem(shop_items[4]) end},
+            {text = string.format("%s %d", shop_items[1].name, shop_items[1].price), callback = function() buyItem(shop_items[1]) end},
+            {text = string.format("%s %d", shop_items[2].name, shop_items[2].price), callback = function() buyItem(shop_items[2]) end},
+            {text = string.format("%s %d", shop_items[3].name, shop_items[3].price), callback = function() buyItem(shop_items[3]) end},
+            {text = string.format("%s %d", shop_items[4].name, shop_items[4].price), callback = function() buyItem(shop_items[4]) end},
         },
         {
-            {text = "咖啡 8", callback = function() buyItem(shop_items[5]) end},
-            {text = "四叶草 10", callback = function() buyItem(shop_items[6]) end},
-            {text = "小猫 50", callback = function() buyItem(shop_items[7]) end},
-            {text = "小兔 35", callback = function() buyItem(shop_items[8]) end},
+            {text = string.format("%s %d", shop_items[5].name, shop_items[5].price), callback = function() buyItem(shop_items[5]) end},
+            {text = string.format("%s %d", shop_items[6].name, shop_items[6].price), callback = function() buyItem(shop_items[6]) end},
+            {text = string.format("%s %d", shop_items[7].name, shop_items[7].price), callback = function() buyItem(shop_items[7]) end},
+            {text = string.format("%s %d", shop_items[8].name, shop_items[8].price), callback = function() buyItem(shop_items[8]) end},
         },
         {
             {text = "退出", callback = function() UIManager:close(dialog) end},
@@ -4125,6 +4254,17 @@ function FocusFeedback:_onActivity(now)
                         local m = self:_readModeState()
                         m.ch_reading_sec = (m.ch_reading_sec or 0) + diff
                         self:_saveModeState(m)
+                    elseif v14_mode == MODE_SPRINT then
+                        local m = self:_readModeState()
+                        m.spr_read = (m.spr_read or 0) + diff
+                        self:_saveModeState(m)
+                        if m.spr_read >= (m.spr_goal_sec or math.huge) then
+                            self:_settleSprint()
+                        end
+                    elseif v14_mode == MODE_SAND then
+                        local m = self:_readModeState()
+                        m.sand_read = (m.sand_read or 0) + diff
+                        self:_saveModeState(m)
                     end
                     local long = self:_readLongMode()
                     if long.cycle and not long.settled then
@@ -4147,6 +4287,10 @@ function FocusFeedback:_onActivity(now)
                             UIManager:show(self:_buildCoinFlipDialog())
                         end
                     end
+                    if v14_mode == MODE_DRAW then
+                        -- 抽签模式：每日首次阅读触发今日抽签弹窗（未抽签时）
+                        self:_showDrawDialog()
+                    end
                 end)
                 -- 累计领养期间的阅读时长
                 if self:_readAdopted() then
@@ -4156,8 +4300,19 @@ function FocusFeedback:_onActivity(now)
                     lstat.read_seconds = (lstat.read_seconds or 0) + diff
                     self:_saveLongStat(lstat)
                     -- V4: 阅读增加心情值 0.4%/分钟
+                    -- 抽签当日效果（心情增长维度）：上吉翻倍 / 中下减半 / 满格·锁死兜底
                     local mood = self:_readMood()
-                    mood = math.min(100, mood + (diff / 60) * MOOD_PER_READ_MIN)
+                    local mood_rate = MOOD_PER_READ_MIN
+                    local mfx = self:_drawEffect()
+                    if mfx == "luxury_joy" then
+                        mood_rate = mood_rate * 2
+                    elseif mfx == "blue_book" then
+                        mood_rate = mood_rate * 0.5
+                    end
+                    mood = math.min(100, mood + (diff / 60) * mood_rate)
+                    if mfx == "happy_day" then mood = 100
+                    elseif mfx == "depression" then mood = MOOD_MIN
+                    elseif mfx == "mood_floor" then mood = math.max(50, mood) end
                     self:_saveMood(mood)
                 end
                 -- V8: 长期任务「连续阅读」天数更新（昨天连续则+1，中断则归1，当天只计一次）
@@ -4192,7 +4347,16 @@ function FocusFeedback:_onActivity(now)
     else
         -- V8: 阅读中断，单次不间断时长归零
         local stat = self:_getDailyStat()
-        stat.session_cur = 0
+        if self:_getActiveMode() == MODE_FLOW then
+            -- 心流模式：退出文档/休眠/熄屏后 FLOW_RESUME_GRACE(2分钟)内回来不算断
+            local last_act = self.last_page_turn_wall
+            local since = last_act and (now - last_act) or math.huge
+            if since > FLOW_RESUME_GRACE then
+                stat.session_cur = 0
+            end
+        else
+            stat.session_cur = 0
+        end
         self:_saveDailyStat(stat)
     end
 
@@ -4456,8 +4620,12 @@ function FocusFeedback:onResume()
                 self:_saveMood(60)
             else
             local start_mood = self:_readMood()
-            -- V6: 小兔在身边时，心情值掉落速度×0.5
+            -- 碎纸屑期间按快速掉落速率（20%/h），否则按休眠速率（6%/h）
             local decay = MOOD_DECAY_SUSPEND
+            if self:_readScrapsState().active then
+                decay = MOOD_DECAY_SCRAPS
+            end
+            -- V6: 小兔在身边时，心情值掉落速度×0.5
             local pet = self:_readPet()
             if pet.rabbit then
                 decay = decay * 0.5
@@ -4498,7 +4666,10 @@ function FocusFeedback:onResume()
         self:_saveLastMoodUpdate(os.time())
     end
     -- V9: 唤醒后需翻页才恢复计时，避免休眠后短暂操作被计入阅读
-    self.last_page_turn_wall = nil
+    -- 心流模式保留 last_page_turn_wall，用于「2分钟内回来不算断」的缓冲判定
+    if self:_getActiveMode() ~= MODE_FLOW then
+        self.last_page_turn_wall = nil
+    end
     self:_startTimer()
 end
 
@@ -5176,18 +5347,36 @@ function FocusFeedback:_checkRandomEvents()
         {key = "fly_away",    chance = EVT_FLY_AWAY_CHANCE,    enabled = toggles.fly_away,    trigger = function() return self:_triggerFlyAway() end},
     }
 
+    local draw_fx = self:_drawEffect()
     for _, evt in ipairs(tick_events) do
         if evt.enabled then
-            -- V6: 四叶草生效期间，书飞走不触发（跳过负面事件）
-            -- V14: 摸鱼模式负面事件不出现
+            local is_good = (evt.key ~= "fly_away")
+            -- V6: 四叶草生效期间，书飞走不触发；V14: 摸鱼模式负面事件不出现
             local slack_mode = (self:_getActiveMode() == MODE_SLACK)
-            if (clover and evt.key == "fly_away") or (slack_mode and evt.key == "fly_away") then
+            -- 抽签中下「被掠夺者」：书飞走必触发（无视四叶草/摸鱼的跳过）
+            local skip_fly = (clover or slack_mode) and evt.key == "fly_away"
+            if draw_fx == "robbed" and evt.key == "fly_away" then
+                skip_fly = false
+            end
+            -- 抽签下签「好事绝缘」：不触发任何正面事件
+            if (draw_fx == "no_good" and is_good) or skip_fly then
                 -- 跳过
             else
                 local chance = evt.chance
                 -- V6: 四叶草生效期间，正面事件概率×2
                 if clover then
                     chance = chance * 2
+                end
+                -- 抽签上上「必有好事」/上吉「好事将至」：正面事件必触发
+                -- 抽签中吉「好事翻倍」：正面事件概率×2
+                if (draw_fx == "good_news" or draw_fx == "good_luck") and is_good then
+                    chance = 1
+                elseif draw_fx == "near_good" and is_good then
+                    chance = chance * 2
+                end
+                -- 抽签中下「被掠夺者」：书飞走必触发
+                if draw_fx == "robbed" and evt.key == "fly_away" then
+                    chance = 1
                 end
                 if math.random() < chance then
                     -- 检查是否为首次随机事件
@@ -5533,8 +5722,134 @@ function FocusFeedback:_httpGet(url, timeout_sec)
     return nil, string.format("%s\n已自动重试%d次，请检查网络后重试。", last_err, max_retries)
 end
 
+-- V15: 单次非阻塞 HTTP GET。
+-- 原理：socket.http/ssl.https 的 create() + loop(0.05) 每 50ms 轮询一次，
+-- 每轮之间通过 UIManager:scheduleIn 让出 UI 事件循环，网络请求期间界面不冻结、
+-- 弹窗能正常渲染，彻底解决"网络差时点更新卡死必须重启"的问题。
+-- 回调 on_result(body, err)：body 非 nil 表示成功。
+function FocusFeedback:_httpGetOnceAsync(url, timeout_sec, on_result)
+    timeout_sec = timeout_sec or 15
+    local start = os.time()
+    local req = nil
+    local sink_tbl = {}
+    local finished = false
+
+    local function finish(body, err)
+        if finished then return end
+        finished = true
+        on_result(body, err)
+    end
+
+    -- 创建请求对象；若 create 接口不可用，回退到同步请求（在定时器里执行，不阻塞点击回调）
+    local ok_create = pcall(function()
+        local request_fn
+        if url:match("^https://") then
+            local https_ok, https = pcall(require, "ssl.https")
+            if not (https_ok and https and https.create) then
+                error("ssl.https.create 不可用")
+            end
+            request_fn = https.create
+        else
+            local http_ok, http = pcall(require, "socket.http")
+            if not (http_ok and http and http.create) then
+                error("socket.http.create 不可用")
+            end
+            request_fn = http.create
+        end
+        req = request_fn{
+            url = url,
+            method = "GET",
+            headers = { ["User-Agent"] = "KOReader-FocusFeedback" },
+            sink = ltn12.sink.table(sink_tbl),
+        }
+        if req and req.settimeout then
+            pcall(function()
+                req:settimeout(timeout_sec)
+            end)
+        end
+    end)
+
+    if not ok_create then
+        UIManager:scheduleIn(0.05, function()
+            local body, err = self:_httpGet(url, timeout_sec)
+            finish(body, err)
+        end)
+        return
+    end
+
+    local function step()
+        if finished then return end
+
+        -- 总超时保护（防止任何情况下无限轮询）
+        if os.time() - start > timeout_sec then
+            pcall(function()
+                if req then req:done() end
+            end)
+            finish(nil, string.format("请求超时（超过 %d 秒）", timeout_sec))
+            return
+        end
+
+        local ok, r1, r2 = pcall(function()
+            return req:loop(0.05)
+        end)
+        if not ok then
+            finish(nil, tostring(r1))
+            return
+        end
+
+        if r1 == nil then
+            -- 未完成：仅 "timeout" 表示正常等待，继续轮询并让出 UI 事件循环；
+            -- 其他错误立即返回，避免空转到总超时
+            if r2 == "timeout" or r2 == nil then
+                UIManager:scheduleIn(0.05, step)
+            else
+                finish(nil, r2)
+            end
+            return
+        end
+
+        -- 完成：r1 = HTTP 状态码
+        if tonumber(r1) == 200 then
+            finish(table.concat(sink_tbl), nil)
+        else
+            finish(nil, "HTTP " .. tostring(r1))
+        end
+    end
+
+    UIManager:scheduleIn(0.01, step)
+end
+
+-- V15: 带自动重试的非阻塞 GET（串行重试，重试等待同样让出事件循环）
+function FocusFeedback:_httpGetAsync(url, timeout_sec, attempts, on_result)
+    attempts = attempts or 2
+    local last_err = "未知错误"
+
+    local function try(remaining)
+        self:_httpGetOnceAsync(url, timeout_sec, function(body, err)
+            if body then
+                on_result(body, nil)
+            else
+                last_err = err or "未知错误"
+                if remaining > 1 then
+                    UIManager:scheduleIn(1.0, function()
+                        try(remaining - 1)
+                    end)
+                else
+                    on_result(nil, string.format("%s\n已重试%d次，请检查网络后重试。", last_err, attempts))
+                end
+            end
+        end)
+    end
+
+    try(attempts)
+end
+
 -- 检查更新
 function FocusFeedback:_checkUpdate()
+    if self.update_busy then
+        self:_showMessage("更新操作正在进行中，请稍候…", 3)
+        return
+    end
     local ok, err = pcall(function()
         local base_url = self:_getUpdateSource()
         if not base_url or base_url == "" then
@@ -5545,55 +5860,66 @@ function FocusFeedback:_checkUpdate()
         -- 去掉末尾斜杠
         base_url = base_url:gsub("/$", "")
 
-        self:_showMessage("正在检查更新…", 2)
+        self.update_busy = true
 
-        -- 下载 version.json
+        -- 立即弹"检查中"提示（timeout=0 不自动关闭，结果出来后手动关闭）
+        local checking = InfoMessage:new{
+            text = "正在检查更新…\n请稍候",
+            timeout = 0,
+        }
+        UIManager:show(checking)
+
+        -- 下载 version.json（非阻塞，期间 UI 正常响应）
         local version_url = base_url .. "/version.json"
-        local body, http_err = self:_httpGet(version_url, 15)
+        self:_httpGetAsync(version_url, 15, 2, function(body, http_err)
+            -- 先释放 busy，避免后续逻辑异常导致锁死
+            self.update_busy = false
+            UIManager:close(checking)
 
-        if not body then
-            self:_showMessage(string.format("检查更新失败：\n%s\n\n请确认网络和更新源地址是否正确。", http_err or "未知错误"), 6)
-            return
-        end
+            if not body then
+                self:_showMessage(string.format("检查更新失败：\n%s\n\n请确认网络和更新源地址是否正确。", http_err or "未知错误"), 6)
+                return
+            end
 
-        -- 解析 JSON（简单解析，不依赖外部库）
-        local remote_version = tonumber(body:match('"version"%s*:%s*"?([0-9]+)"?'))
-        if not remote_version then
-            self:_showMessage("无法解析远端版本号。\n请确认 version.json 格式正确。", 5)
-            return
-        end
+            -- 解析 JSON（简单解析，不依赖外部库）
+            local remote_version = tonumber(body:match('"version"%s*:%s*"?([0-9]+)"?'))
+            if not remote_version then
+                self:_showMessage("无法解析远端版本号。\n请确认 version.json 格式正确。", 5)
+                return
+            end
 
-        local local_version = self:_getLocalVersion()
+            local local_version = self:_getLocalVersion()
 
-        if remote_version <= local_version then
-            self:_showMessage(string.format("当前已是最新版本 V%d。", local_version), 3)
-            return
-        end
+            if remote_version <= local_version then
+                self:_showMessage(string.format("当前已是最新版本 V%d。", local_version), 3)
+                return
+            end
 
-        -- 发现新版本
-        local dialog
-        dialog = ButtonDialog:new{
-            title = string.format("发现新版本 V%d！\n当前版本 V%d\n是否立即更新？", remote_version, local_version),
-            title_align = "center",
-            buttons = {
-                {
+            -- 发现新版本
+            local dialog
+            dialog = ButtonDialog:new{
+                title = string.format("发现新版本 V%d！\n当前版本 V%d\n是否立即更新？", remote_version, local_version),
+                title_align = "center",
+                buttons = {
                     {
-                        text = "稍后",
-                        callback = function()
-                            UIManager:close(dialog)
-                        end,
-                    },
-                    {
-                        text = "立即更新",
-                        callback = function()
-                            UIManager:close(dialog)
-                            self:_doUpdate(base_url, remote_version)
-                        end,
+                        {
+                            text = "稍后",
+                            callback = function()
+                                UIManager:close(dialog)
+                            end,
+                        },
+                        {
+                            text = "立即更新",
+                            callback = function()
+                                UIManager:close(dialog)
+                                self:_doUpdate(base_url, remote_version)
+                            end,
+                        },
                     },
                 },
-            },
-        }
-        UIManager:show(dialog)
+            }
+            UIManager:show(dialog)
+        end)
     end)
 
     if not ok then
@@ -5603,6 +5929,10 @@ end
 
 -- 执行更新
 function FocusFeedback:_doUpdate(base_url, remote_version)
+    if self.update_busy then
+        self:_showMessage("更新操作正在进行中，请稍候…", 3)
+        return
+    end
     local ok, err = pcall(function()
         -- 需要下载的文件列表
         local files = {
@@ -5619,40 +5949,86 @@ function FocusFeedback:_doUpdate(base_url, remote_version)
         local success_count = 0
         local fail_count = 0
         local fail_list = {}
+        local total = #files
 
-        for _, fname in ipairs(files) do
-            local url = base_url .. "/" .. fname
-            local body, http_err = self:_httpGet(url, 30)
-            if body and #body > 0 then
-                -- 写入本地文件
-                local dest = plugin_dir .. fname
-                local f = io.open(dest, "w")
-                if f then
-                    f:write(body)
-                    f:close()
-                    success_count = success_count + 1
-                else
-                    fail_count = fail_count + 1
-                    table.insert(fail_list, fname)
-                end
+        self.update_busy = true
+
+        -- 立即弹下载进度弹窗（timeout=0 不自动关闭，完成后手动关闭）
+        local progress = InfoMessage:new{
+            text = string.format("正在下载更新…\n(0/%d)", total),
+            timeout = 0,
+        }
+        UIManager:show(progress)
+
+        local function updateProgress()
+            UIManager:close(progress)
+            progress = InfoMessage:new{
+                text = string.format("正在下载更新…\n(%d/%d)", success_count + fail_count, total),
+                timeout = 0,
+            }
+            UIManager:show(progress)
+        end
+
+        local function finishUpdate()
+            self.update_busy = false
+            UIManager:close(progress)
+
+            if fail_count == 0 then
+                -- 更新本地版本号
+                G_reader_settings:saveSetting(settingKey("last_update_version"), remote_version)
+                self:_showMessage(string.format("更新完成！\n成功更新 %d 个文件。\n请重启 KOReader 使更新生效。", success_count), 8)
             else
-                fail_count = fail_count + 1
-                table.insert(fail_list, fname)
+                local msg = string.format("更新部分失败。\n成功 %d 个，失败 %d 个。\n失败文件：%s\n建议重试或手动更新。",
+                    success_count, fail_count, table.concat(fail_list, ", "))
+                self:_showMessage(msg, 8)
             end
         end
 
-        if fail_count == 0 then
-            -- 更新本地版本号
-            G_reader_settings:saveSetting(settingKey("last_update_version"), remote_version)
-            self:_showMessage(string.format("更新完成！\n成功更新 %d 个文件。\n请重启 KOReader 使更新生效。", success_count), 8)
-        else
-            local msg = string.format("更新部分失败。\n成功 %d 个，失败 %d 个。\n失败文件：%s\n建议重试或手动更新。",
-                success_count, fail_count, table.concat(fail_list, ", "))
-            self:_showMessage(msg, 8)
+        -- 逐个文件串行下载（非阻塞，每个文件完成后更新进度并下载下一个）
+        local i = 1
+        local function downloadNext()
+            if i > total then
+                finishUpdate()
+                return
+            end
+
+            local fname = files[i]
+            local url = base_url .. "/" .. fname
+            self:_httpGetAsync(url, 15, 2, function(body, http_err)
+                local ok2, err2 = pcall(function()
+                    i = i + 1
+                    if body and #body > 0 then
+                        local dest = plugin_dir .. fname
+                        local f = io.open(dest, "w")
+                        if f then
+                            f:write(body)
+                            f:close()
+                            success_count = success_count + 1
+                        else
+                            fail_count = fail_count + 1
+                            table.insert(fail_list, fname)
+                        end
+                    else
+                        fail_count = fail_count + 1
+                        table.insert(fail_list, fname)
+                    end
+                    updateProgress()
+                end)
+                if not ok2 then
+                    -- 单文件处理异常：中止更新，释放 busy
+                    self.update_busy = false
+                    UIManager:close(progress)
+                    self:_showMessage(string.format("更新出错：\n%s", tostring(err2)), 8)
+                    return
+                end
+                downloadNext()
+            end)
         end
+        downloadNext()
     end)
 
     if not ok then
+        self.update_busy = false
         self:_showMessage(string.format("更新出错：\n%s", tostring(err)), 8)
     end
 end
@@ -5960,6 +6336,68 @@ function FocusFeedback:_isNightTime()
     return hh >= 18 or hh < 3
 end
 
+-- 白昼时间：6:00 - 18:00（白天模式的加成时段，与夜间镜像）
+function FocusFeedback:_isDayTime()
+    local hh = tonumber(os.date("%H")) or 0
+    return hh >= DAY_START_HOUR and hh < DAY_END_HOUR
+end
+
+-- 昼夜模式周期可关闭窗口（夜间/白天共用）
+-- 可关闭窗口位于：开启时刻 ±1h，以及每个 24h 周期边界 ±1h；其余时间锁定
+-- 返回 table：{closable=true, from=相对秒, to=相对秒} 或 {closable=false, next_from=相对秒, next_to=相对秒}
+function FocusFeedback:_cycleWindow(duration, window)
+    local m = self:_readModeState()
+    local started = tonumber(m.started_at) or 0
+    if started <= 0 then
+        return { closable = true, from = 0, to = window }
+    end
+    local now = os.time()
+    local elapsed = now - started
+    local k = math.floor(elapsed / duration)
+    for i = math.max(0, k - 1), k + 1 do
+        local center = i * duration
+        if elapsed >= center - window and elapsed <= center + window then
+            return { closable = true, from = center - window, to = center + window }
+        end
+    end
+    local next_center = (k + 1) * duration
+    return { closable = false, next_from = next_center - window, next_to = next_center + window }
+end
+
+-- 昼夜模式状态文本：可关闭时显示剩余时间，锁定中显示下次可关闭窗口时段
+function FocusFeedback:_cycleStatusText(mode)
+    local duration = NIGHT_DURATION
+    if mode == MODE_DAY then duration = DAY_DURATION
+    elseif mode == MODE_SAND then duration = SAND_DURATION end
+    local m = self:_readModeState()
+    local started = tonumber(m.started_at) or os.time()
+    local w = self:_cycleWindow(duration, NIGHT_CLOSE_WINDOW)
+    if w.closable then
+        local remain = (started + w.to) - os.time()
+        return string.format("可关闭（剩余%s）", fmtClock(math.max(0, remain)))
+    end
+    -- 用 os.date 显示绝对时钟，跨天时仍反映"每天的这个时段"
+    local f = os.date("%H:%M", started + w.next_from)
+    local t = os.date("%H:%M", started + w.next_to)
+    return string.format("锁定中，下次可关 %s–%s", f, t)
+end
+
+-- 统一进入模式入口：互斥校验 + 可选猫门槛校验
+function FocusFeedback:_canEnterMode(mode, need_cat)
+    if self:_getActiveMode() then
+        self:_showMessage("当前已有其他模式进行中。\n模式互斥，请等待其结束后再开启。", 6)
+        return false
+    end
+    if need_cat then
+        local pet = self:_readPet()
+        if not pet.cat then
+            self:_showMessage((MODE_NAMES[mode] or "该模式") .. "需要养猫后才能开启。\n先去商超买一只小猫吧！", 6)
+            return false
+        end
+    end
+    return true
+end
+
 -- 返回某模式的剩余冷却秒数（0 表示可开启）
 function FocusFeedback:_getCooldownRemain(mode)
     local cooldown = 0
@@ -5969,6 +6407,10 @@ function FocusFeedback:_getCooldownRemain(mode)
         cooldown = SLACK_COOLDOWN
     elseif mode == MODE_HEARTBEAT then
         cooldown = HEARTBEAT_COOLDOWN
+    elseif mode == MODE_SPRINT then
+        cooldown = SPRINT_COOLDOWN
+    elseif mode == MODE_DRAW then
+        cooldown = DRAW_COOLDOWN
     end
     if cooldown <= 0 then return 0 end
     local cd = self:_readCooldowns()
@@ -5986,7 +6428,9 @@ function FocusFeedback:_showCooldownMsg(mode, remain)
     local cooldown = 0
     if mode == MODE_CHALLENGE then cooldown = CHALLENGE_COOLDOWN
     elseif mode == MODE_SLACK then cooldown = SLACK_COOLDOWN
-    elseif mode == MODE_HEARTBEAT then cooldown = HEARTBEAT_COOLDOWN end
+    elseif mode == MODE_HEARTBEAT then cooldown = HEARTBEAT_COOLDOWN
+    elseif mode == MODE_SPRINT then cooldown = SPRINT_COOLDOWN
+    elseif mode == MODE_DRAW then cooldown = DRAW_COOLDOWN end
     local next_ok = ended + cooldown
     local remain_txt = string.format("%d天%d小时%d分",
         math.floor(remain / 86400), math.floor((remain % 86400) / 3600), math.floor((remain % 3600) / 60))
@@ -6024,6 +6468,11 @@ function FocusFeedback:_buildModeSubmenuItems()
         {key = MODE_CHALLENGE, text = "挑战模式"},
         {key = MODE_SLACK, text = "摸鱼模式"},
         {key = MODE_NIGHT, text = "夜间模式"},
+        {key = MODE_DAY, text = "白天模式"},
+        {key = MODE_FLOW, text = "心流模式"},
+        {key = MODE_SPRINT, text = "短跑模式"},
+        {key = MODE_SAND, text = "沙漏模式"},
+        {key = MODE_DRAW, text = "抽签模式"},
         {key = MODE_HEARTBEAT, text = "心跳模式"},
     }
     for _, e in ipairs(mode_entries) do
@@ -6041,6 +6490,16 @@ function FocusFeedback:_buildModeSubmenuItems()
                         status = self:_getSlackStatusText()
                     elseif k == MODE_NIGHT then
                         status = self:_getNightStatusText()
+                    elseif k == MODE_DAY then
+                        status = self:_getDayStatusText()
+                    elseif k == MODE_FLOW then
+                        status = self:_getFlowStatusText()
+                    elseif k == MODE_SPRINT then
+                        status = self:_getSprintStatusText()
+                    elseif k == MODE_SAND then
+                        status = self:_getSandStatusText()
+                    elseif k == MODE_DRAW then
+                        status = self:_getDrawStatusText()
                     elseif k == MODE_HEARTBEAT then
                         status = self:_getHeartbeatStatusText()
                     end
@@ -6058,6 +6517,16 @@ function FocusFeedback:_buildModeSubmenuItems()
                     self:_toggleSlackMode()
                 elseif k == MODE_NIGHT then
                     self:_toggleNightMode()
+                elseif k == MODE_DAY then
+                    self:_toggleDayMode()
+                elseif k == MODE_FLOW then
+                    self:_toggleFlowMode()
+                elseif k == MODE_SPRINT then
+                    self:_toggleSprintMode()
+                elseif k == MODE_SAND then
+                    self:_toggleSandMode()
+                elseif k == MODE_DRAW then
+                    self:_toggleDrawMode()
                 elseif k == MODE_HEARTBEAT then
                     self:_toggleHeartbeatMode()
                 end
@@ -6093,8 +6562,7 @@ function FocusFeedback:_toggleChallengeMode()
         self:_showCooldownMsg(MODE_CHALLENGE, remain)
         return
     end
-    if self:_getActiveMode() then
-        self:_showMessage("当前已有其他模式进行中。\n模式互斥，请等待其结束后再开启。", 6)
+    if not self:_canEnterMode(MODE_CHALLENGE, true) then
         return
     end
     self:_showChallengeSetup()
@@ -6250,24 +6718,20 @@ end
 -- ========== V14 夜间模式 ==========
 
 function FocusFeedback:_getNightStatusText()
-    local m = self:_readModeState()
-    local remain = math.max(0, (m.started_at or 0) + NIGHT_DURATION - os.time())
-    return string.format("剩余%s，%d分钟内可手动关闭", fmtClock(remain), NIGHT_CLOSE_WINDOW / 60)
+    return self:_cycleStatusText(MODE_NIGHT)
 end
 
 function FocusFeedback:_toggleNightMode()
     if self:_getActiveMode() == MODE_NIGHT then
-        local m = self:_readModeState()
-        local elapsed = os.time() - (m.started_at or 0)
-        if elapsed <= NIGHT_CLOSE_WINDOW then
+        local w = self:_cycleWindow(NIGHT_DURATION, NIGHT_CLOSE_WINDOW)
+        if w.closable then
             self:_confirmCloseNight()
         else
-            self:_showMessage("已过手动关闭窗口（开始后±1小时）。\n夜间模式将持续满24小时自动关闭。", 6)
+            self:_showMessage("夜间模式正处于锁定中。\n" .. self:_cycleStatusText(MODE_NIGHT), 6)
         end
         return
     end
-    if self:_getActiveMode() then
-        self:_showMessage("当前已有其他模式进行中。\n模式互斥，请等待其结束后再开启。", 6)
+    if not self:_canEnterMode(MODE_NIGHT, true) then
         return
     end
     self:_confirmStartNight()
@@ -6276,7 +6740,7 @@ end
 function FocusFeedback:_confirmStartNight()
     local dialog
     dialog = ButtonDialog:new{
-        title = "开启夜间模式？\n承诺持续约24小时：\n· 夜晚(18:00-3:00)里程碑积分+1\n· 白天阅读将失去小猫的+1加成\n开启1小时内可手动关闭，之后不可中途结束",
+        title = "开启夜间模式？（需要先养小猫哦）\n· 一个完整昼夜周期约24小时\n· 夜晚(18:00-3:00)里程碑积分+1\n· 白天阅读将失去小猫的+1加成\n· 开启后倚「可关闭窗口」手动结束，不会自动关",
         title_align = "center",
         buttons = {
             {
@@ -6284,7 +6748,7 @@ function FocusFeedback:_confirmStartNight()
                     UIManager:close(dialog)
                     local m = { mode = MODE_NIGHT, started_at = os.time() }
                     self:_saveModeState(m)
-                    self:_showMessage("夜间模式已开启！\n持续约24小时后自动关闭。", 6)
+                    self:_showMessage("夜间模式已开启！\n一个昼夜周期后将进入「可关闭」窗口。", 6)
                 end},
                 {text = "取消", callback = function() UIManager:close(dialog) end},
             },
@@ -6303,6 +6767,273 @@ function FocusFeedback:_confirmCloseNight()
                 {text = "关闭", callback = function()
                     UIManager:close(dialog)
                     self:_closeMode(MODE_NIGHT)
+                end},
+                {text = "取消", callback = function() UIManager:close(dialog) end},
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+-- ========== V14 白天模式 ==========
+
+function FocusFeedback:_getDayStatusText()
+    return self:_cycleStatusText(MODE_DAY)
+end
+
+function FocusFeedback:_toggleDayMode()
+    if self:_getActiveMode() == MODE_DAY then
+        local w = self:_cycleWindow(DAY_DURATION, NIGHT_CLOSE_WINDOW)
+        if w.closable then
+            self:_confirmCloseDay()
+        else
+            self:_showMessage("白天模式正处于锁定中。\n" .. self:_cycleStatusText(MODE_DAY), 6)
+        end
+        return
+    end
+    if not self:_canEnterMode(MODE_DAY, true) then
+        return
+    end
+    self:_confirmStartDay()
+end
+
+function FocusFeedback:_confirmStartDay()
+    local dialog
+    dialog = ButtonDialog:new{
+        title = "开启白天模式？（需要先养小猫哦）\n· 一个完整昼夜周期约24小时\n· 白昼(6:00-18:00)里程碑积分+1\n· 夜晚阅读将失去小猫的+1加成\n· 开启后倚「可关闭窗口」手动结束，不会自动关",
+        title_align = "center",
+        buttons = {
+            {
+                {text = "开启", callback = function()
+                    UIManager:close(dialog)
+                    local m = { mode = MODE_DAY, started_at = os.time() }
+                    self:_saveModeState(m)
+                    self:_showMessage("白天模式已开启！\n一个昼夜周期后将进入「可关闭」窗口。", 6)
+                end},
+                {text = "取消", callback = function() UIManager:close(dialog) end},
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function FocusFeedback:_confirmCloseDay()
+    local dialog
+    dialog = ButtonDialog:new{
+        title = "手动关闭白天模式？\n关闭后即可重新选择模式。",
+        title_align = "center",
+        buttons = {
+            {
+                {text = "关闭", callback = function()
+                    UIManager:close(dialog)
+                    self:_closeMode(MODE_DAY)
+                end},
+                {text = "取消", callback = function() UIManager:close(dialog) end},
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+-- ========== V14 心流模式 ==========
+
+function FocusFeedback:_getFlowStatusText()
+    local stat = self:_getDailyStat()
+    local sess = math.floor((stat.session_cur or 0) / 60)
+    return string.format("持续%d分钟，可随时关闭", sess)
+end
+
+function FocusFeedback:_toggleFlowMode()
+    if self:_getActiveMode() == MODE_FLOW then
+        self:_closeMode(MODE_FLOW)
+        return
+    end
+    if not self:_canEnterMode(MODE_FLOW, false) then return end
+    self:_confirmStartFlow()
+end
+
+function FocusFeedback:_confirmStartFlow()
+    local dialog
+    dialog = ButtonDialog:new{
+        title = "开启心流模式？\n· 阅读时不产生里程碑积分\n· 单次持续阅读达标给分：\n  30分钟+2 / 60分钟+3 / 90分钟+4（每30分钟+1）\n· 翻页/划笔记、插件内操作不断连\n· 退出文档/熄屏≤2分钟回来不断连，超时要重来\n· 随时可关闭，无冷却",
+        title_align = "center",
+        buttons = {
+            {
+                {text = "开启", callback = function()
+                    UIManager:close(dialog)
+                    local m = { mode = MODE_FLOW, started_at = os.time(), flow_awarded = 0 }
+                    self:_saveModeState(m)
+                    self:_showMessage("心流模式已开启！\n开始你的持续阅读吧。", 6)
+                end},
+                {text = "取消", callback = function() UIManager:close(dialog) end},
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+-- ========== V14 短跑模式 ==========
+
+function FocusFeedback:_getSprintStatusText()
+    local m = self:_readModeState()
+    local remain = math.max(0, (m.started_at or 0) + SPRINT_WINDOW - os.time())
+    return string.format("已读%s / 目标%s，剩余%s", secondsToText(m.spr_read or 0), secondsToText(m.spr_goal_sec or 0), fmtClock(remain))
+end
+
+function FocusFeedback:_toggleSprintMode()
+    if self:_getActiveMode() == MODE_SPRINT then
+        self:_showMessage("短跑模式进行中。\n" .. self:_getSprintStatusText(), 6)
+        return
+    end
+    local remain = self:_getCooldownRemain(MODE_SPRINT)
+    if remain > 0 then
+        self:_showCooldownMsg(MODE_SPRINT, remain)
+        return
+    end
+    if not self:_canEnterMode(MODE_SPRINT, true) then return end
+    self:_showSprintSetup()
+end
+
+function FocusFeedback:_showSprintSetup()
+    local dialog
+    dialog = InputDialog:new{
+        title = "短跑模式：设定目标\n（需在开启后5小时内读完，推荐1-5小时）",
+        input = "2",
+        input_hint = "输入目标小时数",
+        buttons = {
+            {
+                {text = "取消", callback = function() UIManager:close(dialog) end},
+                {text = "开始短跑", is_enter_default = true, callback = function()
+                    local txt = dialog:getInputText()
+                    local goal_h = tonumber(txt)
+                    UIManager:close(dialog)
+                    if not goal_h or goal_h < SPRINT_MIN_GOAL_H then
+                        self:_showMessage("目标小时数需≥" .. SPRINT_MIN_GOAL_H .. "，请重新设置。", 5)
+                        return
+                    end
+                    goal_h = math.floor(goal_h)
+                    if goal_h > 24 then goal_h = 24 end
+                    self:_startSprint(goal_h)
+                end},
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function FocusFeedback:_startSprint(goal_h)
+    local m = {
+        mode = MODE_SPRINT,
+        started_at = os.time(),
+        spr_goal_sec = goal_h * 3600,
+        spr_read = 0,
+        spr_escrow = 0,
+        spr_settled = false,
+    }
+    self:_saveModeState(m)
+    self:_showMessage(string.format("短跑开始！\n目标：5小时内阅读%d小时，积分将寄存，末尾统一发放。", goal_h), 7)
+end
+
+-- 短跑结算（成功：寄存积分入账+奖励3件套；失败：清零+心情10%）
+function FocusFeedback:_settleSprint()
+    local m = self:_readModeState()
+    if m.mode ~= MODE_SPRINT or m.spr_settled then return end
+    local goal = m.spr_goal_sec or 0
+    local read = m.spr_read or 0
+    local escrow = m.spr_escrow or 0
+    m.spr_settled = true
+    self:_saveModeState(m)
+    local now = os.time()
+    if read >= goal then
+        local cur = self:_readPoints()
+        self:_savePoints(cur + escrow)
+        local inv = self:_readInventory()
+        inv.cotton = (inv.cotton or 0) + 1
+        inv.biscuit = (inv.biscuit or 0) + 1
+        inv.wastebasket = (inv.wastebasket or 0) + 1
+        self:_saveInventory(inv)
+        self:_showMessage(string.format("短跑成功！\n阅读 %s ≥ 目标 %s\n寄存积分%d已入账\n奖励：棉花糖、饼干、废纸篓各×1",
+            secondsToText(read), secondsToText(goal), escrow), 8)
+    else
+        self:_saveMood(10)
+        self:_showMessage(string.format("短跑失败……\n阅读 %s < 目标 %s\n寄存积分%d已清零，心情跌落至10%%。",
+            secondsToText(read), secondsToText(goal), escrow), 8)
+    end
+    local cd = self:_readCooldowns()
+    cd[MODE_SPRINT] = now
+    self:_saveCooldowns(cd)
+    self:_saveModeState({})
+end
+
+-- ========== V14 沙漏模式 ==========
+
+function FocusFeedback:_getSandStatusText()
+    local m = self:_readModeState()
+    local goal = m.sand_goal_sec or 0
+    local used = math.min(goal, m.sand_read or 0)
+    return string.format("已用%s / 限量%s %s", secondsToText(used), secondsToText(goal), self:_cycleStatusText(MODE_SAND))
+end
+
+function FocusFeedback:_toggleSandMode()
+    if self:_getActiveMode() == MODE_SAND then
+        local w = self:_cycleWindow(SAND_DURATION, NIGHT_CLOSE_WINDOW)
+        if w.closable then
+            self:_confirmCloseSand()
+        else
+            self:_showMessage("沙漏模式正处于锁定中。\n" .. self:_cycleStatusText(MODE_SAND), 6)
+        end
+        return
+    end
+    if not self:_canEnterMode(MODE_SAND, true) then return end
+    self:_showSandSetup()
+end
+
+function FocusFeedback:_showSandSetup()
+    local dialog
+    dialog = InputDialog:new{
+        title = "沙漏模式：设定累计阅读时长\n（≤3小时，可分散累计；周期满24h倍数才可关闭）",
+        input = "1",
+        input_hint = "输入累计小时数(≤3)",
+        buttons = {
+            {
+                {text = "取消", callback = function() UIManager:close(dialog) end},
+                {text = "开始沙漏", is_enter_default = true, callback = function()
+                    local txt = dialog:getInputText()
+                    local goal_h = tonumber(txt)
+                    UIManager:close(dialog)
+                    if not goal_h or goal_h <= 0 or goal_h > 3 then
+                        self:_showMessage("目标需在0-3小时之间，请重新设置。", 5)
+                        return
+                    end
+                    self:_startSand(goal_h)
+                end},
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function FocusFeedback:_startSand(goal_h)
+    local m = {
+        mode = MODE_SAND,
+        started_at = os.time(),
+        sand_goal_sec = goal_h * 3600,
+        sand_read = 0,
+    }
+    self:_saveModeState(m)
+    self:_showMessage(string.format("沙漏已启动！\n设定累计阅读%d小时，期间积分必+1，超限后不再加成。", goal_h), 7)
+end
+
+function FocusFeedback:_confirmCloseSand()
+    local dialog
+    dialog = ButtonDialog:new{
+        title = "手动关闭沙漏模式？\n关闭后即可重新选择模式。",
+        title_align = "center",
+        buttons = {
+            {
+                {text = "关闭", callback = function()
+                    UIManager:close(dialog)
+                    self:_closeMode(MODE_SAND)
                 end},
                 {text = "取消", callback = function() UIManager:close(dialog) end},
             },
@@ -6634,6 +7365,250 @@ end
 
 -- ========== V14 模式自动检查 ==========
 
+-- ========== V14 抽签模式 ==========
+-- 六签权重（上上15 / 上吉20 / 中吉20 / 中平10 / 中下20 / 下15）
+local DRAW_WEIGHTS = {15, 20, 20, 10, 20, 15}
+-- 每签4效果（key + 最终文案，固定台词与效果介绍连成一句；占位词「书的昵称」展示时替换）
+local DRAW_EFFECTS = {
+    {
+        {"super_double", "恭喜抽中上上签-超级加倍，书的昵称已被你貔貅般的运气吓哭……今日阅读积分双倍！"},
+        {"happy_day", "恭喜抽中上上签-happy day，书的昵称已被你貔貅般的运气吓哭……今日心情持续满格！"},
+        {"good_news", "恭喜抽中上上签-好事来袭，书的昵称已被你貔貅般的运气吓哭……今日必有好事！"},
+        {"black_friday", "恭喜抽中上上签-黑色星期五，书的昵称已被你貔貅般的运气吓哭……今日商超物品一律1积分！"},
+    },
+    {
+        {"all_bonus", "恭喜抽中上吉签-全天加成，今天运气超级好，快去刮彩票。今日每个里程碑必+1！"},
+        {"luxury_joy", "恭喜抽中上吉签-极速愉悦，今天运气超级好，快去刮彩票。今日心情增长翻倍！"},
+        {"good_luck", "恭喜抽中上吉签-好事将至，今天运气超级好，快去刮彩票。今日好运迎面而来！"},
+        {"gray_friday", "恭喜抽中上吉签-灰色星期五，今天运气超级好，快去刮彩票。今日较贵物品降至3积分！"},
+    },
+    {
+        {"cat_love", "恭喜抽中中吉签-猫之眷顾，今天运气不错呀！今日小猫加成提升至80%！"},
+        {"mood_floor", "恭喜抽中中吉签-心情底线，今天运气不错呀！今日心情底线提升至50%！"},
+        {"near_good", "恭喜抽中中吉签-好事临近，今天运气不错呀！今日好事翻倍！"},
+        {"ash_friday", "恭喜抽中中吉签-灰白星期五，今天运气不错呀！今日较贵物品降至5积分！"},
+    },
+    {
+        {"nothing", "恭喜抽中中平签-无事发生，今天运气一般般……今日阅读如同回到那个插件停留在v9的时候，很平静，很幸福……"},
+        {"cat_eye", "恭喜抽中中平签-猫的眼神，今天运气一般般……今日小猫加成+1%！"},
+        {"ten_discount", "恭喜抽中中平签-十折优惠！今天运气一般般……但可以在商超里享受原价的优惠~"},
+        {"small_use", "恭喜抽中中平签-有点小用，今天运气一般般……今日商超随机一件物品降至5积分！"},
+    },
+    {
+        {"iron_bowl", "恭喜抽中中下签-公务员一般的铁饭碗，今日运气有点烂、、今日每个里程碑必+1！"},
+        {"blue_book", "恭喜抽中中下签-忧郁小书，今日运气有点烂、、今日心情增长减半！"},
+        {"robbed", "恭喜抽中中下签-被掠夺者，今日运气有点烂、、今日必遇书飞走与被掠夺！"},
+        {"white_friday", "恭喜抽中中下签-白色星期五，今日运气有点烂、、今日低价物品提价至5积分！"},
+    },
+    {
+        {"no_gain", "恭喜抽中下签-越努力越心酸，今日运气超级烂，不要轻举妄动谢谢。今日阅读无任何积分！"},
+        {"depression", "恭喜抽中下签-抑郁症晚期，今日运气超级烂，不要轻举妄动谢谢。今日心情锁死10%！"},
+        {"no_good", "恭喜抽中下签-好事绝缘中，今日运气超级烂，不要轻举妄动谢谢。今日不遇任何好事！"},
+        {"rich_area", "恭喜抽中下签-误入富人区，今日运气超级烂，不要轻举妄动谢谢。今日商超物价一律100积分！"},
+    },
+}
+
+function FocusFeedback:_readDrawDay()
+    local ok, v = pcall(function()
+        return G_reader_settings:readSetting(settingKey("v14_draw_day"), {})
+    end)
+    if ok and type(v) == "table" then return v end
+    return {}
+end
+function FocusFeedback:_saveDrawDay(d)
+    G_reader_settings:saveSetting(settingKey("v14_draw_day"), d or {})
+end
+
+-- 当前生效效果 key（仅当抽签激活且当日已抽签时返回；否则 nil）
+function FocusFeedback:_drawEffect()
+    if self:_getActiveMode() ~= MODE_DRAW then return nil end
+    local d = self:_readDrawDay()
+    if d.date ~= todayKey() then return nil end
+    return d.fx
+end
+
+-- 双重抽取：一层按六签权重抽签，二层在该签4效果里随机1个作为今日唯一效果
+function FocusFeedback:_rollDraw()
+    local total = 0
+    for _, w in ipairs(DRAW_WEIGHTS) do total = total + w end
+    local r = math.random() * total
+    local sign_idx = 1
+    local acc = 0
+    for i, w in ipairs(DRAW_WEIGHTS) do
+        acc = acc + w
+        if r <= acc then sign_idx = i break end
+    end
+    local pick = DRAW_EFFECTS[sign_idx][math.random(#DRAW_EFFECTS[sign_idx])]
+    local fx, text = pick[1], pick[2]
+    local nn = self:_readNickname()
+    if nn == "" then nn = "这本未命名之书" end
+    text = string.gsub(text, "书的昵称", nn)
+    local d = { date = todayKey(), fx = fx, sign = sign_idx, text = text }
+    self:_saveDrawDay(d)
+    return d
+end
+
+-- 抽签弹窗（每日首次阅读自动弹出；开启时立即抽今日第一签）
+function FocusFeedback:_showDrawDialog()
+    -- 防止同一时刻重复弹窗（用户在操作签筒前不叠加新弹窗）
+    -- 兜底：若上次弹窗已超过10分钟未操作（如切书/休眠导致弹窗被系统关闭），视为已关闭可重弹
+    if self.draw_dialog_open then
+        if self.draw_dialog_at and os.time() - self.draw_dialog_at < 600 then
+            return
+        end
+        self.draw_dialog_open = false
+    end
+    local d = self:_readDrawDay()
+    if d.date == todayKey() then
+        return
+    end
+    self.draw_dialog_open = true
+    self.draw_dialog_at = os.time()
+    local nn = self:_readNickname()
+    if nn == "" then nn = "这本未命名之书" end
+    local dialog
+    local function close_draw_dialog()
+        self.draw_dialog_open = false
+        UIManager:close(dialog)
+    end
+    dialog = ButtonDialog:new{
+        title = "书捡到一个神秘小签筒……来为今日读书运势抽支签吧！\n\n「" .. nn .. "」今日运势",
+        title_align = "center",
+        buttons = {
+            {
+                {text = "抽签", callback = function()
+                    close_draw_dialog()
+                    local rd = self:_rollDraw()
+                    self:_showMessage("== " .. rd.text, 10)
+                end},
+                {text = "明日再说", callback = function()
+                    close_draw_dialog()
+                    -- 今日不抽=无签效果
+                    self:_saveDrawDay({ date = todayKey() })
+                end},
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function FocusFeedback:_getDrawStatusText()
+    local m = self:_readModeState()
+    local remain = math.max(0, (m.started_at or 0) + DRAW_DURATION - os.time())
+    local d = self:_readDrawDay()
+    if d.date == todayKey() and d.fx then
+        return string.format("剩余%d天，今日已抽签", math.floor(remain / 86400) + 1)
+    end
+    return string.format("剩余%d天，今日待抽签", math.floor(remain / 86400) + 1)
+end
+
+function FocusFeedback:_toggleDrawMode()
+    if self:_getActiveMode() == MODE_DRAW then
+        self:_showDrawInfo()
+        return
+    end
+    local remain = self:_getCooldownRemain(MODE_DRAW)
+    if remain > 0 then
+        self:_showCooldownMsg(MODE_DRAW, remain)
+        return
+    end
+    if not self:_canEnterMode(MODE_DRAW, true) then return end
+    self:_confirmStartDraw()
+end
+
+-- 抽签模式进行中：点击菜单项显示今日签运详情
+function FocusFeedback:_showDrawInfo()
+    local m = self:_readModeState()
+    local remain = math.max(0, (m.started_at or 0) + DRAW_DURATION - os.time())
+    local remain_days = math.floor(remain / 86400) + 1
+    local d = self:_readDrawDay()
+    local dialog
+    local title
+    local buttons
+    if d.date == todayKey() and d.fx then
+        -- 今日已抽签：显示签型 + 效果详情
+        local sign_names = {"上上签", "上吉签", "中吉签", "中平签", "中下签", "下签"}
+        local sign_name = sign_names[d.sign] or "未知签"
+        local fx_text = d.text or "（无效果）"
+        -- 中平「有点小用」：标明具体抽到的物品
+        if d.fx == "small_use" then
+            local dk = self:_drawDiscountItem()
+            local dname = self:_getItemDisplayName(dk)
+            fx_text = fx_text .. "\n（今日随机物品：「" .. dname .. "」价格变为5积分）"
+        end
+        title = string.format("今日签运 · %s\n剩余%d天\n\n%s", sign_name, remain_days, fx_text)
+        buttons = {
+            {
+                {text = "关闭抽签模式", callback = function()
+                    UIManager:close(dialog)
+                    self:_confirmCloseDraw()
+                end},
+                {text = "知道了", callback = function() UIManager:close(dialog) end},
+            },
+        }
+    else
+        -- 今日未抽签：提供抽签入口
+        title = string.format("今日待抽签\n剩余%d天\n\n点击「抽签」抽取今日运势。", remain_days)
+        buttons = {
+            {
+                {text = "抽签", callback = function()
+                    UIManager:close(dialog)
+                    self:_showDrawDialog()
+                end},
+                {text = "关闭抽签模式", callback = function()
+                    UIManager:close(dialog)
+                    self:_confirmCloseDraw()
+                end},
+            },
+        }
+    end
+    dialog = ButtonDialog:new{
+        title = title,
+        title_align = "center",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+function FocusFeedback:_confirmStartDraw()
+    local dialog
+    dialog = ButtonDialog:new{
+        title = "开启抽签模式？（需要先养小猫哦）\n· 持续7天，冷却20天\n· 每天首次阅读自动抽一签定当日运势\n· 签运效果仅当日生效，0点重置\n· 抽签与挑战/摸鱼/心跳等其他模式互斥",
+        title_align = "center",
+        buttons = {
+            {
+                {text = "开启", callback = function()
+                    UIManager:close(dialog)
+                    local m = { mode = MODE_DRAW, started_at = os.time() }
+                    self:_saveModeState(m)
+                    self:_showMessage("抽签模式已开启！\n先来抽今日第一签。", 6)
+                    self:_showDrawDialog()
+                end},
+                {text = "取消", callback = function() UIManager:close(dialog) end},
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function FocusFeedback:_confirmCloseDraw()
+    local dialog
+    dialog = ButtonDialog:new{
+        title = "手动关闭抽签模式？\n关闭后即可重新选择模式。",
+        title_align = "center",
+        buttons = {
+            {
+                {text = "关闭", callback = function()
+                    UIManager:close(dialog)
+                    self:_closeMode(MODE_DRAW)
+                end},
+                {text = "取消", callback = function() UIManager:close(dialog) end},
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
 function FocusFeedback:_checkModeAuto()
     local now = os.time()
     local m = self:_readModeState()
@@ -6647,6 +7622,14 @@ function FocusFeedback:_checkModeAuto()
         end
     end
 
+    -- 短跑模式：5小时窗口到期未达目标则失败结算
+    if mode == MODE_SPRINT and (m.started_at or 0) > 0 and not m.spr_settled then
+        if now - m.started_at >= SPRINT_WINDOW then
+            self:_settleSprint()
+            return
+        end
+    end
+
     -- 摸鱼模式：最长30天自动关闭
     if mode == MODE_SLACK and (m.started_at or 0) > 0 then
         if now - m.started_at >= SLACK_MAX_DURATION then
@@ -6656,20 +7639,20 @@ function FocusFeedback:_checkModeAuto()
         end
     end
 
-    -- 夜间模式：24小时自动关闭
-    if mode == MODE_NIGHT and (m.started_at or 0) > 0 then
-        if now - m.started_at >= NIGHT_DURATION then
-            self:_closeMode(MODE_NIGHT, true)
-            self:_showMessage("夜间模式承诺期结束，已自动关闭。", 5)
-            return
-        end
-    end
-
     -- 心跳模式：72小时自动关闭
     if mode == MODE_HEARTBEAT and (m.started_at or 0) > 0 then
         if now - m.started_at >= HEARTBEAT_DURATION then
             self:_closeMode(MODE_HEARTBEAT, true)
             self:_showMessage("心跳模式已持续72小时，自动关闭。\n冷却15天后可再次开启。", 6)
+            return
+        end
+    end
+
+    -- 抽签模式：7天持续到期自动关闭
+    if mode == MODE_DRAW and (m.started_at or 0) > 0 then
+        if now - m.started_at >= DRAW_DURATION then
+            self:_closeMode(MODE_DRAW, true)
+            self:_showMessage("抽签模式已持续7天，自动关闭。\n冷却20天后可再次开启。", 6)
             return
         end
     end
