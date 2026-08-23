@@ -1808,6 +1808,8 @@ function FocusFeedback:_checkSleep()
             local stat = self:_getDailyStat()
             stat.sleep_natural = true
             self:_saveDailyStat(stat)
+            -- V14: 4h睡眠间隔以「上次睡眠结束时间」起算，自然醒时记录
+            self:_saveLastSleepTs(os.time())
             self:_saveSleepState({type = nil, reading_at_start = 0,
                 deep_date = sleep.deep_date, nap_date = sleep.nap_date})
             return nil
@@ -2130,6 +2132,8 @@ function FocusFeedback:_wakeWithCoffee(callback)
 
     -- 立即苏醒，保留今日睡眠日期限制
     local sleep = self:_readSleepState()
+    -- V14: 4h睡眠间隔以「上次睡眠结束时间」起算，咖啡唤醒时记录
+    self:_saveLastSleepTs(os.time())
     self:_saveSleepState({type = nil, reading_at_start = 0,
         deep_date = sleep.deep_date, nap_date = sleep.nap_date})
 
@@ -4301,18 +4305,25 @@ function FocusFeedback:_onActivity(now)
                     self:_saveLongStat(lstat)
                     -- V4: 阅读增加心情值 0.4%/分钟
                     -- 抽签当日效果（心情增长维度）：上吉翻倍 / 中下减半 / 满格·锁死兜底
+                    -- V14: 挑战成功心情拉满8h不掉落：期间心情锁死100，并刷新衰减基准
                     local mood = self:_readMood()
-                    local mood_rate = MOOD_PER_READ_MIN
-                    local mfx = self:_drawEffect()
-                    if mfx == "luxury_joy" then
-                        mood_rate = mood_rate * 2
-                    elseif mfx == "blue_book" then
-                        mood_rate = mood_rate * 0.5
+                    local boost_until = G_reader_settings:readSetting(settingKey("v14_mood_boost_until"), 0) or 0
+                    if boost_until > os.time() then
+                        mood = 100
+                        self:_saveLastMoodUpdate(os.time())
+                    else
+                        local mood_rate = MOOD_PER_READ_MIN
+                        local mfx = self:_drawEffect()
+                        if mfx == "luxury_joy" then
+                            mood_rate = mood_rate * 2
+                        elseif mfx == "blue_book" then
+                            mood_rate = mood_rate * 0.5
+                        end
+                        mood = math.min(100, mood + (diff / 60) * mood_rate)
+                        if mfx == "happy_day" then mood = 100
+                        elseif mfx == "depression" then mood = MOOD_MIN
+                        elseif mfx == "mood_floor" then mood = math.max(50, mood) end
                     end
-                    mood = math.min(100, mood + (diff / 60) * mood_rate)
-                    if mfx == "happy_day" then mood = 100
-                    elseif mfx == "depression" then mood = MOOD_MIN
-                    elseif mfx == "mood_floor" then mood = math.max(50, mood) end
                     self:_saveMood(mood)
                 end
                 -- V8: 长期任务「连续阅读」天数更新（昨天连续则+1，中断则归1，当天只计一次）
@@ -4996,8 +5007,12 @@ function FocusFeedback:_triggerStranger()
             self:_savePoints(current - amount)
             reward_text = "*积分-" .. amount
         else
-            local mood = self:_readMood()
-            self:_saveMood(mood - 10)
+            -- V14: 挑战成功心情拉满8h不掉落：期间负面事件不扣心情
+            local boost_until = G_reader_settings:readSetting(settingKey("v14_mood_boost_until"), 0) or 0
+            if boost_until <= os.time() then
+                local mood = self:_readMood()
+                self:_saveMood(mood - 10)
+            end
             reward_text = "*心情值-10%"
         end
     elseif stranger.reward_type == "item_and_points" then
@@ -5138,8 +5153,12 @@ function FocusFeedback:_triggerFlyAway()
         {
             text = "放弃（心情值-20）",
             callback = function()
-                local mood = self:_readMood()
-                self:_saveMood(math.max(MOOD_MIN, mood - 20))
+                -- V14: 挑战成功心情拉满8h不掉落：期间放弃不扣心情
+                local boost_until = G_reader_settings:readSetting(settingKey("v14_mood_boost_until"), 0) or 0
+                if boost_until <= os.time() then
+                    local mood = self:_readMood()
+                    self:_saveMood(math.max(MOOD_MIN, mood - 20))
+                end
                 return true
             end,
         },
@@ -5522,23 +5541,14 @@ function FocusFeedback:addToMainMenu(menu_items)
                     self:_showCollection()
                 end,
             },
+            -- V14: 模式系统
+            -- 注意：旧版 KOReader（v2026.07.2 及更早）的 touchmenu.lua:onMenuSelect 会直接对
+            -- item.sub_item_table 取长度，不支持 sub_item_table_func 字段（点了会崩溃），
+            -- 因此这里必须传入构建好的 table，动态部分用 text_func/checked_func 实现。
             {
-                text = "在线更新",
+                text = "模式",
                 separator = true,
-                sub_item_table = {
-                    {
-                        text = "检查更新",
-                        callback = function()
-                            self:_checkUpdate()
-                        end,
-                    },
-                    {
-                        text = "设置更新源",
-                        callback = function()
-                            self:_setUpdateSource()
-                        end,
-                    },
-                },
+                sub_item_table = self:_buildModeSubmenuItems(),
             },
             {
                 text = "随机事件",
@@ -5600,14 +5610,23 @@ function FocusFeedback:addToMainMenu(menu_items)
                     },
                 },
             },
-            -- V14: 模式系统
-            -- 注意：旧版 KOReader（v2026.07.2 及更早）的 touchmenu.lua:onMenuSelect 会直接对
-            -- item.sub_item_table 取长度，不支持 sub_item_table_func 字段（点了会崩溃），
-            -- 因此这里必须传入构建好的 table，动态部分用 text_func/checked_func 实现。
             {
-                text = "模式",
+                text = "在线更新",
                 separator = true,
-                sub_item_table = self:_buildModeSubmenuItems(),
+                sub_item_table = {
+                    {
+                        text = "检查更新",
+                        callback = function()
+                            self:_checkUpdate()
+                        end,
+                    },
+                    {
+                        text = "设置更新源",
+                        callback = function()
+                            self:_setUpdateSource()
+                        end,
+                    },
+                },
             },
         },
     }
@@ -7083,8 +7102,29 @@ function FocusFeedback:_toggleHeartbeatMode()
     if self:_getActiveMode() == MODE_HEARTBEAT then
         local m = self:_readModeState()
         local remain = math.max(0, (m.started_at or 0) + HEARTBEAT_DURATION - os.time())
-        self:_showMessage(string.format("心跳模式进行中（不可中途结束）\n\n剩余：%s\n每日首次阅读时抛硬币决定当日里程碑积分。",
-            fmtClock(remain)), 8)
+        local today = todayKey()
+        -- V14: 今日尚未抛硬币（弹窗被点掉等）时，提供「立即抛硬币」补救按钮
+        if m.hb_date ~= today or m.hb_result == nil then
+            local dialog
+            dialog = ButtonDialog:new{
+                title = string.format("心跳模式进行中（不可中途结束）\n\n剩余：%s\n今日尚未抛硬币，可立即补抛：",
+                    fmtClock(remain)),
+                title_align = "center",
+                buttons = {
+                    {
+                        {text = "立即抛硬币", is_enter_default = true, callback = function()
+                            UIManager:close(dialog)
+                            UIManager:show(self:_buildCoinFlipDialog())
+                        end},
+                        {text = "取消", callback = function() UIManager:close(dialog) end},
+                    },
+                },
+            }
+            UIManager:show(dialog)
+        else
+            self:_showMessage(string.format("心跳模式进行中（不可中途结束）\n\n剩余：%s\n每日首次阅读时抛硬币决定当日里程碑积分。",
+                fmtClock(remain)), 8)
+        end
         return
     end
     local remain = self:_getCooldownRemain(MODE_HEARTBEAT)
@@ -7131,6 +7171,7 @@ function FocusFeedback:_buildCoinFlipDialog()
         prob = math.max(0.05, math.min(0.95, prob))
         local win = math.random() < prob
         local m = self:_readModeState()
+        m.hb_date = todayKey()
         m.hb_result = win
         self:_saveModeState(m)
         UIManager:close(dialog)
