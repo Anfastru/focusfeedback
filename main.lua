@@ -251,6 +251,7 @@ local DAILY_TASKS = {
         {id = "n8",  desc = "抚摸书5次"},
         {id = "n9",  desc = "使用一次逗书棒"},
         {id = "n10", desc = "保持今日心情值≥50%的时间≥14h"},
+        {id = "n11", desc = "完成一次测验"},
     },
     rare = {
         {id = "r1",  desc = "今日阅读时长达3h"},
@@ -263,6 +264,7 @@ local DAILY_TASKS = {
         {id = "r8",  desc = "使用一次四叶草并成功触发一次任意事件"},
         {id = "r9",  desc = "一日投喂棉花糖数量≥5"},
         {id = "r10", desc = "一日投喂饼干数量≥5"},
+        {id = "r11", desc = "完成一次测验并获得满分"},
     },
     special = {
         {id = "s1", desc = "坚持一日不投喂你的书"},
@@ -979,6 +981,8 @@ function FocusFeedback:_getDailyStat()
             h19_22 = 0,          -- 19:00-22:00 阅读秒
             h0_3 = 0,            -- 0:00-3:00 阅读秒
             finish = 0,          -- 今日读完书数
+            quiz = 0,            -- V14: 今日完成测验次数
+            quiz_perfect = 0,    -- V14: 今日满分测验次数（已答题全部答对）
         }
         G_reader_settings:saveSetting(settingKey("v8_daily_stat"), stat)
     end
@@ -1123,6 +1127,8 @@ function FocusFeedback:_isDailyTaskDone(t, stat, stat_date)
     if id == "l3" then return (stat.pets or 0) >= 1 end
     if id == "l4" then return (stat.collection or 0) >= 1 end
     if id == "l5" then return stat.sleep_natural == true end
+    if id == "n11" then return (stat.quiz or 0) >= 1 end
+    if id == "r11" then return (stat.quiz_perfect or 0) >= 1 end
     return false
 end
 
@@ -4717,6 +4723,59 @@ function FocusFeedback:onCloseWidget()
     end
     self:_unschedule()
     self.task = nil
+end
+
+-- ========== V14 KOAssistant 测验联动 ==========
+
+-- 监听 KOAssistant 章节测验完成事件（需配合 koassistant_quiz_viewer.lua 补丁）
+-- 规则：
+--   1. 选择题整节全对 +1 分（整节仅1分，不按题）
+--   2. 简答/讨论每题答对 +1 分
+--   3. 答错一题 -3% 心情（挑战成功8h拉满期间不扣）
+--   4. 积分直接入账，不走寄存/模式逻辑；计入每日任务
+function FocusFeedback:onKoassistantQuizFinished(payload)
+    if not self:_readAdopted() then return end
+    if type(payload) ~= "table" then return end
+    local total_correct = payload.total_correct or 0
+    local total_answered = payload.total_answered or 0
+    local mc_correct = payload.mc_correct or 0
+    local mc_answered = payload.mc_answered or 0
+    local sa_correct = payload.sa_correct or 0
+    local essay_correct = payload.essay_correct or 0
+
+    -- 1. 积分：选择题整节全对（已答选择题全部答对）+1，简答/讨论每题+1
+    local mc_points = (mc_answered > 0 and mc_correct == mc_answered) and 1 or 0
+    local points = mc_points + sa_correct + essay_correct
+    if points > 0 then
+        self:_addPoints(points)
+    end
+
+    -- 2. 心情：答错一题-3%（挑战成功8h拉满期间不扣）
+    local wrong = total_answered - total_correct
+    local mood_lost = 0
+    if wrong > 0 then
+        local boost_until = G_reader_settings:readSetting(settingKey("v14_mood_boost_until"), 0) or 0
+        if boost_until <= os.time() then
+            mood_lost = 3 * wrong
+            local mood = self:_readMood()
+            self:_saveMood(mood - mood_lost)
+        end
+    end
+
+    -- 3. 每日任务：完成一次测验 / 满分（已答题全部答对）
+    local stat = self:_getDailyStat()
+    stat.quiz = (stat.quiz or 0) + 1
+    if total_answered > 0 and total_correct == total_answered then
+        stat.quiz_perfect = (stat.quiz_perfect or 0) + 1
+    end
+    self:_saveDailyStat(stat)
+
+    -- 4. 提示
+    local msg = string.format("测验完成！积分+%d", points)
+    if mood_lost > 0 then
+        msg = msg .. string.format("，心情值-%d%%", mood_lost)
+    end
+    self:_showMessage(msg, 5)
 end
 
 -- ========== 菜单 ==========
