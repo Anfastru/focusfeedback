@@ -1563,12 +1563,25 @@ end
 
 -- 首次点开一本书时弹出分类选择
 function FocusFeedback:_ensureBookCategory()
-    if not self.enabled then return end
+    logger.warn("FF-DEBUG enter: enabled=" .. tostring(self.enabled) .. " adopted=" .. tostring(self:_readAdopted()) .. " key=" .. tostring(self:_getBookKey()))
+    if not self.enabled then
+        logger.warn("FF-DEBUG guard1: plugin disabled")
+        return end
+    -- 仅已领养时提示（分类影响领养书的性格）
+    if not self:_readAdopted() then
+        logger.warn("FF-DEBUG guard2: not adopted")
+        return end
     local key = self:_getBookKey()
-    if not key then return end
-    if self:_readBookCategory(key) then return end
+    if not key then
+        logger.warn("FF-DEBUG guard3: no book key")
+        return end
+    if self:_readBookCategory(key) then
+        logger.warn("FF-DEBUG guard4: already categorized " .. tostring(key))
+        return end
     -- 避免重复弹窗
-    if self._categorizing_key == key then return end
+    if self._categorizing_key == key then
+        logger.warn("FF-DEBUG guard5: dialog already showing")
+        return end
     self._categorizing_key = key
 
     local dialog
@@ -1592,12 +1605,19 @@ function FocusFeedback:_ensureBookCategory()
         table.insert(buttons, row)
     end
 
-    dialog = ButtonDialog:new{
-        title = "请给本书标注类别\n\n不同类别的阅读将会影响你领养的书之性格哦！",
-        title_align = "center",
-        buttons = buttons,
-    }
-    UIManager:show(dialog)
+    local ok, err = pcall(function()
+        dialog = ButtonDialog:new{
+            title = "请给本书标注类别\n\n不同类别的阅读将会影响你领养的书之性格哦！",
+            title_align = "center",
+            buttons = buttons,
+        }
+        UIManager:show(dialog)
+    end)
+    if not ok then
+        logger.warn("FF-DEBUG dialog error: " .. tostring(err))
+    else
+        logger.warn("FF-DEBUG dialog shown for " .. tostring(key))
+    end
 end
 
 -- 阅读时长累计 -> 属性增长（每 1h 对应属性 +1%）
