@@ -223,6 +223,26 @@ local CHALLENGE_BOOST_DURATION = 8 * 3600   -- 8小时不掉落
 -- 低落免疫卡持续时间
 local MOOD_IMMUNE_DURATION = 72 * 3600      -- 72小时心情下限90%
 
+-- ========== V15 书之属性系统 ==========
+local ATTR_KEYS = {"知识", "审美", "情感", "阅历", "逻辑", "辩证"}
+local BOOK_CATEGORIES = {"文学", "类型小说", "历史", "哲学", "社会科学", "自然科学", "实用技术", "艺术"}
+-- 书籍分类 -> 阅读时影响的属性
+local CATEGORY_ATTRS = {
+    ["文学"]     = {"情感", "审美"},
+    ["类型小说"] = {"情感"},
+    ["历史"]     = {"知识", "阅历"},
+    ["哲学"]     = {"逻辑", "辩证"},
+    ["社会科学"] = {"知识", "辩证"},
+    ["自然科学"] = {"阅历", "逻辑"},
+    ["实用技术"] = {"知识"},
+    ["艺术"]     = {"审美", "知识"},
+}
+local ATTR_WEIGHT_STRENGTH = 2      -- 画像加权强度：weight = 1 + 2*sim（温和梯度，不压倒性）
+local ATTR_READ_GAIN_PER_H = 1      -- 阅读1h +1%
+local ATTR_EVENT_GAIN = 0.4         -- 普通事件 +0.4%
+local ATTR_SPECIAL_GAIN = 1         -- 特殊事件 +1%
+local ATTR_BOOKMARK_GAIN = 0.1      -- 书签掉落 +0.1%
+
 -- 长期模式周期配置（天数/目标阅读天数/目标时长/入场费/物品奖励数/积分/低落卡/睡眠卡）
 local LONG_CYCLES = {
     {days = 21,  target_days = 20, target_sec = 25 * 3600,    fee = 0,  reward_items = 1, reward_pts = 0,  mood_card = 0,  sleep_card = 0},
@@ -1492,6 +1512,151 @@ function FocusFeedback:_loadV5Data()
     end
 end
 
+-- ========== V15 书之属性系统 ==========
+
+-- 读取当前领养期的六维属性（nil 表示尚未初始化）
+function FocusFeedback:_readAttributes()
+    return G_reader_settings:readSetting(settingKey("v15_attributes"), nil)
+end
+
+function FocusFeedback:_saveAttributes(attrs)
+    G_reader_settings:saveSetting(settingKey("v15_attributes"), attrs or {})
+end
+
+-- 初始化属性（首次或新领养时归零）
+function FocusFeedback:_initAttributes()
+    local attrs = self:_readAttributes()
+    if not attrs then
+        attrs = {知识 = 0, 审美 = 0, 情感 = 0, 阅历 = 0, 逻辑 = 0, 辩证 = 0}
+        self:_saveAttributes(attrs)
+    end
+    return attrs
+end
+
+-- 增加某属性数值（0-100 封顶）
+function FocusFeedback:_addAttribute(attr, value)
+    if not attr then return end
+    local attrs = self:_initAttributes()
+    attrs[attr] = math.min(100, math.max(0, (attrs[attr] or 0) + value))
+    self:_saveAttributes(attrs)
+end
+
+-- 随机取一个属性（用于书签掉落/特殊事件）
+function FocusFeedback:_randomAttrKey()
+    return ATTR_KEYS[math.random(1, #ATTR_KEYS)]
+end
+
+-- 读取某本书（当前阅读的书）的分类
+function FocusFeedback:_readBookCategory(key)
+    key = key or self:_getBookKey()
+    if not key then return nil end
+    local all = G_reader_settings:readSetting(settingKey("v15_book_categories"), {}) or {}
+    return all[key]
+end
+
+function FocusFeedback:_saveBookCategory(key, cat)
+    if not key then return end
+    local all = G_reader_settings:readSetting(settingKey("v15_book_categories"), {}) or {}
+    all[key] = cat
+    G_reader_settings:saveSetting(settingKey("v15_book_categories"), all)
+end
+
+-- 首次点开一本书时弹出分类选择
+function FocusFeedback:_ensureBookCategory()
+    if not self.enabled then return end
+    local key = self:_getBookKey()
+    if not key then return end
+    if self:_readBookCategory(key) then return end
+    -- 避免重复弹窗
+    if self._categorizing_key == key then return end
+    self._categorizing_key = key
+
+    local dialog
+    local buttons = {}
+    local row = {}
+    for i, cat in ipairs(BOOK_CATEGORIES) do
+        table.insert(row, {
+            text = cat,
+            callback = function()
+                self:_saveBookCategory(key, cat)
+                self._categorizing_key = nil
+                UIManager:close(dialog)
+            end,
+        })
+        if #row == 2 then
+            table.insert(buttons, row)
+            row = {}
+        end
+    end
+    if #row > 0 then
+        table.insert(buttons, row)
+    end
+
+    dialog = ButtonDialog:new{
+        title = "请给本书标注类别\n\n不同类别的阅读将会影响你领养的书之性格哦！",
+        title_align = "center",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+-- 阅读时长累计 -> 属性增长（每 1h 对应属性 +1%）
+function FocusFeedback:_growAttributesFromReading(diff)
+    if not self:_readAdopted() then return end
+    local key = self:_getBookKey()
+    if not key then return end
+    local cat = self:_readBookCategory(key)
+    if not cat then return end
+    local attrs_list = CATEGORY_ATTRS[cat]
+    if not attrs_list then return end
+    local gain = (diff / 3600) * ATTR_READ_GAIN_PER_H
+    if gain <= 0 then return end
+    for _, attr in ipairs(attrs_list) do
+        self:_addAttribute(attr, gain)
+    end
+end
+
+-- 余弦相似度：用户属性向量 A 与内容标签向量 T
+function FocusFeedback:_cosineSim(attrs, tags)
+    if not tags or #tags == 0 then return 0 end
+    local sumA2 = 0
+    for _, attr in ipairs(ATTR_KEYS) do
+        local a = attrs[attr] or 0
+        sumA2 = sumA2 + a * a
+    end
+    if sumA2 <= 0 then return 0 end
+    local dot = 0
+    for _, tag in ipairs(tags) do
+        dot = dot + (attrs[tag] or 0)
+    end
+    local normT = math.sqrt(#tags)
+    return dot / (math.sqrt(sumA2) * normT)
+end
+
+-- 加权随机选择：weight = 1 + ATTR_WEIGHT_STRENGTH * sim
+function FocusFeedback:_weightedPick(items, weight_fn)
+    if #items == 0 then return nil end
+    local weights = {}
+    local total = 0
+    for i, item in ipairs(items) do
+        local w = weight_fn(item, i)
+        if w < 0 then w = 0 end
+        weights[i] = w
+        total = total + w
+    end
+    if total <= 0 then
+        return items[math.random(1, #items)]
+    end
+    local r = math.random() * total
+    for i, w in ipairs(weights) do
+        r = r - w
+        if r <= 0 then
+            return items[i]
+        end
+    end
+    return items[#items]
+end
+
 -- 里程碑时获得积分（替换原 _awardFood）
 function FocusFeedback:_awardPoints(minute)
     if not self:_readAdopted() then return end
@@ -2148,6 +2313,8 @@ function FocusFeedback:_wakeWithCoffee(callback)
     stat.coffee = (stat.coffee or 0) + 1
     stat.wake_coffee = (stat.wake_coffee or 0) + 1
     self:_saveDailyStat(stat)
+    -- V15: 使用一次咖啡唤醒 +0.4% 辩证
+    self:_addAttribute("辩证", ATTR_EVENT_GAIN)
 
     self._pending_dialogue = "谁把我苦醒了……"
     if callback then callback() end
@@ -2176,6 +2343,8 @@ function FocusFeedback:_useClover(callback)
     local stat = self:_getDailyStat()
     stat.clover = (stat.clover or 0) + 1
     self:_saveDailyStat(stat)
+    -- V15: 使用一次四叶草 +0.4% 审美
+    self:_addAttribute("审美", ATTR_EVENT_GAIN)
 
     self._pending_dialogue = "凡事发生皆利于我！"
     if callback then callback() end
@@ -2640,10 +2809,37 @@ end
 
 function FocusFeedback:_getRandomNormalDialogue()
     local normal = self.dialogue_data.normal or {}
-    if #normal == 0 then
+    local gated = self.dialogue_data.gated or {}
+    local attrs = self:_initAttributes()
+
+    -- 构建台词池：普通台词 + 满足属性门槛的台词
+    local pool = {}
+    for _, line in ipairs(normal) do
+        local text = type(line) == "table" and line.text or line
+        local tags = type(line) == "table" and line.tags or nil
+        table.insert(pool, {text = text, tags = tags})
+    end
+    for _, line in ipairs(gated) do
+        local ok = true
+        for attr, min_val in pairs(line.min_attr or {}) do
+            if (attrs[attr] or 0) < min_val then
+                ok = false
+                break
+            end
+        end
+        if ok then
+            table.insert(pool, {text = line.text, tags = line.tags})
+        end
+    end
+    if #pool == 0 then
         return "书在静静等待。"
     end
-    return normal[math.random(1, #normal)]
+
+    -- V15: 画像余弦相似度加权
+    local picked = self:_weightedPick(pool, function(line)
+        return 1 + ATTR_WEIGHT_STRENGTH * self:_cosineSim(attrs, line.tags or {})
+    end)
+    return picked.text
 end
 
 -- 打开页面时的台词（检查特定条件）
@@ -2930,6 +3126,8 @@ function FocusFeedback:_startAdoption()
     self:_saveCloverExpire(0)
     -- V7: 清空已遇见陌生人列表
     self:_saveMetStrangers({})
+    -- V15: 重置六维属性（新领养从零开始）
+    self:_saveAttributes({知识 = 0, 审美 = 0, 情感 = 0, 阅历 = 0, 逻辑 = 0, 辩证 = 0})
 
     -- 关闭领养页面
     if self.adoption_page then
@@ -3400,7 +3598,31 @@ end
 
 -- 翻开
 function FocusFeedback:_doReveal()
-    local idx = self:_readBookIndex()
+    -- V15: 翻开时按属性画像加权选择书名（不影响去重逻辑）
+    local collection = self:_readCollection()
+    local revealed = {}
+    for _, entry in ipairs(collection) do
+        revealed[entry.index] = true
+    end
+    local available = {}
+    for i = 1, #self.book_data do
+        if not revealed[i] then
+            table.insert(available, i)
+        end
+    end
+    -- 如果所有书都已翻开，重置池子
+    if #available == 0 then
+        for i = 1, #self.book_data do
+            table.insert(available, i)
+        end
+    end
+    local attrs = self:_initAttributes()
+    local idx = self:_weightedPick(available, function(i)
+        local book = self.book_data[i]
+        return 1 + ATTR_WEIGHT_STRENGTH * self:_cosineSim(attrs, book.tags or {})
+    end)
+    self:_saveBookIndex(idx)
+
     local book = self.book_data[idx] or self.book_data[1]
     local nickname = self:_readNickname()
 
@@ -3416,6 +3638,7 @@ function FocusFeedback:_doReveal()
         food_consumed = self:_readFoodConsumed(),
         adoption_books = self:_readAdoptionBooks(),
         adoption_book_count = self:_countAdoptionBooks(),
+        attributes = attrs,  -- V15: 翻开时的属性快照
     })
     self:_saveCollection(collection)
 
@@ -3708,7 +3931,7 @@ function FocusFeedback:_showAdoptionCollection()
             text = string.format("《%s》 %s", book.title, book.author),
             mandatory = entry.reveal_date,
             callback = function()
-                self:_showBookDetail(entry)
+                self:_showBookDetailMenu(entry)
             end,
         })
     end
@@ -3722,6 +3945,91 @@ function FocusFeedback:_showAdoptionCollection()
         show_parent = nil,
     }
     UIManager:show(collection_menu)
+end
+
+-- 养成书籍详情菜单：养成日记 / 书的信息
+function FocusFeedback:_showBookDetailMenu(entry)
+    local book = self.book_data[entry.index] or { title = "未知", author = "" }
+    local items = {
+        {
+            text = "养成日记",
+            callback = function()
+                self:_showBookDetail(entry)
+            end,
+        },
+        {
+            text = "书的信息",
+            callback = function()
+                self:_showBookInfo(entry)
+            end,
+        },
+    }
+    local menu = Menu:new{
+        title = string.format("《%s》", book.title),
+        item_table = items,
+        width = Screen:getWidth(),
+        is_borderless = true,
+        is_popout = false,
+        show_parent = nil,
+    }
+    UIManager:show(menu)
+end
+
+-- 书的信息弹窗：生日/成年日/年龄/六维属性
+function FocusFeedback:_showBookInfo(entry)
+    local book = self.book_data[entry.index] or { title = "未知", author = "", quote = "" }
+    local attrs = entry.attributes or {}
+
+    local function formatDate(date_str)
+        if not date_str or date_str == "" then return "未知" end
+        local y, m, d = date_str:match("(%d+)-(%d+)-(%d+)")
+        if not y or not m or not d then return date_str end
+        return string.format("%s年%s月%s日", y, m, d)
+    end
+
+    -- 年龄：领养日 -> 今天
+    local age_text = "未知"
+    if entry.adopt_date and entry.adopt_date ~= "" then
+        local adopt_ts = self:_dateToTimestamp(entry.adopt_date)
+        if adopt_ts then
+            local days = math.floor((os.time() - adopt_ts) / 86400)
+            if days < 0 then days = 0 end
+            local years = math.floor(days / 365)
+            local months = math.floor((days % 365) / 30)
+            age_text = string.format("%d岁%d个月", years, months)
+        end
+    end
+
+    local lines = {
+        string.format("书名：《%s》", book.title),
+        string.format("作者：%s", book.author or ""),
+        "",
+        string.format("生日（领养日）：%s", formatDate(entry.adopt_date)),
+        string.format("成年日（翻开日）：%s", formatDate(entry.reveal_date)),
+        string.format("年龄：%s", age_text),
+        "",
+        "书之属性：",
+    }
+    for _, attr in ipairs(ATTR_KEYS) do
+        table.insert(lines, string.format("%s：%d%%", attr, attrs[attr] or 0))
+    end
+
+    local dialog
+    dialog = ButtonDialog:new{
+        title = table.concat(lines, "\n"),
+        title_align = "center",
+        buttons = {
+            {
+                {
+                    text = "关闭",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
 end
 
 -- 读完书籍列表
@@ -4348,6 +4656,10 @@ function FocusFeedback:_onActivity(now)
                 pcall(function()
                     self:_addBookReadingTime(diff)
                 end)
+                -- V15: 阅读时长累计 -> 属性增长
+                pcall(function()
+                    self:_growAttributesFromReading(diff)
+                end)
             end
         end
 
@@ -4510,6 +4822,10 @@ function FocusFeedback:onReaderReady()
     self._end_book_triggered = false
     self._last_annotation_count = nil  -- 重置标注基准，首次检测时初始化
     self:_getBookKey()
+    -- V15: 首次点开一本书时弹出分类选择
+    pcall(function()
+        self:_ensureBookCategory()
+    end)
     -- V5: 记录领养期间阅读的书
     if self:_readAdopted() and not self.reveal_book then
         pcall(function()
@@ -4977,6 +5293,8 @@ function FocusFeedback:_triggerBookmark()
     if #quotes == 0 then return "书签掉落", "一片书签" end
     local nickname = self:_readNickname()
     local quote = quotes[math.random(1, #quotes)]
+    -- V15: 书签掉落 +0.1% 随机属性
+    self:_addAttribute(self:_randomAttrKey(), ATTR_BOOKMARK_GAIN)
 
     -- V7: 前缀单独一行，书签内容另起一行（内部再按18字符断行）
     local text = "（书的昵称）身上掉落了一片书签：\n" .. quote
@@ -5034,8 +5352,14 @@ function FocusFeedback:_triggerStranger()
         end
     end
 
-    local stranger = pool[math.random(1, #pool)]
+    -- V15: 画像加权选择陌生人（属性越匹配权重越高，不影响去重逻辑）
+    local attrs = self:_initAttributes()
+    local stranger = self:_weightedPick(pool, function(s)
+        return 1 + ATTR_WEIGHT_STRENGTH * self:_cosineSim(attrs, s.tags or {})
+    end)
     local nickname = self:_readNickname()
+    -- V15: 遇见陌生人 +0.4% 阅历
+    self:_addAttribute("阅历", ATTR_EVENT_GAIN)
 
     -- V7: 记录已遇见
     if not met_set[stranger.key] then
@@ -5121,6 +5445,8 @@ function FocusFeedback:_triggerBookFriend()
     if #books == 0 or #templates == 0 then return "书际关系", "一些物品" end
 
     local nickname = self:_readNickname()
+    -- V15: 一次书际关系 +0.4% 情感
+    self:_addAttribute("情感", ATTR_EVENT_GAIN)
 
     local template = templates[math.random(1, #templates)]
     local book_title = books[math.random(1, #books)]
@@ -5167,6 +5493,8 @@ end
 -- 随机事件-书掉入巴别塔图书馆
 function FocusFeedback:_triggerBabel()
     local nickname = self:_readNickname()
+    -- V15: 一次巴别图书馆事件 +0.4% 知识
+    self:_addAttribute("知识", ATTR_EVENT_GAIN)
     local text = "宇宙（别人管它叫图书馆）由许多六边形的回廊组成，数目不能确定，也许是无限的……（书的昵称）掉入了巴别图书馆，这里有许多它的同类，还有一位失明的阿根廷诗人，都在知识的海洋中寻觅着什么……（书的昵称）想起自己诞生之初第一次仰头望见银河的感受，选择了加入它们。"
     text = text:gsub("（书的昵称）", function() return nickname end)
 
@@ -5184,6 +5512,8 @@ end
 -- 随机事件-书飞走了……
 function FocusFeedback:_triggerFlyAway()
     local nickname = self:_readNickname()
+    -- V15: 书飞走了 +0.4% 逻辑
+    self:_addAttribute("逻辑", ATTR_EVENT_GAIN)
     local text = "（书的昵称）出门玩耍，路过堪萨斯州的大草原时，一阵猛烈的旋风突然来临。周围的房子、女孩和黑色小梗犬都被大风卷了起来，（书的昵称）也是，它吓得吱哇乱叫。"
     text = text:gsub("（书的昵称）", function() return nickname end)
 
@@ -5231,6 +5561,8 @@ end
 function FocusFeedback:_triggerSpecialEvent(event_def)
     if not event_def then return "特殊事件", "一份礼物" end
     local nickname = self:_readNickname()
+    -- V15: 特殊事件 +1% 随机属性
+    self:_addAttribute(self:_randomAttrKey(), ATTR_SPECIAL_GAIN)
 
     local text = (event_def.text or ""):gsub("（书的昵称）", function() return nickname end)
     local title = event_def.title or "特殊事件"
