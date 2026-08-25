@@ -3240,6 +3240,11 @@ function FocusFeedback:_showAdoptionPage()
         self:_loadV2Data()
     end
 
+    -- V15: 当前阅读的书未分类时重新弹出分类选择（不新增子菜单）
+    pcall(function()
+        self:_ensureBookCategory()
+    end)
+
     -- 更新心情（处理碎纸屑衰减等，可能触发心情弃养）
     local was_adopted = self:_readAdopted()
     self:_updateMood()
