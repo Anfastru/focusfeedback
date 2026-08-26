@@ -207,7 +207,7 @@ local SPRINT_COOLDOWN = 72 * 3600           -- 冷却72小时
 local SPRINT_MIN_GOAL_H = 1                 -- 目标最少1小时
 
 -- 沙漏模式常量
-local SAND_MAX_GOAL_SEC = 3 * 3600          -- 目标累计时长 ≤3小时
+local SAND_TOTAL_LIMIT_SEC = 8 * 3600       -- 用户自定义加成时段累计总长 ≤8小时
 local SAND_DURATION = 24 * 3600             -- 周期24h倍数才可关闭
 
 -- 抽签模式常量
@@ -1725,15 +1725,18 @@ function FocusFeedback:_awardPoints(minute)
         points = POINTS_AFTER_5H
     end
 
-    -- 抽签当日效果（积分维度）：下签无积分 / 上上双倍 / 上吉·中下每里程碑必+1
+    -- 抽签当日效果（积分维度）：下签无积分 / 上上双倍 / 上吉·中吉每里程碑必+1 / 中下-铁饭碗必为1
     -- 注：抽签与其他模式互斥，此处 mode 只会是 DRAW 或长期共存态
     local draw_fx = self:_drawEffect()
     if draw_fx == "no_gain" then
         points = 0
     elseif draw_fx == "super_double" then
         points = points * 2
-    elseif draw_fx == "all_bonus" or draw_fx == "iron_bowl" then
+    elseif draw_fx == "all_bonus" then
         points = points + 1
+    elseif draw_fx == "iron_bowl" then
+        -- 中下签-公务员般的铁饭碗：里程碑积分固定为1
+        points = 1
     end
 
     -- V14 心跳模式：猜中当日里程碑大幅加成，猜错无积分
@@ -1746,9 +1749,9 @@ function FocusFeedback:_awardPoints(minute)
             return
         end
     elseif mode == MODE_SAND then
-        -- V14 沙漏模式：累计使用未超限量时必+1，超限后无额外加成
-        local sdm = self:_readModeState()
-        if (sdm.sand_read or 0) <= (sdm.sand_goal_sec or 0) then
+        -- V15 沙漏模式：用户自定义加成时段内，里程碑积分必+1（不依赖猫概率）
+        --           时段外：失去猫的概率加成，不加成（0加成）
+        if self:_isInSandWindow() then
             points = points + 1
         end
     else
@@ -4610,10 +4613,6 @@ function FocusFeedback:_onActivity(now)
                         if m.spr_read >= (m.spr_goal_sec or math.huge) then
                             self:_settleSprint()
                         end
-                    elseif v14_mode == MODE_SAND then
-                        local m = self:_readModeState()
-                        m.sand_read = (m.sand_read or 0) + diff
-                        self:_saveModeState(m)
                     end
                     local long = self:_readLongMode()
                     if long.cycle and not long.settled then
@@ -4731,6 +4730,12 @@ function FocusFeedback:_tick()
     pcall(function() self:_checkRandomEvents() end)
     -- V8: 轮询标注数量（某些阅读器后端不触发 onAnnotationsUpdated）
     pcall(function() self:_checkAnnotationCount() end)
+    -- V15.1: 书之来信（成年书测试书注入 + 离线来信检查）
+    pcall(function()
+        self:_ensureTestBooks()
+        self:_inboxInit()
+        self:_showInboxLetters()
+    end)
     self:_schedule()
 end
 
@@ -5034,6 +5039,12 @@ function FocusFeedback:onResume()
     if self:_getActiveMode() ~= MODE_FLOW then
         self.last_page_turn_wall = nil
     end
+    -- V15.1: 唤醒时立即检查书之来信（注入测试书 + 离线来信）
+    pcall(function()
+        self:_ensureTestBooks()
+        self:_inboxInit()
+        self:_showInboxLetters()
+    end)
     self:_startTimer()
 end
 
@@ -6792,6 +6803,80 @@ function FocusFeedback:_getActiveMode()
     return m.mode or nil
 end
 
+-- 沙漏模式：读取用户设定的加成时段列表 [{s_min, e_min}]
+-- s_min/e_min 为当日绝对分钟数(0-1439)，单段不跨日，故必有 s_min < e_min
+function FocusFeedback:_getSandWindows()
+    local m = self:_readModeState()
+    local list = m.sand_windows
+    if type(list) ~= "table" then return {} end
+    return list
+end
+
+-- 沙漏模式：当前时刻（分钟精度）是否落在任一时段内（命中→必+1加成）
+function FocusFeedback:_isInSandWindow()
+    local now = os.date("*t")
+    local cur_min = now.hour * 60 + now.min
+    for _, w in ipairs(self:_getSandWindows()) do
+        if cur_min >= w.s_min and cur_min < w.e_min then
+            return true
+        end
+    end
+    return false
+end
+
+-- 沙漏模式：时段累计总分钟
+function FocusFeedback:_sandTotalMinutes()
+    local total = 0
+    for _, w in ipairs(self:_getSandWindows()) do
+        total = total + (w.e_min - w.s_min)
+    end
+    return total
+end
+
+-- 沙漏模式：把时段列表转成展示文本（HH:MM–HH:MM）
+function FocusFeedback:_sandWindowsToText()
+    local parts = {}
+    for _, w in ipairs(self:_getSandWindows()) do
+        table.insert(parts, string.format("%02d:%02d–%02d:%02d",
+            math.floor(w.s_min / 60), w.s_min % 60,
+            math.floor(w.e_min / 60), w.e_min % 60))
+    end
+    if #parts == 0 then return "未设定" end
+    return table.concat(parts, "、")
+end
+
+-- 沙漏模式：向列表追加/合并一段区间（s_min<e_min），返回是否成功（累计≤8h则并入，否则拒绝）
+-- 重叠自动合并为并集
+function FocusFeedback:_sandAddWindow(s_min, e_min)
+    if e_min <= s_min then return false end   -- 空段或跨日（e<=s）直接拒绝
+    local merged = {}
+    for _, w in ipairs(self:_getSandWindows()) do
+        table.insert(merged, { s_min = w.s_min, e_min = w.e_min })
+    end
+    table.insert(merged, { s_min = s_min, e_min = e_min })
+    table.sort(merged, function(a, b) return a.s_min < b.s_min end)
+    local final = {}
+    for _, w in ipairs(merged) do
+        local last = final[#final]
+        if last and w.s_min <= last.e_min then
+            last.e_min = math.max(last.e_min, w.e_min)  -- 重叠/相邻合并为并集
+        else
+            table.insert(final, w)
+        end
+    end
+    local total = 0
+    for _, w in ipairs(final) do
+        total = total + (w.e_min - w.s_min)
+    end
+    if total > SAND_TOTAL_LIMIT_SEC / 60 then
+        return false   -- 累计超8h，拒绝
+    end
+    local m = self:_readModeState()
+    m.sand_windows = final
+    self:_saveModeState(m)
+    return true
+end
+
 -- 夜间时间：18:00 - 次日 3:00
 function FocusFeedback:_isNightTime()
     local hh = tonumber(os.date("%H")) or 0
@@ -7430,10 +7515,8 @@ end
 -- ========== V14 沙漏模式 ==========
 
 function FocusFeedback:_getSandStatusText()
-    local m = self:_readModeState()
-    local goal = m.sand_goal_sec or 0
-    local used = math.min(goal, m.sand_read or 0)
-    return string.format("已用%s / 限量%s %s", secondsToText(used), secondsToText(goal), self:_cycleStatusText(MODE_SAND))
+    local txt = self:_sandWindowsToText()
+    return string.format("加成时段：%s\n累计 %d 分钟 %s", txt, self:_sandTotalMinutes(), self:_cycleStatusText(MODE_SAND))
 end
 
 function FocusFeedback:_toggleSandMode()
@@ -7450,24 +7533,69 @@ function FocusFeedback:_toggleSandMode()
     self:_showSandSetup()
 end
 
+-- 解析 "HH:MM" 为当日分钟数(0-1439)，非法返回 nil
+function FocusFeedback:_parseClockMinutes(txt)
+    if type(txt) ~= "string" then return nil end
+    local hh, mm = txt:match("(%d+):(%d+)")
+    hh, mm = tonumber(hh), tonumber(mm)
+    if not hh or not mm then return nil end
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59 then return nil end
+    return hh * 60 + mm
+end
+
 function FocusFeedback:_showSandSetup()
     local dialog
     dialog = InputDialog:new{
-        title = "沙漏模式：设定累计阅读时长\n（≤3小时，可分散累计；周期满24h倍数才可关闭）",
-        input = "1",
-        input_hint = "输入累计小时数(≤3)",
+        title = string.format("沙漏模式：设定加成时段\n每次输入一段「起始-结束」(如 9:30-11:30)\n已设：%s   累计%d分钟\n（每段不跨日，总长≤8小时）",
+            self:_sandWindowsToText(), self:_sandTotalMinutes()),
+        input = "",
+        input_hint = "如 9:30-11:30",
         buttons = {
             {
-                {text = "取消", callback = function() UIManager:close(dialog) end},
-                {text = "开始沙漏", is_enter_default = true, callback = function()
-                    local txt = dialog:getInputText()
-                    local goal_h = tonumber(txt)
+                {text = "取消/放弃", callback = function()
                     UIManager:close(dialog)
-                    if not goal_h or goal_h <= 0 or goal_h > 3 then
-                        self:_showMessage("目标需在0-3小时之间，请重新设置。", 5)
+                    -- 放弃则清空本次未启动的设定
+                    local m = self:_readModeState()
+                    m.sand_windows = nil
+                    self:_saveModeState(m)
+                end},
+                {text = "完成并开始", is_enter_default = true, callback = function()
+                    if self:_sandTotalMinutes() <= 0 then
+                        self:_showMessage("请先添加至少一个时段。", 4)
                         return
                     end
-                    self:_startSand(goal_h)
+                    UIManager:close(dialog)
+                    self:_startSand()
+                end},
+                {text = "清空已设", callback = function()
+                    local m = self:_readModeState()
+                    m.sand_windows = nil
+                    self:_saveModeState(m)
+                    UIManager:close(dialog)
+                    self:_showSandSetup()
+                end},
+            },
+            {
+                {text = "添加这一时段", callback = function()
+                    local raw = dialog:getInputText()
+                    local s_txt, e_txt = raw:match("(%d+:%d+)%s*[%-~:]+%s*(%d+:%d+)")
+                    if not s_txt or not e_txt then
+                        self:_showMessage("格式错误，请输入如「9:30-11:30」。", 4)
+                        return
+                    end
+                    local s_min = self:_parseClockMinutes(s_txt)
+                    local e_min = self:_parseClockMinutes(e_txt)
+                    if not s_min or not e_min or e_min <= s_min then
+                        self:_showMessage("时段无效：起始需早于结束，且不能跨日。", 4)
+                        return
+                    end
+                    if not self:_sandAddWindow(s_min, e_min) then
+                        self:_showMessage("时段累计超过8小时上限，无法添加。", 4)
+                        return
+                    end
+                    -- 成功添加：刷新对话框标题以显示最新累计
+                    UIManager:close(dialog)
+                    self:_showSandSetup()
                 end},
             },
         },
@@ -7475,15 +7603,15 @@ function FocusFeedback:_showSandSetup()
     UIManager:show(dialog)
 end
 
-function FocusFeedback:_startSand(goal_h)
+function FocusFeedback:_startSand()
     local m = {
         mode = MODE_SAND,
         started_at = os.time(),
-        sand_goal_sec = goal_h * 3600,
-        sand_read = 0,
     }
     self:_saveModeState(m)
-    self:_showMessage(string.format("沙漏已启动！\n设定累计阅读%d小时，期间积分必+1，超限后不再加成。", goal_h), 7)
+    local total = self:_sandTotalMinutes()
+    self:_showMessage(string.format("沙漏已启动！\n加成时段：%s\n（共%d分钟）时段内积分必+1，时段外失去猫加成。",
+        self:_sandWindowsToText(), total), 8)
 end
 
 function FocusFeedback:_confirmCloseSand()
@@ -7879,7 +8007,7 @@ local DRAW_EFFECTS = {
         {"small_use", "恭喜抽中中平签-有点小用，今天运气一般般……今日商超随机一件物品降至5积分！"},
     },
     {
-        {"iron_bowl", "恭喜抽中中下签-公务员一般的铁饭碗，今日运气有点烂、、今日每个里程碑必+1！"},
+        {"iron_bowl", "恭喜抽中中下签-公务员一般的铁饭碗，今日运气有点烂、、今日每个里程碑积分固定为1！"},
         {"blue_book", "恭喜抽中中下签-忧郁小书，今日运气有点烂、、今日心情增长减半！"},
         {"robbed", "恭喜抽中中下签-被掠夺者，今日运气有点烂、、今日必遇书飞走与被掠夺！"},
         {"white_friday", "恭喜抽中中下签-白色星期五，今日运气有点烂、、今日低价物品提价至5积分！"},
@@ -8148,6 +8276,704 @@ function FocusFeedback:_checkModeAuto()
             self:_settleLongMode()
         end
     end
+end
+
+-- ============================================================
+-- V15.1 书之来信（成年书日常事件池 + 离线来信）
+-- 仅成年书（翻开后）触发。后果字段值：mood=心情值±%，pts=积分±，item=道具key
+-- 事件主体不加任何条件=进通用池；conds={字符串}，每项由引擎 _inboxCondWeight 解析。
+-- ============================================================
+local INBOX_TEST_MODE = true   -- 测试模式：true 时后果不真正生效（仅展示）
+-- 进食类冷却组（3h）：事件4/6/7/8；电影类冷却组（2天）：事件10/11/12
+local INBOX_COOLDOWN_EAT = {"eat_4", "eat_6", "eat_7", "eat_8"}
+local INBOX_COOLDOWN_MOVIE = {"movie_10", "movie_11", "movie_12"}
+local INBOX_COOLDOWN_EAT_SEC = 3 * 3600
+local INBOX_COOLDOWN_MOVIE_SEC = 2 * 24 * 3600
+
+local ADULT_INBOX_EVENTS = {
+    -- 1 xx失眠了（夜间）
+    { bg="xx失眠了。", conds={"夜间high"}, id="insomnia",
+      bs={
+        { t="无后续", conds={"阅历up"} },
+        { t="于是从床上爬起来看星星。", conds={"审美up"} },
+        { t="硬睡无果后选择吃了一片褪黑素，成功入睡。", conds={"逻辑up","知识up"} },
+        { t="干脆通宵玩电子游戏。", mood=5, conds={"情感up"} },
+        { t="决定半夜出门探秘灵异之地。", conds={"辩证up","00:00high"} },
+      }
+    },
+    -- 2 xx睡了个超好的觉（夜间）
+    { bg="xx睡了个超好的觉。", conds={"夜间high"}, id="sleep_well",
+      bs={
+        { t="无后续。" },
+        { t="第二天醒来心情很不错。", mood=3 },
+        { t="结果睡过头了，忘记了和xx的约定。", conds={"近日阅读较少up","首次上线较晚up"} },
+        { t="结果睡过头了，但什么后果也没造成，睡觉好幸福！", mood=10, conds={"情感up","春季up"} },
+        { t="意外梦见了一个很奇特的点子……", conds={"审美up","情感up"} },
+      }
+    },
+    -- 3 xx做了个噩梦
+    { bg="xx做了个噩梦。", id="nightmare",
+      bs={
+        { t="无后续。", conds={"阅历up"} },
+        { t="但意外学会了特殊技能清明梦。", conds={"知识up","审美up"} },
+        { t="被吓得浑身发抖……", mood=-10, conds={"情感up"} },
+        { t="醒来后遇见了鬼压床。", mood=-5, conds={"首次上线较晚up","知识较低up"} },
+      }
+    },
+    -- 4 xx吃了一顿超美味的饭（饭点）
+    { bg="xx吃了一顿超美味的饭。", conds={"饭点high"}, id="eat_4", cdgrp="EAT",
+      bs={
+        { t="无后续。", mood=5, conds={"逻辑up"} },
+        { t="但误食了过敏食物，被送进医院抢救半小时后，已经痊愈。", conds={"知识较低up","近日阅读较少up","夏秋up"} },
+      }
+    },
+    -- 5 xx喝了一杯水
+    { bg="xx喝了一杯水。", id="drink",
+      bs={
+        { t="无后续。", conds={"逻辑up"} },
+        { t="被呛住，原地咳嗽了五分钟。", conds={"阅历较低up"} },
+        { t="遇见凉水塞书缝……", mood=-5, conds={"阅历up","近日阅读较少up"} },
+        { t="结果发现水是雪碧假扮的，xx感到很诡异。", conds={"审美up","辩证up","逻辑up"} },
+      }
+    },
+    -- 6 xx独自去了一家餐馆吃饭
+    { bg="xx独自去了一家餐馆吃饭。", conds={"饭点high"}, id="eat_6", cdgrp="EAT",
+      bs={
+        { t="无后续。", conds={"逻辑up"} },
+        { t="拍到了自己的书生照片（总感觉会遇见狐狸……）。", mood=5, conds={"审美up"} },
+        { t="吃完顺手扫了饮料有奖码，中了三等奖。", pts=3, conds={"阅历up"} },
+      }
+    },
+    -- 7 xx点了个外卖来吃吃！
+    { bg="xx点了个外卖来吃吃！", conds={"饭点high"}, id="eat_7", cdgrp="EAT",
+      bs={
+        { t="无后续。" },
+        { t="点到一些美味健康之物。", mood=5, conds={"阅历up"} },
+        { t="点到一堆难吃的预制菜……", mood=-5, conds={"近日阅读较少up","审美较低up"} },
+        { t="结果骑手派送途中外卖连着电动车一起被抢了……xx善解人意地送了骑手一辆新车。", pts=-5, conds={"情感up"} },
+        { t="结果骑手派送途中外卖连着电动车一起被抢了……xx没吃到饭气得半死，抢走了骑手仅剩的二十块钱点了个新外卖。", pts=2, conds={"辩证up","近日阅读较多up"} },
+      }
+    },
+    -- 8 xx决定自己下厨
+    { bg="xx决定自己下厨。", conds={"饭点high"}, id="eat_8", cdgrp="EAT",
+      bs={
+        { t="无后续。" },
+        { t="做出一顿色香味俱全之物。", mood=5, conds={"知识up","逻辑up"} },
+        { t="把房子烧没了……只好向主人索要财物购入新房子。", pts=-5, conds={"知识较低up"} },
+      }
+    },
+    -- 9 xx决定带猫去做绝育（春秋）
+    { bg="xx决定带猫去做绝育。", conds={"春秋high"}, id="cat_neuter",
+      bs={
+        { t="绝育成功，小猫变得更粘人了！", pts=1, conds={"情感up"} },
+        { t="猫生气地抓伤了xx，xx开始思考宠物绝育的伦理问题。最终把猫带回了家。", conds={"知识up","逻辑up","辩证up"} },
+        { t="结果因为夜晚天黑看不清路，连书带猫一起滚落到了一处悬崖下面……", conds={"审美up"} },
+      }
+    },
+    -- 10 xx独自观看了电影《Lalaland》
+    { bg="xx独自观看了电影《Lalaland》。", conds={"晚间high","深夜up"}, id="movie_10", cdgrp="MOVIE",
+      bs={
+        { t="无后续。" },
+        { t="感觉很无聊，在美丽的歌曲里开始睡觉。", mood=-1, conds={"审美较低up"} },
+        { t="感觉很兴奋，并陶醉在洛杉矶的夜晚里。", mood=5, conds={"审美up"} },
+        { t="看到一半却突然掉落大量碎纸屑，只好落荒而逃。", conds={"近日阅读较少up","离线时间长up"} },
+      }
+    },
+    -- 11 xx独自观看了电影《战狼2》
+    { bg="xx独自观看了电影《战狼2》。", conds={"日中up"}, id="movie_11", cdgrp="MOVIE",
+      bs={
+        { t="无后续。" },
+        { t="很讨厌，发誓再也不看。", mood=-1, conds={"审美up"} },
+        { t="结果爱上了男主演……", conds={"审美较低up"} },
+      }
+    },
+    -- 12 xx独自观看了电影《花样年华》
+    { bg="xx独自观看了电影《花样年华》。", conds={"晚间high","深夜up"}, id="movie_12", cdgrp="MOVIE",
+      bs={
+        { t="无后续。" },
+        { t="但是感觉看不懂，莫名其妙。", conds={"审美较低up","情感较低up"} },
+        { t="这期真是审美积累……", conds={"审美up","情感up"} },
+      }
+    },
+    -- 13 xx在独自观看电影时不小心把可乐弄洒在了电影院的座位上
+    { bg="xx在独自观看电影时不小心把可乐弄洒在了电影院的座位上。", conds={"知识较低up"}, id="cola",
+      bs={
+        { t="无后续。", mood=-1, pts=-1 },
+        { t="只好痛哭流涕地找到保洁员道歉。", mood=-5, conds={"情感up","阅历较低up"} },
+        { t="趁着无人注意偷偷溜出了影院。", conds={"情感较低up"} },
+      }
+    },
+    -- 14 xx独自观看了一场F1比赛
+    { bg="xx独自观看了一场F1比赛。", conds={"夏秋晚间up"}, id="f1",
+      bs={
+        { t="无后续。", conds={"阅历up","逻辑up"} },
+        { t="从此一发不可收拾成为了苦逼的四轮书……", mood=-10, pts=5, conds={"情感up"} },
+        { t="感觉好无聊再也不打算看了。", conds={"情感较低up","辩证up"} },
+      }
+    },
+    -- 15 xx生病了……
+    { bg="xx生病了……", conds={"流感季high","知识较低up","离线时间长up"}, id="sick",
+      bs={
+        { t="无后续。", mood=-1 },
+        { t="但去医院打了吊针后堂堂痊愈！", mood=10, pts=-5, conds={"阅历up"} },
+        { t="但没有去医院。", mood=-10, conds={"知识较低up","阅历较低up"} },
+      }
+    },
+    -- 16 xx在外面被一个很大的东西欺负了……
+    { bg="xx在外面被一个很大的东西欺负了……", id="bully",
+      bs={
+        { t="xx不知道那是什么，xx很害怕地躲回了家。", mood=-5, conds={"知识较低up","阅历较低up"} },
+        { t="xx感觉莫名其妙，绕过它离开了。", conds={"知识up","阅历up"} },
+        { t="xx拿出电话摇来了xx的主人也就是你，你发现那是一只邪恶斑点狗。", pts=-2, conds={"情感up"} },
+        { t="聪明的xx跟随着此物回到它的家，偷拿了两块钱给自己当精神损失费。", pts=2, conds={"辩证high"} },
+      }
+    },
+    -- 17 xx读完了一本书
+    { bg="xx读完了一本书。", conds={"近日读完up"}, id="finish",
+      bs={
+        { t="无后续。", mood=1 },
+        { t="发现这本书超级无敌烂。", mood=-5, conds={"情感up"} },
+        { t="惊喜地发现这是xx的书生之书……", mood=20, conds={"审美up"} },
+        { t="发现了许多逻辑漏洞，怒上豆瓣写了二星辣评，收到了出版社的礼包补偿。", pts=2, conds={"辩证high"} },
+      }
+    },
+    -- 18 xx走入一家神秘小店……
+    { bg="xx走入一家神秘小店……", conds={"午夜深high"}, id="mystery_shop",
+      bs={
+        { t="却因为打扮太土被赶了出来。", mood=-1, conds={"审美较低up"} },
+        { t="购入一个盲盒，拆开一看发现是一堆迷你拼豆小鸡。还挺可爱的。", mood=5, item="toy", conds={"情感up"} },
+        { t="购入了一碗神秘食物，吃完感觉好难吃不想给钱赶紧跑路。", mood=-1, pts=1, conds={"逻辑up","辩证up"} },
+        { t="发现自己什么也买不起于是试图偷东西，被抓住拷打了一顿。", mood=-5, pts=-3, conds={"辩证high"} },
+      }
+    },
+    -- 19 xx网购了一款机器人
+    { bg="xx网购了一款机器人。", conds={"知识up","逻辑up"}, id="robot",
+      bs={
+        { t="无后续。", pts=-2 },
+        { t="傻子xx用不懂，扔掉了。", pts=-5, conds={"阅历较低up"} },
+        { t="聪明xx利用机器人大大提高了自己的生活水平。", pts=-2, mood=10, conds={"知识up","逻辑up","阅历up"} },
+        { t="机器人却偷偷告诉了xx一个惊天大秘密……", conds={"审美up"} },
+      }
+    },
+    -- 20 xx决定开始运动。
+    { bg="xx决定开始运动。", id="sport",
+      bs={
+        { t="一小时过去，xx放弃了。", conds={"阅历较低high"} },
+        { t="xx购入了瑜伽球×1。", pts=-2, item="toy", conds={"审美up"} },
+        { t="xx每天早晨6：00准时爬起床跑步，却因为起床动静太大遭到了邻居疯狂投诉，只好放弃。", mood=-1, conds={"知识较低up"} },
+        { t="xx购入了拳击手套×1。", pts=-2, item="toy", conds={"各项均衡high"} },
+      }
+    },
+    -- 21 xx无聊地待在家里，追起了自己的尾巴。却意外制造了一场龙卷风。
+    { bg="xx无聊地待在家里，追起了自己的尾巴。却意外制造了一场龙卷风。", pts=-1, id="tail_tornado" },
+    -- 22 xx独自开始哼歌。
+    { bg="xx独自开始哼歌。", conds={"审美up"}, id="hum" },
+    -- 23 xx网购了一套画具。
+    { bg="xx网购了一套画具。", pts=-2, item="toy", conds={"审美up"}, id="art_supplies" },
+    -- 24 xx原地跳了一段天鹅湖。
+    { bg="xx原地跳了一段天鹅湖。", conds={"审美up"}, id="swan" },
+    -- 25 xx来到一片湖旁边，开始坐下钓鱼。
+    { bg="xx来到一片湖旁边，开始坐下钓鱼。", conds={"阅历up"}, id="fish",
+      bs={
+        { t="无后续。" },
+        { t="钓到了一条萌萌小鱼，xx将它又放回了湖里。", mood=5, conds={"情感up"} },
+        { t="两小时过去了什么也没钓到！xx气急败坏地跑了。", mood=-5, conds={"阅历较低up"} },
+        { t="过了一会儿，鱼线开始抖动，xx提起来一看，却发现是一个河神……", conds={"辩证up"} },
+      }
+    },
+    -- 26 xx决定出门走走！心情+2%
+    { bg="xx决定出门走走！", mood=2, id="walk" },
+    -- 27 xx决定去网吧放纵自己！狂打了两个小时数独。
+    { bg="xx决定去网吧放纵自己！狂打了两个小时数独。", conds={"逻辑high"}, id="netcafe" },
+    -- 28 xx决定用一辈子来成为自己。
+    { bg="xx决定用一辈子来成为自己。", conds={"各项均衡且偏高high"}, id="become_self" },
+    -- 29 xx走在路上，捡到了一副塔罗牌。
+    { bg="xx走在路上，捡到了一副塔罗牌。", conds={"晚夜high","情感up"}, id="tarot",
+      bs={
+        { t="xx把玩了一会儿，随手扔在了路边。", conds={"阅历较低up"} },
+        { t="xx感到很有意思，随机抽取了一张，逆位宝剑八。" },
+        { t="xx把它带回了家。", conds={"审美up","情感up","阅历up","知识up"} },
+      }
+    },
+    -- 30 xx来到了博物馆。
+    { bg="xx来到了博物馆。", conds={"午后high","知识high"}, id="museum",
+      bs={
+        { t="但只是乱逛一圈就走了。", conds={"阅历较低up"} },
+        { t="意外被工作人员挖掘，关进了玻璃柜成为新展品。", mood=-2, conds={"审美up"} },
+        { t="学到了很多新知识！", pts=2, conds={"知识high"} },
+      }
+    },
+    -- 31 xx看到了一道彩虹。心情+2%（审美up）
+    { bg="xx看到了一道彩虹。", mood=2, conds={"审美up"}, id="rainbow" },
+    -- 32 xx说："Can I waste all your time here on the sidewalk?"
+    { bg="xx说：“Can I waste all your time here on the sidewalk?”", conds={"审美up","情感up"}, id="sidewalk" },
+    -- 33 xx路过了一座华美的建筑。
+    { bg="xx路过了一座华美的建筑。", conds={"辩证up","逻辑up","知识up","阅历较低up"}, id="building" },
+    -- 34 xx小睡了30分钟。
+    { bg="xx小睡了30分钟。", conds={"午睡up","春季up"}, id="nap",
+      bs={
+        { t="醒来后精神好了很多。", mood=5 },
+        { t="恰巧梦见了一个温暖的午后……", conds={"情感up"} },
+      }
+    },
+    -- 35 xx被陨石砸中了。心情-10%
+    { bg="xx被陨石砸中了。", mood=-10, conds={"知识较低up"}, id="meteor" },
+    -- 36 xx骑车在外面玩时，天空突然下起了倾盆大雨。心情-5%
+    { bg="xx骑车在外面玩时，天空突然下起了倾盆大雨。", mood=-5, id="rain_bike" },
+    -- 37 xx搭乘出租车时，充电宝突然着火了。
+    { bg="xx搭乘出租车时，充电宝突然着火了。", id="power_bank",
+      bs={
+        { t="xx赶紧将其扔到了司机身上。", mood=2, conds={"知识较低up","辩证up"} },
+        { t="xx吓得快死了立马跳车。", mood=-2, conds={"阅历较低up"} },
+        { t="xx淡定地拿出一瓶矿泉水浇了上去，结果充电宝直接爆炸了！将xx和司机一起送进了医院。", pts=-5, conds={"知识较低up","阅历较低up"} },
+        { t="不过还好，xx拿出了干粉灭火器手忙脚乱一通操作化解危机。", pts=3, conds={"知识up","阅历up","逻辑up"} },
+      }
+    },
+    -- 38 xx搭乘电梯时，电梯突然出现了故障。
+    { bg="xx搭乘电梯时，电梯突然出现了故障。", id="elevator",
+      bs={
+        { t="xx淡定地踮起脚按了呼救按键，半小时后脱困。", conds={"逻辑up"} },
+        { t="xx急得团团转。晕晕的团团生气地救出了它。", mood=-2, conds={"情感up"} },
+        { t="xx躲在电梯里背着主人偷偷玩起了手机。", mood=5, conds={"审美up","辩证up"} },
+      }
+    },
+    -- 39 xx来到一颗树下，顺手挖了个洞。
+    { bg="xx来到一颗树下，顺手挖了个洞。", conds={"审美up","辩证up"}, id="hole",
+      bs={
+        { t="无后续。", mood=1 },
+        { t="意外发现了石油，但xx发现报矿没有奖励，遗憾地把它又埋了起来。", conds={"辩证up"} },
+        { t="结果发现一个神秘小卷轴……", conds={"审美high"} },
+      }
+    },
+    -- 40 xx路遇了一个冰淇淋并食用之。心情+2%
+    { bg="xx路遇了一个冰淇淋并食用之。", mood=2, id="icecream" },
+}
+local ADULT_INBOX_EVENTS_FLAT = nil  -- 惰性生成（主体+各分支展开）
+
+-- 书信开头/结尾模板：按当前单本最高属性选用
+-- 占位符（昵称）会在展示时替换
+local INBOX_LETTER_TEMPLATES = {
+    grief_high = {
+        great = "（昵称）：",
+        open = "你不在的日子里我的生活很丰富！也很想你……",
+        close = "下次见！！要开心——",
+    },
+    aesthetic_high = {
+        great = "亲爱的朋友：",
+        open = "展信佳。当你读这封信的时候，我又将拥有你生命中的三分钟。",
+        close = "请停一停，你真美丽。",
+    },
+    logic_high = {
+        great = "朋友：",
+        open = "近况汇报如下：",
+        close = "一切都还好吗？",
+    },
+    knowledge_high = {
+        great = "亲爱的主人：",
+        open = "最近又学到了许多新东西，忍不住向你分享……",
+        close = "江南无所有，聊赠一枝春。",
+    },
+    experience_high = {
+        great = "人类：",
+        open = "见字如晤。有些好玩的经历，难以抑制分享的心情。",
+        close = "真想与这封信一起，跨过千山万水。",
+    },
+    dialectic_high = {
+        great = "人类的女孩：",
+        open = "见不到你我急得团团转……最近也有一些小书事发生！请品鉴！",
+        close = "真想和你畅聊上一个晚自习呀！",
+    },
+}
+-- 模板对应的最高属性判定
+local INBOX_LETTER_PROFILE = {
+    { attr="审美", style="aesthetic_high" },
+    { attr="逻辑", style="logic_high" },
+    { attr="知识", style="knowledge_high" },
+    { attr="阅历", style="experience_high" },
+    { attr="辩证", style="dialectic_high" },
+    { attr="情感", style="grief_high" },  -- 情感兜底
+}
+
+-- 惰性展开事件池：每个 (主体×分支) 展开为一个候选
+function FocusFeedback:_inboxFlatEvents()
+    if ADULT_INBOX_EVENTS_FLAT then return ADULT_INBOX_EVENTS_FLAT end
+    local flat = {}
+    for _, e in ipairs(ADULT_INBOX_EVENTS) do
+        local tail_blanks = { { t="" } }
+        local branches = (e.bs and #e.bs > 0) and e.bs or tail_blanks
+        for _, b in ipairs(branches) do
+            table.insert(flat, {
+                id = e.id,
+                bg = e.bg,
+                text = (b.t and b.t ~= "") and e.bg .. b.t or e.bg,
+                conds = e.conds or {},
+                bconds = b.conds or {},
+                mood = b.mood or (e.mood or 0),
+                pts = b.pts or (e.pts or 0),
+                item = b.item or e.item,
+                cdgrp = (b.cdgrp or e.cdgrp),
+                nap = e.nap,
+                is_blank = (not b.t or b.t == ""),
+            })
+        end
+    end
+    ADULT_INBOX_EVENTS_FLAT = flat
+    return flat
+end
+
+-- 依据当前单本六维属性，按属性值加权随机抽取书信风格（与事件触发同一套加权逻辑）
+function FocusFeedback:_inboxLetterStyle(entry)
+    local a = self:_inboxAttrs(entry)
+    -- 每种风格的出现概率 ∝ 它对应属性的当前值；属性为0时给极低权重保底，避免完全消失
+    local picked = self:_weightedPick(INBOX_LETTER_PROFILE, function(item)
+        return 0.1 + (a[item.attr] or 0)
+    end)
+    return INBOX_LETTER_TEMPLATES[picked.style] or INBOX_LETTER_TEMPLATES.grief_high
+end
+
+-- 季节：3-5春，6-8夏，9-11秋，12-2冬（返回“春/夏/秋/冬”）
+function FocusFeedback:_seasonLabel(month)
+    if month == 3 or month == 4 or month == 5 then return "春" end
+    if month == 6 or month == 7 or month == 8 then return "夏" end
+    if month == 9 or month == 10 or month == 11 then return "秋" end
+    return "冬"
+end
+
+-- 时间段落标签（用于事件选中时的时间锚点；来信时间由时长随机分配）
+function FocusFeedback:_inboxPeriodLabel(hour)
+    if hour < 3 then return "深夜" end
+    if hour < 6 then return "深夜" end
+    if hour < 9 then return "早晨" end
+    if hour < 12 then return "上午" end
+    if hour < 13 then return "午间" end
+    if hour < 18 then return "午后" end
+    if hour < 21 then return "傍晚" end
+    if hour < 24 then return "晚间" end
+    return "深夜"
+end
+
+-- 六维属性（来自 collection entry 的 attributes，或当前存活书）
+function FocusFeedback:_inboxAttrs(entry)
+    local a = entry and entry.attributes
+    if type(a) == "table" and a["知识"] then return a end
+    return self:_initAttributes()  -- 兜底全 0
+end
+
+-- 计算某条候选的权重乘数（>=0，0 表示当前不可触发）
+function FocusFeedback:_inboxBranchWeight(cand, attrs, ctx)
+    local w = 1.0
+    local all_conds = {}
+    for _, c in ipairs(cand.conds) do table.insert(all_conds, c) end
+    for _, c in ipairs(cand.bconds) do table.insert(all_conds, c) end
+    for _, c in ipairs(all_conds) do
+        local f = self:_inboxCondWeight(c, attrs, ctx)
+        w = w * f
+        if w <= 0.001 then return 0 end
+    end
+    return w
+end
+
+-- 解析单个条件字符串 → 乘数 [0,3]。dirname 语义：up/high = 属性高加权；较低up/high = 属性低加权
+function FocusFeedback:_inboxCondWeight(c, attrs, ctx)
+    -- 时间/季节类（不带属性，用 ctx.hour / ctx.season / ctx.periodWeight）
+    local hour = ctx.hour or 12
+    if c == "夜间high" then return (hour >= 18 or hour < 6) and 3 or 0 end
+    if c == "深夜up" then return (hour >= 23 or hour < 3) and 1.8 or 0 end
+    if c == "晚间high" then return (hour >= 19 and hour < 23) and 3 or 0 end
+    if c == "晚夜high" then return (hour >= 18 or hour < 5) and 3 or 0 end
+    if c == "午夜深high" then return (hour >= 22 or hour < 6) and 3 or 0 end
+    if c == "日中up" then return (hour >= 12 and hour < 18) and 1.8 or 0 end
+    if c == "午后high" then return (hour >= 14 and hour < 18) and 3 or 0 end
+    if c == "饭点high" then return (hour >= 7 and hour < 9) or (hour >= 12 and hour < 13) or (hour >= 18 and hour < 19) and 3 or 0 end
+    if c == "午睡up" then return (hour >= 12 and hour < 15) and 1.8 or 0 end
+    if c == "00:00high" then return (hour == 0) and 3 or 0 end
+
+    -- 季节
+    local season = ctx.season or self:_seasonLabel(os.date("*t").month)
+    if c == "春季up" then return season == "春" and 1.8 or 1.0 end
+    if c == "夏秋up" then return (season == "夏" or season == "秋") and 1.8 or 1.0 end
+    if c == "春秋high" then return (season == "春" or season == "秋") and 3 or 0 end
+    if c == "流感季high" then return (season == "春" or season == "秋") and 3 or 1.0 end
+    if c == "夏秋晚间up" then return (season == "夏" or season == "秋") and (hour >= 21 and hour < 22) and 1.8 or 0 end
+
+    -- 阅读记录
+    local recent_less = ctx.recent_read_ge6_less and true or false   -- 近3日较多(<6h? 见下)
+    if c == "近日阅读较少up" then return ctx.read_low and 1.8 or 1.0 end
+    if c == "近日阅读较多up" then return ctx.read_high and 1.8 or 1.0 end
+    if c == "近日读完up" then return ctx.finished_recent and 2.0 or 0 end
+    if c == "离线时间长up" then return ctx.offline_long and 1.6 or 0 end
+    if c == "首次上线较晚up" then return ctx.first_online_late and 1.8 or 0 end
+
+    -- 属性类：形态 属性名 + up/high/较低
+    local attr = c:match("^([知识审美情感阅历逻辑辩证])")
+    local attr_ok = attr ~= nil
+    if attr_ok and (c:find("较低", 1, true) or c:match("up$") or c:match("high$")) then
+        local v = attrs[attr] or 0
+        local low = c:find("较低", 1, true) ~= nil
+        local level = c:match("high$") and "high" or "up"
+        local k = level == "high" and 3 or 1.6
+        if low then
+            return (v <= 30) and k or (100 - v) / 100   -- 越低越高；>30 时随反比
+        else
+            return (v >= 70) and k or v / 100
+        end
+    end
+    -- 特殊
+    if c == "各项均衡up" then return ctx.balanced and 1.6 or 0 end
+    if c == "各项均衡high" then return ctx.balanced and 2.6 or 0 end
+    if c == "各项均衡且偏高high" then return ctx.balanced and ctx.high_all and 3 or 0 end
+    return 1.0 -- 未知条件视为中性
+end
+
+-- 生成两本测试书（注入 collection），属性分布便于观察
+function FocusFeedback:_ensureTestBooks()
+    local c = self:_readCollection()
+    local hasA, hasB = false, false
+    for _, e in ipairs(c) do
+        if e.test_book == "A" then hasA = true end
+        if e.test_book == "B" then hasB = true end
+    end
+    if hasA and hasB then return end
+    -- 测试书 A：属性均衡且中高（便于测"均衡且偏高"）
+    if not hasA then
+        table.insert(c, {
+            index = 99901, nickname = "测试书·均衡", test_book = "A",
+            reveal_date = todayKey(), adopt_date = todayKey(),
+            attributes = {知识=65,审美=60,情感=62,阅历=58,逻辑=70,辩证=64},
+        })
+    end
+    -- 测试书 B：属性偏谱（逻辑极高、情感极低，便于观察方向加权差异）
+    if not hasB then
+        table.insert(c, {
+            index = 99902, nickname = "测试书·偏科", test_book = "B",
+            reveal_date = todayKey(), adopt_date = todayKey(),
+            attributes = {知识=85,审美=75,情感=15,阅历=40,逻辑=90,辩证=80},
+        })
+    end
+    self:_saveCollection(c)
+end
+
+-- 为 collection 中每本成年书（含测试书）更新 last_inbox_ts（首次）
+function FocusFeedback:_inboxInit()
+    local c = self:_readCollection()
+    local changed = false
+    for _, e in ipairs(c) do
+        if e.reveal_date and not e.last_inbox_ts then
+            e.last_inbox_ts = os.time()
+            changed = true
+        end
+    end
+    if changed then self:_saveCollection(c) end
+end
+
+-- 读取近3日阅读时长(秒)，用于"较少/较多"判定（less ≤3h，more ≥6h）
+function FocusFeedback:_recentReadSeconds()
+    return self:_getDailyStat().reading_seconds or 0
+end
+
+-- 读取当前积分
+function FocusFeedback:_inboxPoints()
+    return self:_readPoints() or 0
+end
+
+-- 读取某项道具库存数量
+function FocusFeedback:_inboxInv(qty, key)
+    local inv = self:_readInventory()
+    return (inv and inv[key]) or 0
+end
+
+-- 依据离线时长在时间轴内随机撒点，返回升序的时间戳数组
+-- keep = 事件条数；offline_sec = 本次离线总长
+function FocusFeedback:_inboxRandomTimes(offline_sec, keep)
+    local times = {}
+    local span = math.max(600, offline_sec)  -- 至少10分钟
+    for i = 1, keep do
+        local t = math.random(0, span - 600)
+        table.insert(times, t)
+    end
+    table.sort(times)
+    return times
+end
+
+-- 生成一封来信内容（不落库）。ctx 封装上下文供权重判定。
+function FocusFeedback:_genInboxLetter(entry, offline_sec, now)
+    local attrs = self:_inboxAttrs(entry)
+    local ctx = { hook = entry }
+    -- 参数保守填充，避免依赖重构上下文：
+    ctx.hour = os.date("*t", now).hour
+    ctx.season = self:_seasonLabel(os.date("*t", now).month)
+    ctx.offline_long = offline_sec >= 4 * 3600
+    ctx.offline_short = offline_sec < 3600
+    -- 均衡与偏高判定（标准差≤10 且 均值≥60）
+    local vals = {}
+    for _, k in ipairs(ATTR_KEYS) do table.insert(vals, attrs[k] or 0) end
+    local sum, n = 0, #vals
+    for _, v in ipairs(vals) do sum = sum + v end
+    local mean = sum / n
+    local sd = 0
+    for _, v in ipairs(vals) do sd = sd + (v - mean) * (v - mean) end
+    sd = math.sqrt(sd / n)
+    ctx.balanced = sd <= 10
+    ctx.high_all = mean >= 60
+    ctx.read_low = self:_recentReadSeconds() <= 3 * 3600
+    ctx.read_high = self:_recentReadSeconds() >= 6 * 3600
+    ctx.first_online_late = ctx.hour >= 11
+    ctx.finished_recent = false
+
+    -- 事件数量：约1条/小时，至少1条（离线稀疏错落；池不足时自动变少）
+    local keep = math.max(1, math.floor(offline_sec / 3600))
+
+    -- 冷却过滤：进食组3h / 电影组2天 距上次触发
+    local cd = entry.inbox_cd or {}
+    local flat = self:_inboxFlatEvents()
+    local pool = {}
+    for _, cand in ipairs(flat) do
+        local ok = true
+        if cand.cdgrp == "EAT" and (cd.eat and now - cd.eat < INBOX_COOLDOWN_EAT_SEC) then ok = false end
+        if cand.cdgrp == "MOVIE" and (cd.mov and now - cd.mov < INBOX_COOLDOWN_MOVIE_SEC) then ok = false end
+        if ok then table.insert(pool, cand) end
+    end
+
+    -- 加权抽取 keep 条（带近期降权，避免重复）
+    local picks = {}
+    local used = {}
+    for _ = 1, keep do
+        local candidates = {}
+        for _, cand in ipairs(pool) do
+            local w = self:_inboxBranchWeight(cand, attrs, ctx)
+            if w > 0 then
+                -- 近期已用事件降权（*0.4），反重复
+                if used[cand.id] then w = w * 0.4 end
+                table.insert(candidates, { cand = cand, w = w })
+            end
+        end
+        if #candidates == 0 then break end
+        local total = 0
+        for _, ci in ipairs(candidates) do total = total + ci.w end
+        local r = math.random() * total
+        -- 归一化候选权重到 [0.1,3]（约束边界）
+        local sel
+        local acc = 0
+        for _, ci in ipairs(candidates) do
+            acc = acc + ci.w
+            if r <= acc then sel = ci.cand break end
+        end
+        if not sel then sel = candidates[#candidates].cand end
+        table.insert(picks, sel)
+        used[sel.id] = true
+    end
+
+    -- 组装信件：附加随机时间戳（时分）与落款日期区间
+    local times = self:_inboxRandomTimes(offline_sec, #picks)
+    local events = {}
+    for i, cand in ipairs(picks) do
+        local sec = times[i] or 0
+        local et = os.time({ year = os.date("*t", now).year, month = os.date("*t", now).month, day = os.date("*t", now).day, hour = 0 }) + sec
+        table.insert(events, {
+            time = os.date("%H:%M", et),
+            text = cand.text:gsub("xx", entry.nickname or "它"),
+            mood = cand.mood or 0,
+            pts = cand.pts or 0,
+            item = cand.item,
+            flatid = cand.id,
+            cand = cand,
+        })
+    end
+    return { events = events }
+end
+
+-- 应用来信后果（积分/心情/道具）。测试模式下不真正生效，仅计入展示文本。
+function FocusFeedback:_applyInboxResult(e, mood, pts, item)
+    if INBOX_TEST_MODE then return end
+    -- 心情
+    if mood and mood ~= 0 then
+        local cur = self:_readMood()
+        self:_saveMood(math.max(0, math.min(100, cur + mood)))
+    end
+    -- 积分（下限0）
+    if pts and pts ~= 0 then
+        local cur = self:_inboxPoints()
+        if pts < 0 and cur <= 0 then
+            -- 已为0则不扣
+        else
+            self:_savePoints(math.max(0, cur + pts))
+        end
+    end
+    -- 道具
+    if item then
+        local inv = self:_readInventory()
+        inv[item] = (inv[item] or 0) + 1
+        self:_saveInventory(inv)
+    end
+end
+
+-- 书之来信主入口：对每本成年书，检查自上次来信以来的离线时长，生成来信并展示
+function FocusFeedback:_showInboxLetters()
+    local c = self:_readCollection()
+    local now = os.time()
+    local changed = false
+    for _, e in ipairs(c) do
+        if e.reveal_date and e.last_inbox_ts then
+            local gap = now - e.last_inbox_ts
+            if gap >= 1800 then  -- 至少30分钟才来信
+                local letter = self:_genInboxLetter(e, gap, now)
+                if #letter.events > 0 then
+                    self:_displayInbox(e, letter, gap, now)
+                    -- 冷却更新（取本信事件中最匹配组）
+                    local cd = e.inbox_cd or {}
+                    for _, ev in ipairs(letter.events) do
+                        if ev.cand and ev.cand.cdgrp == "EAT" then cd.eat = now end
+                        if ev.cand and ev.cand.cdgrp == "MOVIE" then cd.mov = now end
+                    end
+                    e.inbox_cd = cd
+                end
+                e.last_inbox_ts = now
+                changed = true
+            end
+        end
+    end
+    if changed then self:_saveCollection(c) end
+end
+
+-- 展示一封来信（书信：按最高属性选用开头/结尾模板；底部落款日期可跨日；正文为时分+事件）
+function FocusFeedback:_displayInbox(e, letter, gap, now)
+    local times = self:_inboxRandomTimes(gap, #letter.events)  -- 复用随机时序，保证展示与数据一致
+    local style = self:_inboxLetterStyle(e)
+    local nickname = e.nickname or "它"
+    local lines = {}
+
+    -- 书信开头：称谓 + 开头语
+    table.insert(lines, style.great:gsub("（昵称）", nickname))
+    table.insert(lines, style.open:gsub("（昵称）", nickname))
+    table.insert(lines, "")
+
+    -- 正文：时分 + 事件
+    for i, ev in ipairs(letter.events) do
+        local time_str = os.date("%H:%M", now - gap + (times[i] or 0))
+        local suffix = ""
+        local applied = false
+        if ev.mood ~= 0 then suffix = suffix .. (" 心情%+d%%"):format(ev.mood); applied = true end
+        if ev.pts ~= 0 then suffix = suffix .. (" 积分%+d"):format(ev.pts); applied = true end
+        if ev.item then suffix = suffix .. " 道具+" .. ev.item; applied = true end
+        if INBOX_TEST_MODE and applied then
+            suffix = suffix .. "【测试·不生效】"
+        end
+        table.insert(lines, time_str .. "  " .. ev.text .. suffix)
+    end
+
+    -- 书信结尾：结尾语
+    table.insert(lines, "")
+    table.insert(lines, style.close:gsub("（昵称）", nickname))
+    table.insert(lines, "")
+
+    -- 落款（昵称 + 真实日期，跨日显示区间）
+    local start_dt = os.date("%Y.%m.%d", now - gap)
+    local end_dt = os.date("%Y.%m.%d", now)
+    local stamp = start_dt
+    if start_dt ~= end_dt then stamp = stamp .. "-" .. end_dt end
+    table.insert(lines, "落款 · " .. nickname)
+    table.insert(lines, "        " .. stamp)
+    self:_showMessage(table.concat(lines, "\n"), 0)
 end
 
 return FocusFeedback
