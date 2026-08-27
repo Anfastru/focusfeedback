@@ -2737,12 +2737,19 @@ end
 function FocusFeedback:_showItemIntro(key, name)
     local intro = self:_getItemIntro(key)
     local dialog
+    local btnrows = {}
+    -- 模恐纪念品：按原文在介绍下方提供"再次体验"（只能按第一次的选择走，无奖励）
+    if key and key:match("^souvenir_mokou_") then
+        table.insert(btnrows, {{ text = "再次体验", callback = function()
+            UIManager:close(dialog)
+            self:_mokouReplayFromSouvenir(key)
+        end }})
+    end
+    table.insert(btnrows, {{ text = "关闭", callback = function() UIManager:close(dialog) end }})
     dialog = ButtonDialog:new{
         title = string.format("%s\n\n%s", name, intro),
         title_align = "center",
-        buttons = {
-            {{text = "关闭", callback = function() UIManager:close(dialog) end}},
-        },
+        buttons = btnrows,
     }
     UIManager:show(dialog)
 end
@@ -8869,7 +8876,6 @@ end
 -- 生成一封来信内容（不落库）。ctx 封装上下文供权重判定。
 -- ========== V18 成长型事件链：模恐 ==========
 
-local MOKOU_ENTRY_HOUR = 0      -- 入口仅 0 点整
 local MOKOU_ENTRY_CHANCE = 0.10 -- 0点+辩证高：约每10次午夜阅读触发一次
 local MOKOU_NIGHT_S, MOKOU_NIGHT_E = 22, 5   -- 午夜窗口 22:00-5:00
 
@@ -8891,7 +8897,7 @@ end
 
 -- 好感变更（存于 collection entry.favor，-100~100；同一字段后续供冒险型判定）
 function FocusFeedback:_addFavor(entry, delta)
-    if self:_mokouTestActive() then return end   -- 测试模式：好感不计
+    if self:_mokouSkipping(entry) then return end   -- 测试/再次体验引导：好感不计
     delta = tonumber(delta) or 0
     if delta == 0 then return end
     local c = self:_readCollection()
@@ -8929,11 +8935,20 @@ end
 
 -- 选择弹窗（样式对齐 _showEventPopup：固定宽、禁滚动、左对齐正文；按钮点击后关闭并回调）
 function FocusFeedback:_showChainChoice(title, body, opts)
+    -- 再次体验引导：不弹窗，自动取脚本里预设的选择序号
+    if self._chain_script then
+        local e = self:_mokouPopScript()
+        local idx = (e and e.c) or 1
+        local o = opts[idx] or opts[1]
+        if o and o.cb then o.cb() end
+        return
+    end
     local dialog
     local btns = {}
     for i, o in ipairs(opts or {}) do
         btns[i] = { text = o.text, callback = function()
             if dialog then UIManager:close(dialog) end
+            if self._rec_index then self:_mokouRecordChoice(self._rec_index, i) end
             if o.cb then o.cb() end
         end }
     end
@@ -8963,19 +8978,77 @@ function FocusFeedback:_showChainChoice(title, body, opts)
     local vertical = VerticalGroup:new{ align = "left", unpack(parts) }
     vertical.not_focusable = true
     dialog:addWidget(vertical)
+    -- 弹窗被点掉（空白/返回）时复位占用标记 → 下一步轮询会自动重弹本选择，避免卡死
+    dialog.onClose = function() self._chain_popup_up = false end
     UIManager:show(dialog)
 end
 
--- 剧情反应句（简单确认弹窗，关闭后执行后续）
+-- 剧情反应句（简单确认弹窗，关闭后执行后续；再次体验引导下自动续接）
 function FocusFeedback:_mokouReply(entry, text, on_done)
-    self:_showEventPopup("来玩玩模恐吧", text or "", nil, {
-        { text = "确定", callback = function() if on_done then on_done() end end }
+    if self:_mokouGuided(entry) then
+        self._chain_popup_up = false
+        if on_done then on_done() end
+        return
+    end
+    local dialog = self:_showEventPopup("来玩玩模恐吧", text or "", nil, {
+        { text = "确定", callback = function()
+            self._chain_popup_up = false
+            if on_done then on_done() end
+        end }
     })
+    if dialog then dialog.onClose = function() self._chain_popup_up = false end end
 end
 
 -- 测试模式开关（连续快进·无奖励·不收藏）
 function FocusFeedback:_mokouTestActive()
     return G_reader_settings:readSetting(settingKey("v18_mokou_test"), false) or false
+end
+
+-- 是否为"再次体验"引导模式（自动按第一次的选择走、无任何奖励/好感/积分/收藏）
+function FocusFeedback:_mokouGuided(entry)
+    return entry and entry.chain ~= nil and entry.chain.guide == true
+end
+
+-- 事件链运行期是否跳过结算类副作用（测试模式 或 再次体验引导）
+function FocusFeedback:_mokouSkipping(entry)
+    return self:_mokouTestActive() or self:_mokouGuided(entry)
+end
+
+-- 弹出引导脚本的下一个决策（{c=选项序号} 或 {r=路由}），消耗后返回
+function FocusFeedback:_mokouPopScript()
+    local g = self._chain_script
+    if not g then return nil end
+    while #g > 0 do
+        local e = table.remove(g, 1)
+        if type(e) == "table" then return e end
+    end
+    return nil
+end
+
+-- 记录正式游玩中的一次选择（按书 index 持久化到该书 chain.play）
+function FocusFeedback:_mokouRecordChoice(index, idx)
+    local c = self:_readCollection()
+    for _, e in ipairs(c) do
+        if e.index == index and e.chain then
+            e.chain.play = e.chain.play or {}
+            table.insert(e.chain.play, { c = idx })
+            break
+        end
+    end
+    self:_saveCollection(c)
+end
+
+-- 记录正式游玩中的一次路由决策（step2A: home/play；step3bA: to4/zzz）
+function FocusFeedback:_mokouRecordRoute(index, r)
+    local c = self:_readCollection()
+    for _, e in ipairs(c) do
+        if e.index == index and e.chain then
+            e.chain.play = e.chain.play or {}
+            table.insert(e.chain.play, { r = r })
+            break
+        end
+    end
+    self:_saveCollection(c)
 end
 
 -- 事件链入口专判：0点整 + 辩证高，约10%触发；受全局锁/该书已完成约束。
@@ -8984,8 +9057,9 @@ function FocusFeedback:_mokouTryStart(now)
     if self:_chainActiveBook() then return nil end
     local test = self:_mokouTestActive()
     if not test then
+        -- 原文：入口仅 00:00 整可触发
         local t = os.date("*t", now)
-        if t.hour ~= MOKOU_ENTRY_HOUR then return nil end
+        if t.hour ~= 0 then return nil end
         if math.random() >= MOKOU_ENTRY_CHANCE then return nil end
     end
     local c = self:_readCollection()
@@ -9020,30 +9094,104 @@ function FocusFeedback:_mokouForceStart()
     G_reader_settings:saveSetting(settingKey("v18_mokou_test"), true)
     local started = self:_mokouTryStart(os.time())
     if started then
-        self:_mokouStep1(started)
+        self:_mokouExecStep("mokouStep1", started)
     else
         self:_showMessage("没有可用测试书（需已有翻开的成年书且辩证≥10）。", 4)
     end
 end
 
+-- 浅拷贝脚本/路径列表（条目为 {c=}/{r=} 的小表）
+function FocusFeedback:_cloneList(t)
+    local out = {}
+    if type(t) == "table" then
+        for _, v in ipairs(t) do
+            if type(v) == "table" then
+                local nv = {}
+                for k2, v2 in pairs(v) do nv[k2] = v2 end
+                table.insert(out, nv)
+            else
+                table.insert(out, v)
+            end
+        end
+    end
+    return out
+end
+
+-- 从纪念品的"再次体验"开始引导重放：只能按第一次的选择走，不做新选择，无任何奖励
+function FocusFeedback:_mokouReplayFromSouvenir(key)
+    local list = G_reader_settings:readSetting(settingKey("v9_mokou_souvenirs"), {}) or {}
+    local rec
+    for _, r in ipairs(list) do
+        if r.key == key then rec = r break end
+    end
+    if not rec or not rec.path then
+        self:_showMessage("该纪念品没有可重放的故事路径。", 4)
+        return
+    end
+    if self:_chainActiveBook() then
+        self:_showMessage("已有一本书正在进行模恐事件链，请先让它结束。", 4)
+        return
+    end
+    local c = self:_readCollection()
+    local e
+    for _, it in ipairs(c) do
+        if it.index == rec.index and it.reveal_date then e = it break end
+    end
+    if not e then
+        self:_showMessage("当初经历这本书的书已不在收藏里，无法再次体验。", 4)
+        return
+    end
+    e.chain = { id = "mokou", node = "step1", started = os.time(), next = 0, window = true,
+                guide = true, variant = rec.variant or 2,
+                script = self:_cloneList(rec.path), play = {} }
+    self:_saveCollection(c)
+    self:_mokouPlayGuided(e)
+end
+
+-- 引导重放主循环：以 next=0 在选中逻辑里连续推进全部步骤，直到链结算清除为止
+function FocusFeedback:_mokouPlayGuided(entry)
+    local guard = 0
+    while true do
+        guard = guard + 1
+        if guard > 60 then break end
+        local c = self:_readCollection()
+        local e
+        for _, it in ipairs(c) do if it.index == entry.index then e = it break end end
+        if not e or not e.chain or not self:_mokouGuided(e) then break end
+        local node_before = e.chain.node
+        self._chain_script = e.chain.script
+        self._rec_index = nil
+        pcall(function() self:_mokouStep(e, os.time()) end)
+        self._chain_script = nil
+        local c2 = self:_readCollection()
+        local e2
+        for _, it in ipairs(c2) do if it.index == entry.index then e2 = it break end end
+        if e2 and e2.chain and e2.chain.node == node_before then break end
+    end
+end
+
 -- 结算一个结局：标记完成→纪念品入库→清除进行中链→(可选)写最后一条动态
 function FocusFeedback:_mokouSettle(entry, ending_id, ending_name, finalText, mood)
-    local test = self:_mokouTestActive()
+    local test = self:_mokouSkipping(entry)
     local c = self:_readCollection()
     local e
     for _, it in ipairs(c) do if it.index == entry.index then e = it break end end
     if not e then return end
-    if not test then e.chain_done_mokou = true end   -- 测试模式不清标记，便于重跑
+    -- 结算前备份首次游玩的路径与变体，随纪念品存档供"再次体验"重放
+    local play_path = e.chain and e.chain.play or {}
+    local chain_variant = e.chain and e.chain.variant
+    if not test then e.chain_done_mokou = true end   -- 测试/再次体验不清标记，便于重跑
     e.chain = nil
     self:_saveCollection(c)
-    if test then return nil end                       -- 测试模式：不产纪念品、不收藏
+    if test then return nil end                       -- 测试/再次体验：不产纪念品、不收藏
     -- 纪念品
     local key = "souvenir_mokou_" .. ending_id
     local inv = self:_readInventory()
     inv[key] = (inv[key] or 0) + 1
     self:_saveInventory(inv)
     local list = G_reader_settings:readSetting(settingKey("v9_mokou_souvenirs"), {}) or {}
-    table.insert(list, { key = key, index = entry.index, ending = ending_id, nick = entry.nickname, at = os.time() })
+    table.insert(list, { key = key, index = entry.index, ending = ending_id, nick = entry.nickname,
+        at = os.time(), path = self:_cloneList(play_path), variant = chain_variant })
     G_reader_settings:saveSetting(settingKey("v9_mokou_souvenirs"), list)
     if finalText then self:_logTravel(entry, finalText, mood or 0, 0) end
     return key
@@ -9054,12 +9202,19 @@ function FocusFeedback:_mokouSouvenirDef(key)
     if not key or not key:match("^souvenir_mokou_") then return nil end
     local ending_id = key:gsub("^souvenir_mokou_", "")
     local names = { school_gold = "优绩主义你赢了", home = "回家", zzz = "zzzzzz", cat_guilt = "猫之愧疚", silent = "缄默之口", neat = "洁癖之书", cold = "书的冷漠", bad = "坏结局", frank = "弗兰肯斯坦的命运" }
-    return { name = names[ending_id] or ending_id, intro = "一段愉悦（？）的模恐记忆。" }
+    local name = "来玩玩模恐吧：" .. (names[ending_id] or ending_id)
+    -- 昵称取该纪念品最新一次收集记录里的书（多次收集以最近一次为准）
+    local nick = "它"
+    local list = G_reader_settings:readSetting(settingKey("v9_mokou_souvenirs"), {}) or {}
+    for _, rec in ipairs(list) do
+        if rec.key == key and rec.nick then nick = rec.nick break end
+    end
+    return { name = name, intro = "来自" .. nick .. "。一段愉悦（？）的模恐记忆。" }
 end
 
 -- 成年书属性增长（写回该书自身 attributes，0-100 封顶）。成长型事件链即"加属性"之通道。
 function FocusFeedback:_addBookAttr(entry, attr, gain)
-    if self:_mokouTestActive() then return end
+    if self:_mokouSkipping(entry) then return end
     if not attr or not gain or gain == 0 then return end
     local c = self:_readCollection()
     for _, e in ipairs(c) do
@@ -9072,9 +9227,9 @@ function FocusFeedback:_addBookAttr(entry, attr, gain)
     self:_saveCollection(c)
 end
 
--- 结算加成：心情(mood) / 积分(pts) / 属性表(attrs)。测试模式全部无效。
+-- 结算加成：心情(mood) / 积分(pts) / 属性表(attrs)。测试/再次体验引导全部无效。
 function FocusFeedback:_applyMokouRewards(entry, mood, pts, attrs)
-    if self:_mokouTestActive() then return end
+    if self:_mokouSkipping(entry) then return end
     if mood and mood ~= 0 then self:_saveMood(self:_readMood() + mood) end
     if pts and pts ~= 0 then self:_savePoints(self:_readPoints() + pts) end
     if attrs then
@@ -9084,9 +9239,9 @@ function FocusFeedback:_applyMokouRewards(entry, mood, pts, attrs)
     end
 end
 
--- 积分消耗（"不足即清零、为零不扣"）。测试模式不扣。
+-- 积分消耗（"不足即清零、为零不扣"）。测试/再次体验引导不扣。
 function FocusFeedback:_mokouPtsCost(entry, cost)
-    if self:_mokouTestActive() then return end
+    if self:_mokouSkipping(entry) then return end
     cost = cost or 0
     local pts = self:_readPoints()
     if pts >= cost then pts = pts - cost
@@ -9122,17 +9277,23 @@ end
 function FocusFeedback:_mokouIntoPlay(entry)
     local nick = self:_nick(entry)
     local attrs = self:_inboxAttrs(entry)
-    local variant
-    if (attrs["情感"] or 0) >= 70 then variant = 1
-    elseif (attrs["辩证"] or 0) >= 70 then variant = 2
-    else variant = (math.random() < 0.5) and 1 or 2 end
-    self:_logTravel(entry, nick .. "小心翼翼推开铁门，把心一横走进了精神病院深处……")
+    -- 再次体验引导：强制用首次记录的变体，保证走向与第一次一致
+    local variant = entry.chain and entry.chain.variant
+    if not variant or variant < 1 or variant > 2 then
+        if (attrs["情感"] or 0) >= 70 then variant = 1
+        elseif (attrs["辩证"] or 0) >= 70 then variant = 2
+        else variant = (math.random() < 0.5) and 1 or 2 end
+    end
+    -- step2 进铁门事件（①情感high：逗猫 / ②辩证high：锁门卡死），按原文
+    local text1 = nick .. "小心翼翼地推开了精神病院的铁门。夜色里，吱嘎吱嘎的声音格外瘆人。突然，一只小猫窜到了" .. nick .. "脚边，吓了它一跳。虽然这里很恐怖，但小猫还是挺可爱的。" .. nick .. "和小猫愉快地玩了起来。"
+    local text2 = nick .. "小心翼翼地推开了精神病院的铁门。夜色里，吱嘎吱嘎的声音格外瘆人。突然，一只小猫窜到了" .. nick .. "脚边，猛地把门给锁住了。" .. nick .. "心里一惊，连忙去拉锁栓，没想到医院的门锁由于老化，居然死死地卡在了那里。"
+    self:_logTravel(entry, (variant == 1) and text1 or text2)
     local c = self:_readCollection()
     for _, e in ipairs(c) do
         if e.index == entry.index and e.chain then
             e.chain.variant = variant
             e.chain.node = "step3"
-            e.chain.next = self:_mokouTestActive() and 0 or (os.time() + 22 * 3600)
+            e.chain.next = self:_mokouSkipping(entry) and 0 or (os.time() + 22 * 3600)
             e.chain.window = true
             break
         end
@@ -9151,12 +9312,20 @@ function FocusFeedback:_mokouStep2(entry)
             local emo_high = (attrs["情感"] or 0) >= 70
             local flv = (dialect_low or emo_high) and 1 or -1
             self:_addFavor(entry, flv)
-            if flv > 0 then
-                -- 好感增加 → 结局：回家
+            -- 该分支去向依赖好感：正式游玩判定并记录，再次体验按脚本走
+            local route
+            if self:_mokouGuided(entry) then
+                local r = self:_mokouPopScript()
+                route = (r and r.r) or "play"
+            else
+                route = flv > 0 and "home" or "play"
+                self:_mokouRecordRoute(entry.index, route)
+            end
+            if route == "home" then
+                -- 好感增加 → 间隔2h后回家事件 + 结局：回家
                 self:_mokouReply(entry, nick .. "轻轻点了点头。", function()
-                    self:_logTravel(entry, nick .. "从废弃的精神病院回到了家，逃过一劫，心情安稳下来。", 1, 0)
+                    self:_logTravel(entry, nick .. "从废弃精神病院回到了家，累得躺在床上，很快就睡着了。", 1, 0)
                     self:_mokouSettle(entry, "home", "回家")
-                    self:_mokouReply(entry, nick .. "……（结局：回家）")
                 end)
             else
                 -- 好感下降 → 它不听你的，继续深入
@@ -9169,36 +9338,60 @@ function FocusFeedback:_mokouStep2(entry)
             local dialect_high = (attrs["辩证"] or 0) >= 70
             local flv = dialect_high and 1 or -1
             self:_addFavor(entry, flv)
-            self:_mokouIntoPlay(entry)
+            self:_mokouReply(entry, nick .. (flv > 0 and "轻轻点了点头。" or "自言自语道：“才不听你的！”"), function()
+                self:_mokouIntoPlay(entry)
+            end)
         end },
     })
 end
 
--- 推进进行中链的当前节点（午夜窗口弹窗节点统一由 win_map 调度）
+-- 推进进行中链的当前节点（午夜窗口弹窗节点统一由 fn_map 调度）
 function FocusFeedback:_mokouStep(entry, now)
     local ch = entry.chain
     if not ch then return end
     local node = ch.node
-    local win_map = { step2 = "mokouStep2", step3 = "mokouStep3", step4 = "mokouStep4",
-        step5 = "mokouStep5", step6 = "mokouStep6", step7 = "mokouStep7" }
-    local fn = win_map[node]
+    local fn_map = { step1 = "mokouStep1", step2 = "mokouStep2", step3 = "mokouStep3",
+        step4 = "mokouStep4", step5 = "mokouStep5", step6 = "mokouStep6", step7 = "mokouStep7" }
+    -- 前台首次触发（节点不带 _open）
+    local fn = fn_map[node]
     if fn then
         local test = self:_mokouTestActive()
-        local ready = test or (now >= (ch.next or 0) and _inWin(now, MOKOU_NIGHT_S, MOKOU_NIGHT_E))
-        if ready then
+        local ready = test or self:_mokouGuided(entry)
+            or (now >= (ch.next or 0) and _inWin(now, MOKOU_NIGHT_S, MOKOU_NIGHT_E))
+        if ready and not self._chain_popup_up then
             self:_mokouSetNode(entry, node .. "_open")   -- 防重复触发；等待该步骤作出选择
-            local ok, err = pcall(function() self["_" .. fn](self, entry) end)
-            if not ok then logger.warn("mokou step error:", err) end
+            self:_mokouExecStep(fn, entry)
         end
         return
     end
-    if node == "step1_open" then
-        -- 等待 step1 选择；不重复触发
-    elseif node == "bad_open" then
+    -- 节点带 _open：选择弹窗被点掉后兜底重弹，避免永久卡死
+    local open_fn = fn_map[node:gsub("_open$", "")]
+    if open_fn and not self._chain_popup_up then
+        self:_mokouExecStep(open_fn, entry)
+        return
+    end
+    if node == "bad_open" then
         -- 坏结局：未结算则（重新）弹出，避免点空白关闭导致卡死
         if not ch.bad_done and not self._bad_popup_up then
             self:_mokouBadPopup(entry)
         end
+    end
+end
+
+-- 执行一步弹窗（置占用标记，出错时复位，交给下一步轮询重试）
+function FocusFeedback:_mokouExecStep(fn, entry)
+    if self:_mokouGuided(entry) then
+        self._chain_script = entry.chain.script
+        self._rec_index = nil
+    else
+        self._chain_script = nil
+        self._rec_index = entry and entry.index
+    end
+    self._chain_popup_up = true
+    local ok, err = pcall(function() self["_" .. fn](self, entry) end)
+    if not ok then
+        self._chain_popup_up = false
+        logger.warn("mokou step error:", err)
     end
 end
 
@@ -9209,12 +9402,12 @@ function FocusFeedback:_mokouStep3(entry)
     local ch = entry.chain
     if (ch and ch.variant) ~= 2 then
         -- a版：遇见小猫
-        self:_showChainChoice("来玩玩模恐吧", nick .. "在精神病院的走廊里遇见一只小猫正在玩耍，你会：", {
+        self:_showChainChoice("来玩玩模恐吧", nick .. "在废弃的精神病院里遇见一只小猫，看见它们在玩耍，你会：", {
             { text = "A.让它马上离开那只猫。", cb = function()
                 if (attrs["情感"] or 0) >= 70 then self:_addFavor(entry, -1) end
                 self:_mokouReply(entry, nick .. "若有所思。", function()
                     self:_mokouFinish(entry, "home", "回家",
-                        nick .. "又和猫玩了一会儿，便直接离开了精神病院。")
+                        nick .. "又和猫玩了一会，直接离开了精神病院。")
                 end)
             end },
             { text = "B.夸猫真可爱。", cb = function()
@@ -9228,35 +9421,54 @@ function FocusFeedback:_mokouStep3(entry)
         })
     else
         -- b版：被困病房区
-        self:_showChainChoice("来玩玩模恐吧", nick .. "被困在精神病院里，你会建议它：", {
+        self:_showChainChoice("来玩玩模恐吧", nick .. "被困在了精神病院里，你会建议它：", {
             { text = "A.大事不妙，先睡一觉。", cb = function()
                 local dh = (attrs["辩证"] or 0) >= 70
                 self:_addFavor(entry, dh and -2 or 0)
-                self:_mokouReply(entry, nick .. (dh and "感觉莫名其妙！" or "隐约感到不安。"), function()
-                    if dh then
+                -- 该分支去向依赖辩证：正式游玩判定并记录，再次体验按脚本走
+                local route
+                if self:_mokouGuided(entry) then
+                    local r = self:_mokouPopScript()
+                    route = (r and r.r) or "to4"
+                else
+                    route = dh and "to4" or "zzz"
+                    self:_mokouRecordRoute(entry.index, route)
+                end
+                if route == "to4" then
+                    self:_mokouReply(entry, nick .. "感觉莫名其妙！", function()
                         self:_mokouToStep4(entry)   -- 好感减少：改走病房线
-                    else
-                        self:_mokouFinish(entry, "zzz", "zzzzzz",
-                            nick .. "就地躺下睡了一觉，结果被警察带回了家。",
-                            { mood = -7 })
-                    end
-                end)
+                    end)
+                else
+                    -- 好感不变（原文无该档反应）：约5h后 zzzz 结局事件
+                    self:_mokouFinish(entry, "zzz", "zzzzzz",
+                        nick .. "在精神病院就地躺下睡了一觉，第二天被路过的警察看见，强硬地带回了家。",
+                        { mood = -7 })
+                end
             end },
             { text = "B.去病房看看。", cb = function()
                 local dh = (attrs["辩证"] or 0) >= 70
                 if dh then self:_addFavor(entry, 2) end
-                self:_mokouReply(entry, nick .. (dh and "将愉悦地采纳你的建议。" or "略带怀疑地照做了。"), function()
+                if dh then
+                    self:_mokouReply(entry, nick .. "将愉悦地采纳你的建议。", function()
+                        self:_mokouToStep4(entry)
+                    end)
+                else
                     self:_mokouToStep4(entry)
-                end)
+                end
             end },
             { text = "C.试图翻墙出去。", cb = function()
                 local lh = (attrs["逻辑"] or 0) >= 70
                 if lh then self:_addFavor(entry, 2) end
-                self:_mokouReply(entry, nick .. "看起来很心动。", function()
+                local finish = function()
                     self:_mokouFinish(entry, "cat_guilt", "猫之愧疚",
-                        nick .. "翻墙出来时，一只小猫叼来了一份神秘礼物。",
+                        nick .. "在高大的围栏下又蹦又跳、又爬又蹿，终于从精神病院出来了。它最后回头看了一眼里面的小猫，小猫似乎因为愧疚，为" .. nick .. "叼来了一些小礼物。",
                         { pts = 5 })
-                end)
+                end
+                if lh then
+                    self:_mokouReply(entry, nick .. "将愉悦地采纳你的建议。", finish)
+                else
+                    finish()
+                end
             end },
         })
     end
@@ -9268,31 +9480,31 @@ function FocusFeedback:_mokouToStep4(entry)
     for _, e in ipairs(c) do
         if e.index == entry.index and e.chain then
             e.chain.node = "step4"
-            e.chain.next = self:_mokouTestActive() and 0 or (os.time() + 22 * 3600)
+            e.chain.next = self:_mokouSkipping(entry) and 0 or (os.time() + 22 * 3600)
             e.chain.window = true
             break
         end
     end
     self:_saveCollection(c)
-    self:_logTravel(entry, self:_nick(entry) .. "推开病房的房门，在月光里看见一块斑驳的姓名牌：F…k…st……")
+    self:_logTravel(entry, self:_nick(entry) .. "随手推开了一间医院病房，房间里散发着难闻的腐臭味，墙上还爬满了青苔。" .. self:_nick(entry) .. "打开了几个抽屉，发现一张姓名牌之类的东西，上面的字迹很模糊，只看得出几个字母：F…k…st……")
 end
 
 function FocusFeedback:_mokouStep4(entry)
     local nick = self:_nick(entry)
-    self:_showChainChoice("来玩玩模恐吧", nick .. "怀疑这栋精神病院另有蹊跷，你建议：", {
-        { text = "A.循着腐臭味的来源掀开床上的被子。", cb = function()
+    self:_showChainChoice("来玩玩模恐吧", nick .. "怀疑这个精神病院有问题，你建议它下一步：", {
+        { text = "A.循着腐臭味的来源掀开床上的被子", cb = function()
             self:_addFavor(entry, 2)
             self:_mokouReply(entry, nick .. "觉得你说的很有道理。", function()
-                self:_logTravel(entry, nick .. "掀开被子，腐肉里包裹着一枚球状物，一双瞳孔缓缓转过来，正对着它。")
+                self:_logTravel(entry, nick .. "忍着恶心掀开了病床上粘成一坨的被子，被子下面赫然是一坨腐肉！它已经变成了暗沉的褐绿色，边缘因失水而干瘪卷曲着，并因为除去遮挡之后味道更加糟糕。" .. nick .. "凑近了一点，竟然发现了肉中包裹着若隐若现的一颗球状物。诡异的是，似乎是因为" .. nick .. "的到来，那颗球状物轻轻颤动着，随后，将黑色的瞳孔转过来对准了" .. nick .. "。")
                 self:_mokouSetNode(entry, "step5", 22 * 3600, true)
             end)
         end },
-        { text = "B.查看墙上的青苔下面有没有记号线索。", cb = function()
+        { text = "B.查看墙上的青苔下面有没有记号线索", cb = function()
             self:_addFavor(entry, -2)
             self:_mokouReply(entry, nick .. "有点怀疑，但还是照做了。", function()
-                self:_logTravel(entry, nick .. "刮开墙角的青苔，露出一个歪歪扭扭的符号：LEAVE……")
+                self:_logTravel(entry, nick .. "捡起地上的一把小刀，刮开了墙上的青苔，下面似乎真的有诡异的符号，它用自己有限的知识一点点辨认着……L、E、A、V、E……等它意识到那是什么的时候，一切都来不及了……")
                 self:_mokouFinish(entry, "silent", "缄默之口",
-                    nick .. "醒来时已躺在医院的病床上，护士说是好心人送来的。它默默收下了那笔钱。",
+                    nick .. "醒来的时候，发现自己在一家干净明亮的医院里。护士告诉" .. nick .. "，它昨晚在路上醉酒，被好心人送到了这里，并把好心人为" .. nick .. "留下的一些钱交给了它。" .. nick .. "沉默地收下了，此后再也没靠近过那家精神病院。",
                     { pts = 10 })
             end)
         end },
@@ -9302,27 +9514,27 @@ end
 function FocusFeedback:_mokouStep5(entry)
     local nick = self:_nick(entry)
     local attrs = self:_inboxAttrs(entry)
-    self:_showChainChoice("来玩玩模恐吧", nick .. "被那道瞳孔注视着，你选择：", {
-        { text = "A.消耗10%心情值，唤醒它。", cb = function()
+    self:_showChainChoice("来玩玩模恐吧", nick .. "被漆黑的瞳孔注视着，它的世界似乎只剩下了这一种颜色……你发现了它的异常，你选择：", {
+        { text = "A.消耗10%心情值唤醒它", cb = function()
             local dh = (attrs["辩证"] or 0) >= 70
             local lh = (attrs["逻辑"] or 0) >= 70
             local flv = (dh and 2 or 0) + (lh and -2 or 0)   -- 双高抵消
             self:_addFavor(entry, flv)
-            if not self:_mokouTestActive() and self:_readMood() > 0 then
+            if not self:_mokouSkipping(entry) and self:_readMood() > 0 then
                 self:_saveMood(math.max(0, self:_readMood() - 10))
             end
             self:_mokouReply(entry, nick .. "对你表示了感谢。", function()
-                self:_logTravel(entry, nick .. "逃离那注视，把被子盖回腐肉，继续在走廊里游荡，发现了畸形的残肢。")
+                self:_logTravel(entry, nick .. "在主人的帮助下逃离了眼球的注视。它心有余悸，把被子盖回了腐肉上面，继续探索着这个病房。很快，它在床底、柜子、窗帘等等地方都发现了畸形的残肢……")
                 self:_mokouSetNode(entry, "step6", 22 * 3600, true)
             end)
         end },
-        { text = "B.消耗5积分，对腐肉发起攻击。", cb = function()
+        { text = "B.消耗5积分对腐肉发起攻击", cb = function()
             local lh = (attrs["逻辑"] or 0) >= 70
             if lh then self:_addFavor(entry, 2) end
-            if not self:_mokouTestActive() then self:_mokouPtsCost(entry, 5) end
+            if not self:_mokouSkipping(entry) then self:_mokouPtsCost(entry, 5) end
             self:_mokouReply(entry, nick .. "对你表示了感谢。", function()
                 self:_mokouFinish(entry, "neat", "洁癖之书",
-                    nick .. "那物眼球爆开，血水溅满书页。洁癖的它翻墙回家，再不愿回头。",
+                    nick .. "精神病院里，眼球在受到攻击那一瞬间爆开，" .. nick .. "逃脱了那种诡异的注视，但腥臭的血水也溅满了它的书页。洁癖" .. nick .. "难以忍受，不顾一切地翻墙回家了。",
                     { attrs = { ["审美"] = 5 } })
             end)
         end },
@@ -9331,22 +9543,21 @@ end
 
 function FocusFeedback:_mokouStep6(entry)
     local nick = self:_nick(entry)
-    self:_showChainChoice("来玩玩模恐吧", nick .. "看着残缺的肢体，心中有了一个可怕的想法。你觉得它的想法是？", {
-        { text = "A.这家精神病院长期虐待病人，有位高武力的病人最终屠杀了所有人，并将其分尸。", cb = function()
+    self:_showChainChoice("来玩玩模恐吧", nick .. "看着散落一地的残肢，心中渐渐有了想法。你觉得它的想法是？", {
+        { text = "A.该精神病院长期虐待病人，导致一位高武力病人在病发时将长期积怨一并爆发，将院长和工作人员都屠杀分尸了。其他病人也被吓得四散而逃。", cb = function()
             self:_addFavor(entry, -3)
             self:_mokouReply(entry, nick .. "不置可否地看着你。", function()
                 self:_mokouFinish(entry, "cold", "书的冷漠",
-                    nick .. "看破真相，独自悄悄离开，什么也没有带走。",
+                    nick .. "看破了废弃精神病院的真相，但它没有告诉任何人，也没有报警。而是独自悄悄地离开了，没有回头看一眼那些残肢和腐肉。",
                     { pts = 5 })
             end)
         end },
-        { text = "B.这家精神病院长期悄悄用病人做生物实验，试图合成人造怪物。", cb = function()
+        { text = "B.该精神病院长期悄悄用病人做生物实验，试图合成人造怪物，导致了无数病人被肢解、虐待、变得畸形，最后痛苦地死去……", cb = function()
             self:_addFavor(entry, 3)
-            if not self:_mokouTestActive() then self:_saveMood(self:_readMood() + 2) end
+            if not self:_mokouSkipping(entry) then self:_saveMood(self:_readMood() + 2) end
             self:_mokouReply(entry, nick .. "认为你们真是心有灵犀！", function()
-                self:_mokouReply(entry, nick .. "看破真相，十分痛苦。它听见了地下传来的惨叫声，循声找去，发现了一处地下室入口。", function()
-                    self:_mokouSetNode(entry, "step7", 22 * 3600, true)
-                end)
+                self:_logTravel(entry, nick .. "看破了废弃精神病院的真相，感到十分痛苦。此时，它听到一声似有若无的惨叫，似乎是来自地下？！" .. nick .. "一番搜寻后，在医院一个角落发现了地下室的入口。唉，来都来了。" .. nick .. "打开门走了下去。")
+                self:_mokouSetNode(entry, "step7", 22 * 3600, true)
             end)
         end },
     })
@@ -9354,45 +9565,49 @@ end
 
 function FocusFeedback:_mokouStep7(entry)
     local nick = self:_nick(entry)
-    self:_showChainChoice("来玩玩模恐吧", nick .. "顺着惨叫声走进地下室，发现一间隐藏实验室。你会建议：", {
-        { text = "A.赶紧跑，保命要紧。", cb = function()
+    self:_showChainChoice("来玩玩模恐吧", nick .. "在精神病院地下室发现了一间实验室，里面有三个穿着防护服的工作人员，围着中间一坨看不出人型的巨大肉块操作着。那个肉块似乎有自主意识，不断挣扎着，还时不时发出惨叫。你会建议" .. nick .. "：", {
+        { text = "A.赶紧跑，你只是一本小书，保命要紧。", cb = function()
             self:_addFavor(entry, -3)
             self:_mokouReply(entry, nick .. "愣住了。", function()
                 self:_mokouFinish(entry, "zzz", "zzzzzz",
-                    nick .. "决定保命要紧，回家睡了一觉。（心情-5%）",
+                    nick .. "心有余悸地回了家，疲惫与惊吓让它很快就睡着了。",
                     { mood = -5 })
             end)
         end },
-        { text = "B.赶紧冲进去，战斗爽！", cb = function()
+        { text = "B.赶紧冲进去战斗爽。", cb = function()
             self:_addFavor(entry, -1)
             self:_mokouReply(entry, nick .. "愣住了。", function()
                 self:_mokouFinish(entry, "home", "回家",
-                    nick .. "冲进去与工作人员缠斗，最终战败，被丢出了医院。（心情-2%）",
+                    nick .. "冲进地下室与邪恶医生战斗一番，毫不意外地输掉了，反派们看着这本小书感觉无从下手，于是把它丢出了精神病院。",
                     { mood = -2 })
             end)
         end },
-        { text = "C.消耗3积分购入毒气弹，把工作人员毒晕。", cb = function()
+        { text = "C.消耗3积分购入一颗毒气弹把工作人员毒晕。", cb = function()
             self:_mokouPtsCost(entry, 3)
             self:_addFavor(entry, -10)
             self:_mokouReply(entry, nick .. "坚定地点点头。", function()
-                self:_logTravel(entry, nick .. "扔出毒气弹冲进去，却被邪恶的医生一把抓住了书页！")
+                self:_logTravel(entry, nick .. "先躲起来，朝着地下室里扔了一颗毒气弹。十分钟后，毒气发作了，地下室里渐渐没了声音，" .. nick .. "便小心翼翼地走了进去。却马上就被一个邪恶医生抓住了书页！")
                 self:_mokouBadStart(entry)
             end)
         end },
-        { text = "D.消耗3积分购入神秘武器，与坏人战斗。", cb = function()
+        { text = "D.消耗3积分购入神秘武器与坏人战斗。", cb = function()
             self:_mokouPtsCost(entry, 3)
             self:_addFavor(entry, 5)
             self:_mokouReply(entry, nick .. "坚定地点点头。", function()
                 self:_mokouFinish(entry, "frank", "弗兰肯斯坦的命运",
-                    nick .. "揣着神秘武器冲进实验室。真相大白：医生长期制造怪物，最终亲手结束了这一切。它怜悯地杀死了那只肉块。",
+                    nick .. "带着神秘武器，不顾一切地冲进了地下室。经过一番殊死搏斗，将所有神秘医生都制服了。它也得知了医院的真相。三十年前，一位科学家萌生出一个疯狂的念头：造出一个超人。他买下了这家精神病院，将病人们关入地下室进行惨无人道的实验。在他的计划意外暴露之后，他表面离开，实际上一直躲在废弃医院的地下室里继续着邪恶实验。在他离成功最近的一次时，一本小书却闯进来搅乱了这一切。说完，几个邪恶医生纷纷自杀。" .. nick .. "没有管这些人类，而是怜悯地看着手术台上那团不成人形的东西，狠心杀死了它。",
                     { pts = 20, attrs = { ["辩证"] = 5, ["逻辑"] = 5, ["阅历"] = 5, ["情感"] = 5 } })
             end)
         end },
     })
 end
 
--- 坏结局：进入特殊弹窗状态（点空白不掉；点确定只刷新；累计点满8次才真正消失并结算）
+-- 坏结局：正式游玩进入特殊弹窗（点空白不掉；点确定只刷新；累计点满8次才结算）；再次体验引导下直接结算
 function FocusFeedback:_mokouBadStart(entry)
+    if self:_mokouGuided(entry) then
+        self:_mokouFinish(entry, "bad", "坏结局", nil, nil)
+        return
+    end
     local c = self:_readCollection()
     for _, e in ipairs(c) do
         if e.index == entry.index and e.chain then
@@ -9443,7 +9658,7 @@ function FocusFeedback:_mokouBadPopup(entry)
     local padding_w = Size.padding.default
     local avail_w = dialog.width - 2 * (border_w + padding_w)
     local bodyTW = TextBoxWidget:new{
-        text = "别眨眼——" .. self:_nick(entry) .. "被抓住了。",
+        text = string.rep(self:_nick(entry) .. "被抓住了", 40) .. "……",
         face = Font:getFace("cfont", 20), width = avail_w,
     }
     bodyTW.not_focusable = true
@@ -9467,19 +9682,18 @@ function FocusFeedback:_mokouStep1(entry)
                 else variant = (math.random() < 0.5) and 1 or 2 end
                 local text
                 if variant == 1 then
-                    text = nick .. "来到一家早已废弃的精神病院，斑驳的围墙上写满了辱骂、痛苦的句子，空气里弥漫着消毒水与腐烂的气味。"
+                    text = nick .. "来到一家早已废弃的精神病院，斑驳的围墙上用写满了辱骂、痛苦的句子和没有人看得懂的乱涂乱画。" .. nick .. "感到很害怕。"
                 else
-                    text = nick .. "来到一家早已废弃的精神病院，感到好奇与兴奋——这趟夜探变得越来越有趣了。"
+                    text = nick .. "来到一家早已废弃的精神病院，斑驳的围墙上用写满了辱骂、痛苦的句子和没有人看得懂的乱涂乱画。" .. nick .. "感到好奇和兴奋。"
                 end
                 self:_logTravel(entry, text)
                 local c = self:_readCollection()
                 for _, e in ipairs(c) do
                     if e.index == entry.index then
                         e.chain.node = "step2"
-                        -- 测试模式：立即触发下一步；否则间隔22h后进入午夜窗口弹窗
-                        e.chain.next = self:_mokouTestActive() and 0 or (os.time() + 22 * 3600)
+                        -- 测试/再次体验引导：立即触发下一步；否则间隔22h后进入午夜窗口弹窗
+                        e.chain.next = self:_mokouSkipping(entry) and 0 or (os.time() + 22 * 3600)
                         e.chain.window = true
-                        e.chain.path = { "A" }
                         break
                     end
                 end
@@ -9489,7 +9703,7 @@ function FocusFeedback:_mokouStep1(entry)
         { text = "B.老旧的学校", cb = function()
             self:_mokouReply(entry, nick .. "点了点头。", function()
                 -- 30分钟后动态 + 直接迈向结局：优绩主义你赢了
-                self:_logTravel(entry, nick .. "决定去老旧的学校里探险，在锈迹斑斑的教室里窥见了早已锈死的制度。优绩主义你赢了。")
+                self:_logTravel(entry, nick .. "决定去老旧的学校里探险，趁着保安睡觉偷偷潜入。抬起头，却发现灯还亮着！abandon、abandon……细碎的读书声传来，是午夜的高三生专属晚自习。咦，谁的书啊？这时，一位路过的语文老师捡起了" .. nick .. "，放在了讲台上。")
                 self:_mokouSettle(entry, "school_gold", "优绩主义你赢了")
                 self:_mokouReply(entry, nick .. "……（结局：优绩主义你赢了）")
             end)
@@ -9506,7 +9720,7 @@ function FocusFeedback:_chainCheck()
         return
     end
     local started = self:_mokouTryStart(now)
-    if started then pcall(function() self:_mokouStep1(started) end) end
+    if started then pcall(function() self:_mokouExecStep("mokouStep1", started) end) end
 end
 
 function FocusFeedback:_genInboxLetter(entry, offline_sec, now, banned)
