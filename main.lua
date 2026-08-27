@@ -8321,6 +8321,7 @@ local INBOX_COOLDOWN_MOVIE = {"movie_10", "movie_11", "movie_12"}
 local INBOX_COOLDOWN_EAT_SEC = 3 * 3600
 local INBOX_COOLDOWN_MOVIE_SEC = 2 * 24 * 3600
 local INBOX_MIN_GAP_SEC = 1800   -- 距上次来信至少30分钟才来信（防刷屏；测试可临时调小）
+local INBOX_MAX_EVENTS = 8      -- 单次离线来信最多生成条数（防一次性爆量）
 
 local ADULT_INBOX_EVENTS = {
     -- 1 xx失眠了（夜间）
@@ -8634,10 +8635,12 @@ function FocusFeedback:_inboxFlatEvents()
         local tail_blanks = { { t="" } }
         local branches = (e.bs and #e.bs > 0) and e.bs or tail_blanks
         for _, b in ipairs(branches) do
+            -- 分支结果若为"无后续"（表示没有特别后续），则不再拼入正文，只保留背景句
+            local tb = (b.t or ""):gsub("无后续。", ""):gsub("无后续", "")
             table.insert(flat, {
                 id = e.id,
                 bg = e.bg,
-                text = (b.t and b.t ~= "") and e.bg .. b.t or e.bg,
+                text = (tb ~= "") and (e.bg .. tb) or e.bg,
                 conds = e.conds or {},
                 bconds = b.conds or {},
                 mood = b.mood or (e.mood or 0),
@@ -8856,6 +8859,7 @@ function FocusFeedback:_genInboxLetter(entry, offline_sec, now)
 
     -- 事件数量：约1条/小时，至少1条（离线稀疏错落；池不足时自动变少）
     local keep = math.max(1, math.floor(offline_sec / 3600))
+    if keep > INBOX_MAX_EVENTS then keep = INBOX_MAX_EVENTS end   -- 防一次性爆量
 
     -- 冷却过滤：进食组3h / 电影组2天 距上次触发
     local cd = entry.inbox_cd or {}
@@ -9093,13 +9097,13 @@ function FocusFeedback:_showTravelLogDialog(e, page)
         if (ent.mood or 0) ~= 0 then suffix = suffix .. string.format("  心情%+d%%", ent.mood) end
         if (ent.pts or 0) ~= 0 then suffix = suffix .. string.format("  积分%+d", ent.pts) end
         if ent.item then suffix = suffix .. "  道具+" .. ent.item end
-        table.insert(lines, self:_travelWrap((yy .. " " .. hm .. "  " .. (ent.text or "") .. suffix), 26))
+        table.insert(lines, self:_travelWrap((yy .. " " .. hm .. "  " .. (ent.text or "") .. suffix), 40))  -- 调大字号后每行折成 40 半角宽 ≈ 20 汉字
     end
     -- 倒序：最新在顶部
     for i = 1, math.floor(#lines / 2) do
         lines[i], lines[#lines - i + 1] = lines[#lines - i + 1], lines[i]
     end
-    local per_page = 11
+    local per_page = 8   -- 字号加大后减少每页行数，防止撑破弹窗
     local pages = math.max(1, math.ceil(#lines / per_page))
     if page < 1 then page = 1 elseif page > pages then page = pages end
     local pageLines = {}
@@ -9109,12 +9113,12 @@ function FocusFeedback:_showTravelLogDialog(e, page)
     -- 每条动态独立一行：TextWidget 不解析 \n，须一行一个控件竖排
     local bodyParts = {}
     for _, ln in ipairs(pageLines) do
-        local w = TextWidget:new{ text = ln, face = Font:getFace("cfont", 16) }
+        local w = TextWidget:new{ text = ln, face = Font:getFace("cfont", 18) }
         w.not_focusable = true
         table.insert(bodyParts, w)
     end
     if #bodyParts == 0 then
-        local w = TextWidget:new{ text = "（无内容）", face = Font:getFace("cfont", 16) }
+        local w = TextWidget:new{ text = "（无内容）", face = Font:getFace("cfont", 18) }
         w.not_focusable = true
         table.insert(bodyParts, w)
     end
@@ -9157,7 +9161,7 @@ function FocusFeedback:_showTravelLogDialog(e, page)
     if page == pages then
         local last = tlog[#tlog]
         local sign_dt = os.date("%Y.%m.%d", (last and last.ts) or os.time())
-        local signText = TextWidget:new{ text = "—— " .. sign_dt, face = Font:getFace("cfont", 14) }
+        local signText = TextWidget:new{ text = "—— " .. sign_dt, face = Font:getFace("cfont", 16) }
         signText.not_focusable = true
         local avail_w = dialog.width - 2 * (Size.border.window + Size.padding.default) - 2 * Size.padding.default
         local spacer = HorizontalSpan:new{ width = math.max(0, avail_w - signText:getWidth()) }
