@@ -5936,12 +5936,6 @@ function FocusFeedback:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = "清零今日统计",
-                callback = function(menu)
-                    self:_resetToday(menu)
-                end,
-            },
-            {
                 text = "标记读完当前书",
                 callback = function()
                     self:_triggerEndBookRating()
@@ -5983,6 +5977,12 @@ function FocusFeedback:addToMainMenu(menu_items)
                         end,
                     },
                 },
+            },
+            {
+                text = "旅行的书",
+                callback = function()
+                    self:_showTravelBookList()
+                end,
             },
             {
                 text = "图鉴",
@@ -6059,12 +6059,6 @@ function FocusFeedback:addToMainMenu(menu_items)
                     },
                     {
                         text = "旅行的书",
-                        callback = function()
-                            self:_showTravelBookList()
-                        end,
-                    },
-                    {
-                        text = "记录的旅行",
                         checked_func = function() return self:_readEventToggles().inbox ~= false end,
                         callback = function()
                             local t = self:_readEventToggles()
@@ -6073,6 +6067,12 @@ function FocusFeedback:addToMainMenu(menu_items)
                         end,
                     },
                 },
+            },
+            {
+                text = "清零今日统计",
+                callback = function(menu)
+                    self:_resetToday(menu)
+                end,
             },
             {
                 text = "在线更新",
@@ -9102,17 +9102,25 @@ function FocusFeedback:_showTravelLogDialog(e, page)
     local per_page = 11
     local pages = math.max(1, math.ceil(#lines / per_page))
     if page < 1 then page = 1 elseif page > pages then page = pages end
-    local body = {}
+    local pageLines = {}
     for i = (page - 1) * per_page + 1, math.min(page * per_page, #lines) do
-        table.insert(body, lines[i])
+        table.insert(pageLines, lines[i])
     end
-    local body_text = table.concat(body, "\n")
-    if body_text == "" then body_text = "（无内容）" end
-    local bodyTW = TextWidget:new{
-        text = body_text,
-        face = Font:getFace("cfont", 16),
-    }
-    bodyTW.not_focusable = true
+    -- 每条动态独立一行：TextWidget 不解析 \n，须一行一个控件竖排
+    local bodyParts = {}
+    for _, ln in ipairs(pageLines) do
+        local w = TextWidget:new{ text = ln, face = Font:getFace("cfont", 16) }
+        w.not_focusable = true
+        table.insert(bodyParts, w)
+    end
+    if #bodyParts == 0 then
+        local w = TextWidget:new{ text = "（无内容）", face = Font:getFace("cfont", 16) }
+        w.not_focusable = true
+        table.insert(bodyParts, w)
+    end
+    local bodyVG = VerticalGroup:new{ align = "left", unpack(bodyParts) }
+    bodyVG.not_focusable = true
+    local bodyTW = bodyVG  -- 统一变量名，供下方内容组装引用
 
     -- 底部两行按钮：上一行翻页，下一行 查看档案 / 确定
     local buttons = {}
