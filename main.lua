@@ -75,6 +75,7 @@ local FocusFeedback = WidgetContainer:extend{
     book_data = nil,
     dialogue_data = nil,
     reveal_book = nil,
+    reveal_index = nil,
     reveal_nickname = nil,
     _pending_dialogue = nil,
     quotes_normal = nil,
@@ -869,7 +870,7 @@ function FocusFeedback:_readEventToggles()
     local t = G_reader_settings:readSetting(settingKey("v5_event_toggles"), nil)
     if not t then
         -- 默认全部开启
-        t = {bookmark=true, stranger=true, book_friend=true, babel=true, fly_away=true, special=true}
+        t = {bookmark=true, stranger=true, book_friend=true, babel=true, fly_away=true, special=true, inbox=true}
         self:_saveEventToggles(t)
     end
     return t
@@ -3030,6 +3031,7 @@ function FocusFeedback:_abandonBook()
     self:_saveReadTrigger("read_1h", "")
     self:_saveReadTrigger("read_3h", "")
     self.reveal_book = nil
+    self.reveal_index = nil
     self.reveal_nickname = nil
     -- V4: 清除所有 V4 状态（含积分）
     self:_savePoints(0)
@@ -3071,6 +3073,7 @@ function FocusFeedback:_resetAdoption()
     self:_saveAdoptReadingSeconds(0)
     -- 清除翻开状态（内存变量）
     self.reveal_book = nil
+    self.reveal_index = nil
     self.reveal_nickname = nil
     -- V4: 清除 V4 状态（但保留积分，积分是跨领养周期的累积制）
     self:_saveInventory({})
@@ -3678,6 +3681,7 @@ function FocusFeedback:_doReveal()
 
     -- 设置翻开状态
     self.reveal_book = book
+    self.reveal_index = idx   -- V15.2: 记录当前翻开书在图鉴中的序号（供在线阅读动态定位）
     self.reveal_nickname = nickname
 
     logger.info("FocusFeedback V2: book revealed:", book.title)
@@ -3962,7 +3966,7 @@ function FocusFeedback:_showAdoptionCollection()
     for i, entry in ipairs(collection) do
         local book = self.book_data[entry.index] or { title = "未知", author = "" }
         table.insert(items, {
-            text = string.format("《%s》 %s", book.title, book.author),
+            text = entry.nickname or book.title,
             mandatory = entry.reveal_date,
             callback = function()
                 self:_showBookDetailMenu(entry)
@@ -4051,7 +4055,7 @@ function FocusFeedback:_showBookInfo(entry)
     local dialog
     dialog = ButtonDialog:new{
         title = table.concat(lines, "\n"),
-        title_align = "center",
+        title_align = "left",
         buttons = {
             {
                 {
@@ -4731,11 +4735,15 @@ function FocusFeedback:_tick()
     -- V8: 轮询标注数量（某些阅读器后端不触发 onAnnotationsUpdated）
     pcall(function() self:_checkAnnotationCount() end)
     -- V15.1: 书之来信（成年书测试书注入 + 离线来信检查）
+    -- 每个环节独立保护，避免任一异常吞掉来信检查
+    pcall(function() self:_ensureTestBooks() end)
+    pcall(function() self:_inboxInit() end)
     pcall(function()
-        self:_ensureTestBooks()
-        self:_inboxInit()
-        self:_showInboxLetters()
+        local ok, err = pcall(function() self:_showInboxLetters() end)
+        if not ok then logger.warn("FocusFeedback inbox check error:", err) end
     end)
+    -- 旅行的书：在线阅读时偶尔补记动态
+    pcall(function() self:_travelInlineCheck() end)
     self:_schedule()
 end
 
@@ -4827,6 +4835,12 @@ function FocusFeedback:onDispatcherRegisterActions()
             title = _("养书：仓库"),
             general = true,
         })
+        Dispatcher:registerAction("focus_feedback_travel", {
+            category = "none",
+            event = "FocusFeedbackTravel",
+            title = _("养书：旅行的书"),
+            general = true,
+        })
     end)
 end
 
@@ -4845,6 +4859,10 @@ end
 
 function FocusFeedback:onFocusFeedbackWarehouse()
     pcall(function() self:_showWarehouse() end)
+end
+
+function FocusFeedback:onFocusFeedbackTravel()
+    pcall(function() self:_showTravelBookList() end)
 end
 
 -- V9: SimpleUI 公开入口（供 Custom Quick Action 调用）
@@ -5040,11 +5058,9 @@ function FocusFeedback:onResume()
         self.last_page_turn_wall = nil
     end
     -- V15.1: 唤醒时立即检查书之来信（注入测试书 + 离线来信）
-    pcall(function()
-        self:_ensureTestBooks()
-        self:_inboxInit()
-        self:_showInboxLetters()
-    end)
+    pcall(function() self:_ensureTestBooks() end)
+    pcall(function() self:_inboxInit() end)
+    pcall(function() self:_showInboxLetters() end)
     self:_startTimer()
 end
 
@@ -6038,6 +6054,21 @@ function FocusFeedback:addToMainMenu(menu_items)
                         callback = function()
                             local t = self:_readEventToggles()
                             t.special = not t.special
+                            self:_saveEventToggles(t)
+                        end,
+                    },
+                    {
+                        text = "旅行的书",
+                        callback = function()
+                            self:_showTravelBookList()
+                        end,
+                    },
+                    {
+                        text = "记录的旅行",
+                        checked_func = function() return self:_readEventToggles().inbox ~= false end,
+                        callback = function()
+                            local t = self:_readEventToggles()
+                            t.inbox = not (t.inbox ~= false)
                             self:_saveEventToggles(t)
                         end,
                     },
@@ -8289,6 +8320,7 @@ local INBOX_COOLDOWN_EAT = {"eat_4", "eat_6", "eat_7", "eat_8"}
 local INBOX_COOLDOWN_MOVIE = {"movie_10", "movie_11", "movie_12"}
 local INBOX_COOLDOWN_EAT_SEC = 3 * 3600
 local INBOX_COOLDOWN_MOVIE_SEC = 2 * 24 * 3600
+local INBOX_MIN_GAP_SEC = 1800   -- 距上次来信至少30分钟才来信（防刷屏；测试可临时调小）
 
 local ADULT_INBOX_EVENTS = {
     -- 1 xx失眠了（夜间）
@@ -8311,8 +8343,8 @@ local ADULT_INBOX_EVENTS = {
         { t="意外梦见了一个很奇特的点子……", conds={"审美up","情感up"} },
       }
     },
-    -- 3 xx做了个噩梦
-    { bg="xx做了个噩梦。", id="nightmare",
+    -- 3 xx做了个噩梦（夜间）
+    { bg="xx做了个噩梦。", conds={"夜间high"}, id="nightmare",
       bs={
         { t="无后续。", conds={"阅历up"} },
         { t="但意外学会了特殊技能清明梦。", conds={"知识up","审美up"} },
@@ -8727,6 +8759,8 @@ end
 
 -- 生成两本测试书（注入 collection），属性分布便于观察
 function FocusFeedback:_ensureTestBooks()
+    -- 开关：关闭则不再注入测试书
+    if self:_readEventToggles().inbox == false then return end
     local c = self:_readCollection()
     local hasA, hasB = false, false
     for _, e in ipairs(c) do
@@ -8909,26 +8943,260 @@ end
 
 -- 书之来信主入口：对每本成年书，检查自上次来信以来的离线时长，生成来信并展示
 function FocusFeedback:_showInboxLetters()
+    -- 开关：关闭则所有成年书来信活动停用
+    if self:_readEventToggles().inbox == false then return end
     local c = self:_readCollection()
     local now = os.time()
     local changed = false
     for _, e in ipairs(c) do
         if e.reveal_date and e.last_inbox_ts then
             local gap = now - e.last_inbox_ts
-            if gap >= 1800 then  -- 至少30分钟才来信
+            if gap >= INBOX_MIN_GAP_SEC then  -- 距上次来信至少30分钟才来信
                 local letter = self:_genInboxLetter(e, gap, now)
                 if #letter.events > 0 then
-                    self:_displayInbox(e, letter, gap, now)
-                    -- 冷却更新（取本信事件中最匹配组）
+                    -- 写入该书旅行日志（不再自动弹窗，供"旅行的书"手动查看）
+                    local tlog = e.travel_log or {}
+                    local n = #letter.events
+                    for i, ev in ipairs(letter.events) do
+                        table.insert(tlog, {
+                            ts = now - gap + math.floor(gap * i / (n + 1)),  -- 在离线窗口内自然错开
+                            text = ev.text,
+                            mood = ev.mood or 0,
+                            pts = ev.pts or 0,
+                            item = ev.item,
+                        })
+                    end
+                    table.sort(tlog, function(a, b) return (a.ts or 0) < (b.ts or 0) end)
+                    e.travel_log = tlog
+                    -- 更新事件冷却（EAT/MOVIE 避免同一事件反复出现）
                     local cd = e.inbox_cd or {}
                     for _, ev in ipairs(letter.events) do
                         if ev.cand and ev.cand.cdgrp == "EAT" then cd.eat = now end
                         if ev.cand and ev.cand.cdgrp == "MOVIE" then cd.mov = now end
                     end
                     e.inbox_cd = cd
+                    e.last_inbox_ts = now
+                    changed = true
                 end
-                e.last_inbox_ts = now
-                changed = true
+                -- 清理超24h旧日志（每次最多逐条删1条，渐进式）
+                if self:_travelCleanup(e, 1) then changed = true end
+            end
+        end
+    end
+    if changed then self:_saveCollection(c) end
+end
+
+-- 旅行日志清理：每次最多删一条"最早且超过24h"的旧记录（渐进式，不一下子清空）
+function FocusFeedback:_travelCleanup(e, max)
+    local tlog = e.travel_log
+    if not tlog or #tlog == 0 then return false end
+    local now = os.time()
+    local cutoff = now - 24 * 3600
+    max = max or 1
+    local removed = false
+    for _ = 1, max do
+        local idx = nil
+        for i, ent in ipairs(tlog) do
+            if (ent.ts or 0) < cutoff then idx = i; break end
+        end
+        if not idx then break end
+        table.remove(tlog, idx)
+        removed = true
+    end
+    return removed
+end
+
+-- 旅行的书：列出有旅行日志的书昵称（点击进详情）
+function FocusFeedback:_showTravelBookList()
+    local c = self:_readCollection()
+    local entries = {}
+    for _, e in ipairs(c) do
+        local tlog = e.travel_log
+        if e.reveal_date and tlog and #tlog > 0 then
+            table.insert(entries, e)
+        end
+    end
+    if #entries == 0 then
+        self:_showMessage("还没有旅行日记。\n离线一段时间或阅读中，会有动态悄悄记录下来。", 5)
+        return
+    end
+    local items = {}
+    for _, e in ipairs(entries) do
+        local book = self.book_data[e.index] or { title = "未知" }
+        local last = nil
+        for _, _ent in ipairs(e.travel_log or {}) do
+            if not last or (_ent.ts or 0) > (last.ts or 0) then last = _ent end
+        end
+        last = last or {}
+        table.insert(items, {
+            text = e.nickname or book.title,
+            sub = string.format("共 %d 条 · 最近 %d/%d %02d:%02d",
+                #e.travel_log or 0,
+                last.ts and os.date("*t", last.ts).month or 0,
+                last.ts and os.date("*t", last.ts).day or 0,
+                last.ts and os.date("*t", last.ts).hour or 0,
+                last.ts and os.date("*t", last.ts).min or 0),
+            callback = function()
+                self:_showTravelLogDialog(e, 1)
+            end,
+        })
+    end
+    local menu = Menu:new{
+        title = "旅行的书",
+        item_table = items,
+        width = Screen:getWidth(),
+        is_borderless = true,
+        is_popout = false,
+    }
+    menu.show_parent = nil
+    UIManager:show(menu)
+end
+
+-- 中英混排断行：按可见宽度大致 n 个半角宽度一行
+function FocusFeedback:_travelWrap(s, n)
+    s = tostring(s or "")
+    n = n or 26
+    local out = {}
+    local line = ""
+    local w = 0
+    for ch in s:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        local cw = 1
+        if ch:byte() > 127 then cw = 2 end   -- 中文按2个半角宽
+        line = line .. ch
+        w = w + cw
+        if w >= n then
+            table.insert(out, line)
+            line = ""
+            w = 0
+        end
+    end
+    if line ~= "" then table.insert(out, line) end
+    if #out == 0 then out = { "" } end
+    return table.concat(out, "\n")
+end
+
+-- 旅行的书：单本动态日志的大弹窗（分页查看；右下角落款日期；底部 查看档案/确定）
+function FocusFeedback:_showTravelLogDialog(e, page)
+    local tlog = e.travel_log or {}
+    table.sort(tlog, function(a, b) return (a.ts or 0) < (b.ts or 0) end)
+    if #tlog == 0 then
+        self:_showMessage("（这本书还没有旅行动态）", 3)
+        return
+    end
+    -- 构建行：日期 时分 + 文本 + 心情/积分/道具
+    local lines = {}
+    for _, ent in ipairs(tlog) do
+        local t = os.date("*t", ent.ts or 0)
+        local hm = string.format("%02d:%02d", t.hour, t.min)
+        local yy = string.format("%02d-%02d", t.month, t.day)
+        local suffix = ""
+        if (ent.mood or 0) ~= 0 then suffix = suffix .. string.format("  心情%+d%%", ent.mood) end
+        if (ent.pts or 0) ~= 0 then suffix = suffix .. string.format("  积分%+d", ent.pts) end
+        if ent.item then suffix = suffix .. "  道具+" .. ent.item end
+        table.insert(lines, self:_travelWrap((yy .. " " .. hm .. "  " .. (ent.text or "") .. suffix), 26))
+    end
+    -- 倒序：最新在顶部
+    for i = 1, math.floor(#lines / 2) do
+        lines[i], lines[#lines - i + 1] = lines[#lines - i + 1], lines[i]
+    end
+    local per_page = 11
+    local pages = math.max(1, math.ceil(#lines / per_page))
+    if page < 1 then page = 1 elseif page > pages then page = pages end
+    local body = {}
+    for i = (page - 1) * per_page + 1, math.min(page * per_page, #lines) do
+        table.insert(body, lines[i])
+    end
+    local body_text = table.concat(body, "\n")
+    if body_text == "" then body_text = "（无内容）" end
+    local bodyTW = TextWidget:new{
+        text = body_text,
+        face = Font:getFace("cfont", 16),
+    }
+    bodyTW.not_focusable = true
+
+    -- 底部两行按钮：上一行翻页，下一行 查看档案 / 确定
+    local buttons = {}
+    local navrow = {}
+    if page > 1 then
+        table.insert(navrow, { text = "◀ 上一页", callback = function() self:_reopenTravel(e, page - 1) end })
+    else
+        table.insert(navrow, { text = "上一页", enabled = false })
+    end
+    table.insert(navrow, { text = string.format("%d / %d", page, pages), enabled = false })
+    if page < pages then
+        table.insert(navrow, { text = "下一页 ▶", callback = function() self:_reopenTravel(e, page + 1) end })
+    else
+        table.insert(navrow, { text = "下一页", enabled = false })
+    end
+    table.insert(buttons, navrow)
+    table.insert(buttons, {
+        { text = "查看档案", callback = function() self:_showBookInfo(e) end },
+        { text = "确定", callback = function() if self._travel_dlg then UIManager:close(self._travel_dlg) end self._travel_dlg = nil end },
+    })
+
+    local nick = e.nickname or "它"
+    local dialog = ButtonDialog:new{
+        title = string.format("旅行的书 · %s", nick),
+        title_align = "center",
+        width = Screen:scaleBySize(600),
+        scrollable_content = false,
+        buttons = buttons,
+    }
+    dialog.show_parent = nil
+
+    -- 内容组装（最后页右下角落款日期）
+    local parts = { bodyTW }
+    if page == pages then
+        local last = tlog[#tlog]
+        local sign_dt = os.date("%Y.%m.%d", (last and last.ts) or os.time())
+        local signText = TextWidget:new{ text = "—— " .. sign_dt, face = Font:getFace("cfont", 14) }
+        signText.not_focusable = true
+        local avail_w = dialog.width - 2 * (Size.border.window + Size.padding.default) - 2 * Size.padding.default
+        local spacer = HorizontalSpan:new{ width = math.max(0, avail_w - signText:getWidth()) }
+        parts[#parts + 1] = VerticalSpan:new{ width = Size.padding.small }
+        parts[#parts + 1] = HorizontalGroup:new{ align = "left", spacer, signText }
+    end
+    local contentVG = VerticalGroup:new{ align = "left", unpack(parts) }
+    contentVG.not_focusable = true
+    dialog:addWidget(contentVG)
+
+    self._travel_dlg = dialog
+    UIManager:show(dialog)
+end
+
+function FocusFeedback:_reopenTravel(e, page)
+    if self._travel_dlg then UIManager:close(self._travel_dlg) end
+    self._travel_dlg = nil
+    self:_showTravelLogDialog(e, page)
+end
+
+-- 在线阅读时也随机补记录动态（30~90分钟一条，写给当前翻开的书）
+function FocusFeedback:_travelInlineCheck()
+    if self:_readEventToggles().inbox == false then return end
+    if self.suspended or not self.last_page_turn_wall then return end
+    local now = os.time()
+    if (now - self.last_page_turn_wall) > 180 then return end   -- 超过3分钟没在翻页/标注，视为不在读
+    local c = self:_readCollection()
+    local changed = false
+    for _, e in ipairs(c) do
+        if e.reveal_date then   -- 所有已养成（翻开的成年书）各自动态独立
+            local next = e.travel_inline or (now + 3600)
+            if now >= next then
+                local letter = self:_genInboxLetter(e, 3600, now)
+                if #letter.events > 0 then
+                    local tlog = e.travel_log or {}
+                    table.insert(tlog, {
+                        ts = now,
+                        text = letter.events[1].text,
+                        mood = letter.events[1].mood or 0,
+                        pts = letter.events[1].pts or 0,
+                        item = letter.events[1].item,
+                    })
+                    e.travel_log = tlog
+                    e.travel_inline = now + math.random(2400, 5400)  -- 40~90分钟后再记录一条
+                    changed = true
+                    if self:_travelCleanup(e, 1) then changed = true end
+                end
             end
         end
     end
