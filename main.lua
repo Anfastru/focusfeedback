@@ -8949,16 +8949,19 @@ function FocusFeedback:_showChainChoice(title, body, opts)
     local border_w = Size.border.window
     local padding_w = Size.padding.default
     local avail_w = dialog.width - 2 * (border_w + padding_w)
-    local vertical = VerticalGroup:new{ align = "left" }
+    -- 与 _showEventPopup 一致：VerticalGroup 通过构造器接收子控件（无 addWidget 方法）
+    local parts = {}
     if title and title ~= "" then
         local tw = TextWidget:new{ text = title, face = Font:getFace("cfont", 24), width = avail_w }
         tw.not_focusable = true
-        vertical:addWidget(tw)
-        vertical:addWidget(VerticalSpan:new{ width = Size.padding.default * 0.5 })
+        table.insert(parts, tw)
+        table.insert(parts, VerticalSpan:new{ width = Size.padding.default * 0.5 })
     end
     local bodyTW = TextBoxWidget:new{ text = body or "", face = Font:getFace("cfont", 20), width = avail_w }
     bodyTW.not_focusable = true
-    vertical:addWidget(bodyTW)
+    table.insert(parts, bodyTW)
+    local vertical = VerticalGroup:new{ align = "left", unpack(parts) }
+    vertical.not_focusable = true
     dialog:addWidget(vertical)
     UIManager:show(dialog)
 end
@@ -9439,13 +9442,13 @@ function FocusFeedback:_mokouBadPopup(entry)
     local border_w = Size.border.window
     local padding_w = Size.padding.default
     local avail_w = dialog.width - 2 * (border_w + padding_w)
-    local vertical = VerticalGroup:new{ align = "left" }
     local bodyTW = TextBoxWidget:new{
         text = "别眨眼——" .. self:_nick(entry) .. "被抓住了。",
         face = Font:getFace("cfont", 20), width = avail_w,
     }
     bodyTW.not_focusable = true
-    vertical:addWidget(bodyTW)
+    local vertical = VerticalGroup:new{ align = "left", bodyTW }
+    vertical.not_focusable = true
     dialog:addWidget(vertical)
     UIManager:show(dialog)
 end
