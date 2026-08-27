@@ -9124,7 +9124,7 @@ function FocusFeedback:_showTravelLogDialog(e, page)
         if (ent.mood or 0) ~= 0 then suffix = suffix .. string.format("  心情%+d%%", ent.mood) end
         if (ent.pts or 0) ~= 0 then suffix = suffix .. string.format("  积分%+d", ent.pts) end
         if ent.item then suffix = suffix .. "  道具+" .. ent.item end
-        table.insert(lines, self:_travelWrap((yy .. " " .. hm .. "  " .. (ent.text or "") .. suffix), 40))  -- 调大字号后每行折成 40 半角宽 ≈ 20 汉字
+        table.insert(lines, yy .. " " .. hm .. "  " .. (ent.text or "") .. suffix)
     end
     -- 倒序：最新在顶部
     for i = 1, math.floor(#lines / 2) do
@@ -9137,21 +9137,17 @@ function FocusFeedback:_showTravelLogDialog(e, page)
     for i = (page - 1) * per_page + 1, math.min(page * per_page, #lines) do
         table.insert(pageLines, lines[i])
     end
-    -- 每条动态独立一行：TextWidget 不解析 \n，须一行一个控件竖排
-    local bodyParts = {}
-    for _, ln in ipairs(pageLines) do
-        local w = TextWidget:new{ text = ln, face = Font:getFace("cfont", 18) }
-        w.not_focusable = true
-        table.insert(bodyParts, w)
-    end
-    if #bodyParts == 0 then
-        local w = TextWidget:new{ text = "（无内容）", face = Font:getFace("cfont", 18) }
-        w.not_focusable = true
-        table.insert(bodyParts, w)
-    end
-    local bodyVG = VerticalGroup:new{ align = "left", unpack(bodyParts) }
-    bodyVG.not_focusable = true
-    local bodyTW = bodyVG  -- 统一变量名，供下方内容组装引用
+    -- 正文：直接参照渲染舒服的常规弹窗，用 TextBoxWidget 按可用宽度可靠地自动软换行（能正确解析中文标点与 \n）
+    local BODY_FACE = Font:getFace("cfont", 20)   -- 旅行动态使用比常规弹窗大一号的字号
+    local body_text = table.concat(pageLines, "\n")
+    if body_text == "" then body_text = "（无内容）" end
+    local bodyTW = TextBoxWidget:new{
+        text = body_text,
+        face = BODY_FACE,
+        width = Screen:scaleBySize(600) - 2 * (Size.border.window + Size.padding.default),
+        alignment = "left",
+    }
+    bodyTW.not_focusable = true
 
     -- 底部两行按钮：上一行翻页，下一行 查看档案 / 确定
     local buttons = {}
@@ -9188,7 +9184,7 @@ function FocusFeedback:_showTravelLogDialog(e, page)
     if page == pages then
         local last = tlog[#tlog]
         local sign_dt = os.date("%Y.%m.%d", (last and last.ts) or os.time())
-        local signText = TextWidget:new{ text = "—— " .. sign_dt, face = Font:getFace("cfont", 16) }
+        local signText = TextWidget:new{ text = "—— " .. sign_dt, face = Font:getFace("cfont", 18) }
         signText.not_focusable = true
         local avail_w = dialog.width - 2 * (Size.border.window + Size.padding.default) - 2 * Size.padding.default
         local spacer = HorizontalSpan:new{ width = math.max(0, avail_w - signText:getWidth()) }
