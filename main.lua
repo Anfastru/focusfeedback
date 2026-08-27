@@ -4791,6 +4791,19 @@ function FocusFeedback:init()
         self:_saveCollection({})
         G_reader_settings:saveSetting(settingKey("v2_collection_cleared"), true)
     end
+    -- 旅行日志改版后一次性清空旧记录（旧记录为旧格式，无法回显新样式）
+    if not G_reader_settings:isTrue(settingKey("v2_travel_cleared")) then
+        local c = self:_readCollection()
+        local changed = false
+        for _, __e in ipairs(c) do
+            if __e.travel_log and #__e.travel_log > 0 then
+                __e.travel_log = nil
+                changed = true
+            end
+        end
+        if changed then self:_saveCollection(c) end
+        G_reader_settings:saveSetting(settingKey("v2_travel_cleared"), true)
+    end
     -- V6: 测试积分（一次性 +100，便于测试商超新物品）
     if not G_reader_settings:isTrue(settingKey("v6_debug_100")) then
         local pts = self:_readPoints()
@@ -8833,7 +8846,7 @@ function FocusFeedback:_inboxRandomTimes(offline_sec, keep)
 end
 
 -- 生成一封来信内容（不落库）。ctx 封装上下文供权重判定。
-function FocusFeedback:_genInboxLetter(entry, offline_sec, now)
+function FocusFeedback:_genInboxLetter(entry, offline_sec, now, banned)
     local attrs = self:_inboxAttrs(entry)
     local ctx = { hook = entry }
     -- 参数保守填充，避免依赖重构上下文：
@@ -8872,16 +8885,16 @@ function FocusFeedback:_genInboxLetter(entry, offline_sec, now)
         if ok then table.insert(pool, cand) end
     end
 
-    -- 加权抽取 keep 条（带近期降权，避免重复）
+    -- 加权抽取 keep 条（强降权反重复：本次已抽 + 该书最近记录过的事件权重大幅压减）
     local picks = {}
     local used = {}
+    if banned then for _, k in ipairs(banned) do used[k] = true end end
     for _ = 1, keep do
         local candidates = {}
         for _, cand in ipairs(pool) do
             local w = self:_inboxBranchWeight(cand, attrs, ctx)
             if w > 0 then
-                -- 近期已用事件降权（*0.4），反重复
-                if used[cand.id] then w = w * 0.4 end
+                if used[cand.id] then w = w * 0.12 end   -- 近期/本次已用事件强降权，避免短时间重复
                 table.insert(candidates, { cand = cand, w = w })
             end
         end
@@ -8956,7 +8969,8 @@ function FocusFeedback:_showInboxLetters()
         if e.reveal_date and e.last_inbox_ts then
             local gap = now - e.last_inbox_ts
             if gap >= INBOX_MIN_GAP_SEC then  -- 距上次来信至少30分钟才来信
-                local letter = self:_genInboxLetter(e, gap, now)
+                local banned = self:_recentTravelKeys(e, 8)
+                local letter = self:_genInboxLetter(e, gap, now, banned)
                 if #letter.events > 0 then
                     -- 写入该书旅行日志（不再自动弹窗，供"旅行的书"手动查看）
                     local tlog = e.travel_log or {}
@@ -8968,6 +8982,7 @@ function FocusFeedback:_showInboxLetters()
                             mood = ev.mood or 0,
                             pts = ev.pts or 0,
                             item = ev.item,
+                            key = ev.flatid or ev.text,   -- 去重键：事件id；无id时用文案
                         })
                     end
                     table.sort(tlog, function(a, b) return (a.ts or 0) < (b.ts or 0) end)
@@ -9008,6 +9023,18 @@ function FocusFeedback:_travelCleanup(e, max)
         removed = true
     end
     return removed
+end
+
+-- 取某书旅行日志最近 n 条的去重键，用于生成新事件时避开短时间重复
+function FocusFeedback:_recentTravelKeys(e, n)
+    local out = {}
+    local tlog = e.travel_log
+    if not tlog then return out end
+    local from = math.max(1, #tlog - n + 1)
+    for i = from, #tlog do
+        if tlog[i].key then table.insert(out, tlog[i].key) end
+    end
+    return out
 end
 
 -- 旅行的书：列出有旅行日志的书昵称（点击进详情）
@@ -9194,7 +9221,7 @@ function FocusFeedback:_travelInlineCheck()
         if e.reveal_date then   -- 所有已养成（翻开的成年书）各自动态独立
             local next = e.travel_inline or (now + 3600)
             if now >= next then
-                local letter = self:_genInboxLetter(e, 3600, now)
+                local letter = self:_genInboxLetter(e, 3600, now, self:_recentTravelKeys(e, 5))
                 if #letter.events > 0 then
                     local tlog = e.travel_log or {}
                     table.insert(tlog, {
@@ -9203,6 +9230,7 @@ function FocusFeedback:_travelInlineCheck()
                         mood = letter.events[1].mood or 0,
                         pts = letter.events[1].pts or 0,
                         item = letter.events[1].item,
+                        key = letter.events[1].flatid or letter.events[1].text,
                     })
                     e.travel_log = tlog
                     e.travel_inline = now + math.random(2400, 5400)  -- 40~90分钟后再记录一条
