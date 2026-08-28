@@ -2648,10 +2648,6 @@ function FocusFeedback:_getItemDisplayName(key)
         cotton = "棉花糖", biscuit = "饼干", wastebasket = "废纸篓", toy = "逗书棒",
         -- V6: 新增可用物品
         coffee = "咖啡", clover = "四叶草",
-        -- V7: 测试体验卡
-        test_bookmark = "书签掉落体验卡", test_stranger = "遇见陌生人体验卡",
-        test_babel = "掉入巴别塔体验卡", test_special = "特殊事件体验卡",
-        test_flyaway = "书飞走了体验卡",
         -- V14: 长期模式奖励卡
         mood_immune = "低落免疫卡", sleep_immune = "睡眠免疫卡",
     }
@@ -2686,12 +2682,6 @@ function FocusFeedback:_getItemIntro(key)
         clover = "24小时内正面事件概率×2，更适合倒霉宝宝体质的转运小道具。",
         cat = "书的宠物。小猫在身边时，40%概率在里程碑积分入账时额外+1。快谢谢小猫！",
         rabbit = "书的宠物。小兔在身边时，书很幸福……心情值掉落速度×0.5。快谢谢小兔！",
-        -- V7: 测试体验卡
-        test_bookmark = "测试道具。使用后立即触发一次书签掉落事件，不获得奖励，不干扰日常频率。",
-        test_stranger = "测试道具。使用后立即触发一次遇见陌生人事件，不获得奖励，不干扰日常频率。",
-        test_babel = "测试道具。使用后立即触发一次掉入巴别图书馆事件，不获得奖励，不干扰日常频率。",
-        test_special = "测试道具。使用后立即触发一次特殊事件，不获得奖励，不干扰日常频率。",
-        test_flyaway = "测试道具。使用后立即触发一次书飞走了事件，不获得奖励，不干扰日常频率。",
         -- V14: 长期模式奖励卡
         mood_immune = "强制happy！使用后72h内心情值维持下限为90%。",
         sleep_immune = "书感到精力充沛！使用后将为书免疫接下来的两次睡眠。（可跨日免疫）",
@@ -2749,20 +2739,9 @@ function FocusFeedback:_showWarehouse()
     for key, count in pairs(inv) do
         if count and count > 0 then
             local name = self:_getItemDisplayName(key)
-            -- V7: 测试体验卡点击后弹出"使用"选项
-            local is_test = key:match("^test_")
             -- V14: 低落免疫卡/睡眠免疫卡点击后弹出"使用"选项
             local is_v14_card = (key == "mood_immune" or key == "sleep_immune")
-            if is_test then
-                table.insert(items, {
-                    key = key,
-                    text = name,
-                    mandatory = string.format("×%d", count),
-                    callback = function()
-                        self:_useTestCard(key, name)
-                    end,
-                })
-            elseif is_v14_card then
+            if is_v14_card then
                 table.insert(items, {
                     key = key,
                     text = name,
@@ -2853,100 +2832,6 @@ function FocusFeedback:_showItemIntro(key, name)
         buttons = btnrows,
     }
     UIManager:show(dialog)
-end
-
--- ========== V7 测试体验卡 ==========
-
--- 添加测试体验卡到仓库
-function FocusFeedback:_addTestCards()
-    local inv = self:_readInventory()
-    local cards = {"test_bookmark", "test_stranger", "test_babel", "test_special", "test_flyaway"}
-    for _, k in ipairs(cards) do
-        inv[k] = (inv[k] or 0) + 1
-    end
-    self:_saveInventory(inv)
-    self:_showMessage("已添加5张测试体验卡到仓库", 3)
-end
-
--- 使用测试体验卡
-function FocusFeedback:_useTestCard(key, name)
-    local inv = self:_readInventory()
-    if (inv[key] or 0) <= 0 then return end
-
-    local dialog
-    dialog = ButtonDialog:new{
-        title = string.format("使用「%s」？\n（触发事件但不获得奖励，不干扰日常频率）", name),
-        title_align = "center",
-        buttons = {
-            {
-                {text = "使用", callback = function()
-                    UIManager:close(dialog)
-                    -- 扣除体验卡
-                    inv[key] = inv[key] - 1
-                    self:_saveInventory(inv)
-                    -- 触发测试事件（无奖励）
-                    self:_triggerTestEvent(key)
-                end},
-                {text = "取消", callback = function()
-                    UIManager:close(dialog)
-                end},
-            },
-        },
-    }
-    UIManager:show(dialog)
-end
-
--- 触发测试事件（无奖励、不干扰频率）
-function FocusFeedback:_triggerTestEvent(card_key)
-    local nickname = self:_readNickname()
-    if card_key == "test_bookmark" then
-        local quotes = self.bookmark_quotes or {}
-        if #quotes == 0 then
-            self:_showEventPopup("测试-书签掉落", "（书签掉落测试：书签库为空）", nil,
-                {{text = "确定", callback = function() end}})
-            return
-        end
-        local quote = quotes[math.random(1, #quotes)]
-        -- V8: 前缀单独一行，书签内容另起一行
-        local text = "（书的昵称）身上掉落了一片书签：\n" .. quote
-        text = text:gsub("（书的昵称）", function() return nickname end)
-        self:_showEventPopup("测试-书签掉落", text, "（测试模式：无奖励）",
-            {{text = "确定", callback = function() end}})
-
-    elseif card_key == "test_stranger" then
-        if not self.event_data or not self.event_data.strangers then return end
-        -- 排除节日限定
-        local pool = {}
-        for _, s in ipairs(self.event_data.strangers) do
-            if not s.holiday then table.insert(pool, s) end
-        end
-        if #pool == 0 then return end
-        local stranger = pool[math.random(1, #pool)]
-        local text = (stranger.text or ""):gsub("（书的昵称）", function() return nickname end)
-        local title = "测试-遇见" .. (stranger.name or "")
-        self:_showEventPopup(title, text, "（测试模式：无奖励，纪念品不收入仓库）",
-            {{text = "确定", callback = function() end}})
-
-    elseif card_key == "test_babel" then
-        local text = "宇宙（别人管它叫图书馆）由许多六边形的回廊组成，数目不能确定，也许是无限的……" .. nickname .. "掉入了巴别图书馆，这里有许多它的同类，还有一位失明的阿根廷诗人，都在知识的海洋中寻觅着什么……" .. nickname .. "想起自己诞生之初第一次仰头望见银河的感受，选择了加入它们。"
-        self:_showEventPopup("测试-掉入巴别塔", text, "（测试模式：无积分奖励）",
-            {{text = "确定", callback = function() end}})
-
-    elseif card_key == "test_special" then
-        if not self.event_data or not self.event_data.special_events then return end
-        local events = self.event_data.special_events
-        if #events == 0 then return end
-        local evt = events[math.random(1, #events)]
-        local text = (evt.text or ""):gsub("（书的昵称）", function() return nickname end)
-        local title = "测试-" .. (evt.title or "特殊事件")
-        self:_showEventPopup(title, text, "（测试模式：无奖励，纪念品不收入仓库）",
-            {{text = "确定", callback = function() end}})
-
-    elseif card_key == "test_flyaway" then
-        local text = nickname .. "出门玩耍，路过堪萨斯州的大草原时，一阵猛烈的旋风突然来临。周围的房子、女孩和黑色小梗犬都被大风卷了起来，" .. nickname .. "也是，它吓得吱哇乱叫。"
-        self:_showEventPopup("测试-书飞走了", text, "（测试模式：不扣积分，不扣心情）",
-            {{text = "确定", callback = function() end}})
-    end
 end
 
 -- ========== V2 台词系统 ==========
@@ -4129,94 +4014,110 @@ end
 
 -- ========== V20 六边形雷达图 ==========
 
--- 生成一个可嵌入弹窗的自绘雷达图控件（鸭子类型 widget：getSize/paintTo）。
+-- 自绘控件务必是真正的 WidgetContainer 实例（继承 handleEvent/getSize/init 等）。
+-- 之前用普通 Lua table 作为子控件插入弹窗后，事件经 widget 树传播时
+-- 会在 widgetcontainer.lua 的 propagateEvent 处因 handleEvent 为 nil 而崩溃。
 -- 六条轴对应 RADAR_AXES，相对属性对在顶点上对称对望；数值 0~100 线性映射到半径。
-function FocusFeedback:_makeRadarChart(attrs, size)
-    size = size or Screen:scaleBySize(280)
-    local chart = {
-        size = size,
-        attrs = attrs or {},
-        dimen = Geom:new{ w = size, h = size },
-        not_focusable = true,
-        is_visible = true,
-    }
-    function chart:getSize() return self.dimen end
-    function chart:getWidth() return self.size end
-    function chart:getHeight() return self.size end
-    function chart:getInnerSize() return { w = self.size, h = self.size } end
-    function chart:paintTo(bb, x, y)
-        -- 渲染整体设防：任一绘图原语失败仅记录，不打断弹窗/不崩溃
-        local ok, err = pcall(self._render, self, bb, x, y)
-        if not ok then logger.warn("radar paint error: " .. tostring(err)) end
+local RadarChart = WidgetContainer:extend{
+    size = nil,
+    attrs = {},
+    not_focusable = true,
+    is_visible = true,
+}
+function RadarChart:init()
+    self.size = self.size or Screen:scaleBySize(280)
+    self.dimen = Geom:new{ w = self.size, h = self.size }
+    self.is_visible = true
+    self.not_focusable = true
+end
+function RadarChart:getSize()
+    return self.dimen
+end
+function RadarChart:getWidth()
+    return self.dimen.w
+end
+function RadarChart:getHeight()
+    return self.dimen.h
+end
+function RadarChart:getInnerSize()
+    return { w = self.dimen.w, h = self.dimen.h }
+end
+function RadarChart:paintTo(bb, x, y)
+    -- 渲染整体设防：任一绘图原语失败仅记录，不打断弹窗/不崩溃
+    local ok, err = pcall(self._renderRadar, self, bb, x, y)
+    if not ok then logger.warn("radar paint error: " .. tostring(err)) end
+end
+-- 平铺点表（{x0,y0,x1,y1,...}）勾边或多边形填充；新旧 API 兼容
+function RadarChart:_poly(bb, pts, color, w, fill)
+    if bb.drawPolygon then
+        local ok, e = pcall(function() bb:drawPolygon(pts, color, w, fill) end)
+        if not ok and bb.drawPoly then pcall(function() bb:drawPoly(pts, color, w, fill) end) end
+        return
     end
-    -- 平铺点表（{x0,y0,x1,y1,...}）勾边或多边形填充；新旧 API 兼容
-    function chart:_poly(bb, pts, color, w, fill)
-        if bb.drawPolygon then
-            local ok, e = pcall(function() bb:drawPolygon(pts, color, w, fill) end)
-            if not ok and bb.drawPoly then pcall(function() bb:drawPoly(pts, color, w, fill) end) end
-            return
+    if bb.drawPoly then pcall(function() bb:drawPoly(pts, color, w, fill) end) end
+end
+function RadarChart:_renderRadar(bb, px, py)
+    local n = #RADAR_AXES
+    local S = self.size
+    local cx, cy = px + S/2, py + S/2
+    local half = S/2
+    local R_max = half - Screen:scaleBySize(6)
+    local label_r = R_max + Screen:scaleBySize(14)
+    local thin = math.max(1, Screen:scaleBySize(1))
+    -- 网格：3 圈六边形
+    for ring = 1, 3 do
+        local fr = ring * R_max / 3
+        local pts = {}
+        for i = 1, n do
+            local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
+            pts[2*i-1] = cx + fr * math.cos(ang)
+            pts[2*i]   = cy + fr * math.sin(ang)
         end
-        if bb.drawPoly then pcall(function() bb:drawPoly(pts, color, w, fill) end) end
-    end
-    function chart:_render(bb, px, py)
-        local n = #RADAR_AXES
-        local S = self.size
-        local cx, cy = px + S/2, py + S/2
-        local half = S/2
-        local R_max = half - Screen:scaleBySize(6)
-        local label_r = R_max + Screen:scaleBySize(14)
-        local thin = math.max(1, Screen:scaleBySize(1))
-        -- 网格：3 圈六边形
-        for ring = 1, 3 do
-            local fr = ring * R_max / 3
-            local pts = {}
+        self:_poly(bb, pts, Blitbuffer.COLOR_DARK_GRAY, thin, false)
+        -- 外圈与内圈从圆心拉辐条（中圈略，避免过密）
+        if ring == 3 or ring == 1 then
             for i = 1, n do
                 local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
-                pts[2*i-1] = cx + fr * math.cos(ang)
-                pts[2*i]   = cy + fr * math.sin(ang)
+                bb:drawLine(cx, cy,
+                    cx + fr * math.cos(ang), cy + fr * math.sin(ang),
+                    Blitbuffer.COLOR_DARK_GRAY, thin)
             end
-            self:_poly(bb, pts, Blitbuffer.COLOR_DARK_GRAY, thin, false)
-            -- 外圈与内圈从圆心拉辐条（中圈略，避免过密）
-            if ring == 3 or ring == 1 then
-                for i = 1, n do
-                    local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
-                    bb:drawLine(cx, cy,
-                        cx + fr * math.cos(ang), cy + fr * math.sin(ang),
-                        Blitbuffer.COLOR_DARK_GRAY, thin)
-                end
-            end
-        end
-        -- 数据多边形：填充 + 描边
-        local dpts = {}
-        for i, a in ipairs(RADAR_AXES) do
-            local v = math.max(0, math.min(100, tonumber(self.attrs[a]) or 0))
-            local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
-            dpts[2*i-1] = cx + R_max * math.cos(ang) * (v / 100)
-            dpts[2*i]   = cy + R_max * math.sin(ang) * (v / 100)
-        end
-        self:_poly(bb, dpts, Blitbuffer.COLOR_GREEN, thin, true)
-        self:_poly(bb, dpts, Blitbuffer.COLOR_GREEN, math.max(1, Screen:scaleBySize(2)), false)
-        -- 顶点数据点
-        for i = 1, n do
-            bb:drawRect(dpts[2*i-1]-2, dpts[2*i]-2, 5, 5, Blitbuffer.COLOR_GREEN, 1)
-        end
-        -- 轴标签：名称 + 数值
-        local face = Font:getFace("cfont", 13)
-        for i, a in ipairs(RADAR_AXES) do
-            local v = math.max(0, math.min(100, tonumber(self.attrs[a]) or 0))
-            local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
-            local lx = cx + label_r * math.cos(ang)
-            local ly = cy + label_r * math.sin(ang)
-            local label = a .. tostring(v)
-            local wpx = 0
-            for ch in label:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-                local byte = ch:byte()
-                wpx = wpx + ((byte and byte > 127) and 13 or 8)
-            end
-            bb:drawText(lx - wpx/2, ly - 8, label, face, 13, Blitbuffer.COLOR_BLACK)
         end
     end
-    return chart
+    -- 数据多边形：填充 + 描边
+    local dpts = {}
+    for i, a in ipairs(RADAR_AXES) do
+        local v = math.max(0, math.min(100, tonumber(self.attrs[a]) or 0))
+        local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
+        dpts[2*i-1] = cx + R_max * math.cos(ang) * (v / 100)
+        dpts[2*i]   = cy + R_max * math.sin(ang) * (v / 100)
+    end
+    self:_poly(bb, dpts, Blitbuffer.COLOR_GREEN, thin, true)
+    self:_poly(bb, dpts, Blitbuffer.COLOR_GREEN, math.max(1, Screen:scaleBySize(2)), false)
+    -- 顶点数据点
+    for i = 1, n do
+        bb:drawRect(dpts[2*i-1]-2, dpts[2*i]-2, 5, 5, Blitbuffer.COLOR_GREEN, 1)
+    end
+    -- 轴标签：名称 + 数值
+    local face = Font:getFace("cfont", 13)
+    for i, a in ipairs(RADAR_AXES) do
+        local v = math.max(0, math.min(100, tonumber(self.attrs[a]) or 0))
+        local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
+        local lx = cx + label_r * math.cos(ang)
+        local ly = cy + label_r * math.sin(ang)
+        local label = a .. tostring(v)
+        local wpx = 0
+        for ch in label:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+            local byte = ch:byte()
+            wpx = wpx + ((byte and byte > 127) and 13 or 8)
+        end
+        bb:drawText(lx - wpx/2, ly - 8, label, face, 13, Blitbuffer.COLOR_BLACK)
+    end
+end
+
+-- 生成雷达图实例
+function FocusFeedback:_makeRadarChart(attrs, size)
+    return RadarChart:new{ size = size, attrs = attrs or {} }
 end
 
 -- 书的信息弹窗：生日/成年日/年龄/六维属性（含六边形雷达图）
@@ -8775,7 +8676,7 @@ local ADULT_INBOX_EVENTS = {
     -- 27 xx决定去网吧放纵自己！狂打了两个小时数独。
     { bg="xx决定去网吧放纵自己！狂打了两个小时数独。", conds={"逻辑high"}, id="netcafe" },
     -- 28 xx决定用一辈子来成为自己。
-    { bg="xx决定用一辈子来成为自己。", conds={"各项均衡且偏高high"}, id="become_self" },
+    { bg="xx决定用一辈子来成为自己。", conds={"各项均衡up"}, id="become_self" },
     -- 29 xx走在路上，捡到了一副塔罗牌。
     { bg="xx走在路上，捡到了一副塔罗牌。", conds={"晚夜high","情感up"}, id="tarot",
       bs={
@@ -9032,50 +8933,6 @@ local ADULT_INBOX_EVENTS = {
 }
 local ADULT_INBOX_EVENTS_FLAT = nil  -- 惰性生成（主体+各分支展开）
 
--- 书信开头/结尾模板：按当前单本最高属性选用
--- 占位符（昵称）会在展示时替换
-local INBOX_LETTER_TEMPLATES = {
-    grief_high = {
-        great = "（昵称）：",
-        open = "你不在的日子里我的生活很丰富！也很想你……",
-        close = "下次见！！要开心——",
-    },
-    aesthetic_high = {
-        great = "亲爱的朋友：",
-        open = "展信佳。当你读这封信的时候，我又将拥有你生命中的三分钟。",
-        close = "请停一停，你真美丽。",
-    },
-    logic_high = {
-        great = "朋友：",
-        open = "近况汇报如下：",
-        close = "一切都还好吗？",
-    },
-    knowledge_high = {
-        great = "亲爱的主人：",
-        open = "最近又学到了许多新东西，忍不住向你分享……",
-        close = "江南无所有，聊赠一枝春。",
-    },
-    experience_high = {
-        great = "人类：",
-        open = "见字如晤。有些好玩的经历，难以抑制分享的心情。",
-        close = "真想与这封信一起，跨过千山万水。",
-    },
-    dialectic_high = {
-        great = "人类的女孩：",
-        open = "见不到你我急得团团转……最近也有一些小书事发生！请品鉴！",
-        close = "真想和你畅聊上一个晚自习呀！",
-    },
-}
--- 模板对应的最高属性判定
-local INBOX_LETTER_PROFILE = {
-    { attr="审美", style="aesthetic_high" },
-    { attr="逻辑", style="logic_high" },
-    { attr="知识", style="knowledge_high" },
-    { attr="阅历", style="experience_high" },
-    { attr="辩证", style="dialectic_high" },
-    { attr="情感", style="grief_high" },  -- 情感兜底
-}
-
 -- 惰性展开事件池：每个 (主体×分支) 展开为一个候选
 function FocusFeedback:_inboxFlatEvents()
     if ADULT_INBOX_EVENTS_FLAT then return ADULT_INBOX_EVENTS_FLAT end
@@ -9105,16 +8962,6 @@ function FocusFeedback:_inboxFlatEvents()
     end
     ADULT_INBOX_EVENTS_FLAT = flat
     return flat
-end
-
--- 依据当前单本六维属性，按属性值加权随机抽取书信风格（与事件触发同一套加权逻辑）
-function FocusFeedback:_inboxLetterStyle(entry)
-    local a = self:_inboxAttrs(entry)
-    -- 每种风格的出现概率 ∝ 它对应属性的当前值；属性为0时给极低权重保底，避免完全消失
-    local picked = self:_weightedPick(INBOX_LETTER_PROFILE, function(item)
-        return 0.1 + (a[item.attr] or 0)
-    end)
-    return INBOX_LETTER_TEMPLATES[picked.style] or INBOX_LETTER_TEMPLATES.grief_high
 end
 
 -- 季节：3-5春，6-8夏，9-11秋，12-2冬（返回“春/夏/秋/冬”）
@@ -11083,17 +10930,11 @@ function FocusFeedback:_travelInlineCheck()
     if changed then self:_saveCollection(c) end
 end
 
--- 展示一封来信（书信：按最高属性选用开头/结尾模板；底部落款日期可跨日；正文为时分+事件）
+-- 展示一封来信（底部落款日期可跨日；正文为时分+事件）
 function FocusFeedback:_displayInbox(e, letter, gap, now)
     local times = self:_inboxRandomTimes(gap, #letter.events)  -- 复用随机时序，保证展示与数据一致
-    local style = self:_inboxLetterStyle(e)
     local nickname = e.nickname or "它"
     local lines = {}
-
-    -- 书信开头：称谓 + 开头语
-    table.insert(lines, style.great:gsub("（昵称）", nickname))
-    table.insert(lines, style.open:gsub("（昵称）", nickname))
-    table.insert(lines, "")
 
     -- 正文：时分 + 事件
     for i, ev in ipairs(letter.events) do
@@ -11109,16 +10950,12 @@ function FocusFeedback:_displayInbox(e, letter, gap, now)
         table.insert(lines, time_str .. "  " .. ev.text .. suffix)
     end
 
-    -- 书信结尾：结尾语
-    table.insert(lines, "")
-    table.insert(lines, style.close:gsub("（昵称）", nickname))
-    table.insert(lines, "")
-
     -- 落款（昵称 + 真实日期，跨日显示区间）
     local start_dt = os.date("%Y.%m.%d", now - gap)
     local end_dt = os.date("%Y.%m.%d", now)
     local stamp = start_dt
     if start_dt ~= end_dt then stamp = stamp .. "-" .. end_dt end
+    table.insert(lines, "")
     table.insert(lines, "落款 · " .. nickname)
     table.insert(lines, "        " .. stamp)
     self:_showMessage(table.concat(lines, "\n"), 0)
