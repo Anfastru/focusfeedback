@@ -321,6 +321,13 @@ local SPECIAL_TASK_REWARDS = {
     s8 = {key = "m_spring_night", name = "春风沉醉的晚上", intro = "来自特殊任务奖励。春风和夜晚，或许是我们最最后的资产。"},
 }
 
+-- 仓库"特殊物品收集"分母里的事件链纪念品（新增纪念品必须在此登记，否则不计入收集进度）
+-- prefix: 纪念品 key 前缀；endings: 该链全部结局 id
+local COLLECTIBLE_CHAIN_ENDINGS = {
+    { prefix = "souvenir_mokou_", endings = { "school_gold", "home", "zzz", "cat_guilt", "silent", "neat", "cold", "bad", "frank" } },
+    { prefix = "souvenir_misi_", endings = { "wo_nest", "overconfident", "sacred_scholar", "starve_fantasy", "knowledge_power", "gaokao_card", "glutton", "crow_virtue", "knowledge_glory", "asylum", "skeptic" } },
+}
+
 -- 好运任务奖励（纯送钱）
 local LUCK_TASK_REWARDS = {
     l1 = {type = "item", key = "cotton", name = "棉花糖", count = 10},
@@ -2656,6 +2663,33 @@ function FocusFeedback:_getItemIntro(key)
     return "一个神秘的物品。"
 end
 
+-- 仓库"特殊物品收集"分母全集：特殊任务奖励 + 陌生人/特殊事件纪念品 + 事件链纪念品
+function FocusFeedback:_collectibleKeys()
+    local set = {}
+    for _, def in pairs(SPECIAL_TASK_REWARDS) do if def.key then set[def.key] = true end end
+    if self.event_data then
+        for _, s in ipairs(self.event_data.strangers or {}) do if s.reward_key then set[s.reward_key] = true end end
+        for _, e in ipairs(self.event_data.special_events or {}) do if e.reward_key then set[e.reward_key] = true end end
+    end
+    for _, grp in ipairs(COLLECTIBLE_CHAIN_ENDINGS) do
+        for _, eid in ipairs(grp.endings) do set[grp.prefix .. eid] = true end
+    end
+    return set
+end
+
+-- 收集进度：owned/total + 百分比（参考图鉴读完书页面顶部统计形态）
+function FocusFeedback:_collectibleProgress()
+    local inv = self:_readInventory()
+    local set = self:_collectibleKeys()
+    local owned, total = 0, 0
+    for k in pairs(set) do
+        total = total + 1
+        if (inv[k] or 0) > 0 then owned = owned + 1 end
+    end
+    local pct = total > 0 and math.floor(owned / total * 100 + 0.5) or 0
+    return { owned = owned, total = total, pct = pct }
+end
+
 function FocusFeedback:_showWarehouse()
     local inv = self:_readInventory()
     local items = {}
@@ -2706,7 +2740,9 @@ function FocusFeedback:_showWarehouse()
         table.insert(items, {key = "rabbit", text = "小兔", mandatory = "×1",
             callback = function() self:_showItemIntro("rabbit", "小兔") end})
     end
-    if #items == 0 then
+    -- 收集进度：即使暂无仓库物品也展示（分母存在即为可收集目标）
+    local stats = self:_collectibleProgress()
+    if #items == 0 and stats.total == 0 then
         self:_showMessage("仓库空空如也", 3)
         return
     end
@@ -2723,6 +2759,14 @@ function FocusFeedback:_showWarehouse()
         if pa ~= pb then return pa < pb end
         return a.text < b.text
     end)
+    -- 顶部统计行：特殊物品收集 x / y（z%）
+    local stats_text = string.format("特殊物品收集 %d / %d（%d%%）", stats.owned, stats.total, stats.pct)
+    table.insert(items, 1, {
+        key = "__collect_stats",
+        text = stats_text,
+        mandatory = "",
+        callback = function() self:_showMessage("特殊物品收集进度。\n来源：遇见陌生人 / 特殊事件 / 每日任务特殊任务 / 事件链纪念品", 5) end,
+    })
     local menu = Menu:new{
         title = "仓库",
         item_table = items,
@@ -2738,11 +2782,15 @@ function FocusFeedback:_showItemIntro(key, name)
     local intro = self:_getItemIntro(key)
     local dialog
     local btnrows = {}
-    -- 模恐纪念品：按原文在介绍下方提供"再次体验"（只能按第一次的选择走，无奖励）
-    if key and key:match("^souvenir_mokou_") then
+    -- 事件链纪念品（模恐/迷思）：介绍下方提供"再次体验"（只能按第一次的选择走，无奖励）
+    if key and (key:match("^souvenir_mokou_") or key:match("^souvenir_misi_")) then
         table.insert(btnrows, {{ text = "再次体验", callback = function()
             UIManager:close(dialog)
-            self:_mokouReplayFromSouvenir(key)
+            if key:match("^souvenir_mokou_") then
+                self:_mokouReplayFromSouvenir(key)
+            else
+                self:_misiReplayFromSouvenir(key)
+            end
         end }})
     end
     table.insert(btnrows, {{ text = "关闭", callback = function() UIManager:close(dialog) end }})
@@ -4703,6 +4751,8 @@ function FocusFeedback:_onActivity(now)
                 pcall(function()
                     self:_addBookReadingTime(diff)
                 end)
+                -- V19: 好感暗线·阅读（当前书每满1h好感+1，跨会话累积）
+                pcall(function() self:_favorReadCredit(diff) end)
                 -- V15: 阅读时长累计 -> 属性增长
                 pcall(function()
                     self:_growAttributesFromReading(diff)
@@ -4757,8 +4807,10 @@ function FocusFeedback:_tick()
     end)
     -- 旅行的书：在线阅读时偶尔补记动态
     pcall(function() self:_travelInlineCheck() end)
-    -- V18: 成长型事件链（模恐）检查：推进进行中链 + 入口专判
+    -- V18: 成长型事件链（模恐/迷思）检查：推进进行中链 + 入口专判
     pcall(function() self:_chainCheck() end)
+    -- V19: 好感暗线·离线（离线满7h-1 / 连续3天-10 / 超30天停扣 / 摸鱼豁免）
+    pcall(function() self:_favorOfflineCheck() end)
     self:_schedule()
 end
 
@@ -4877,7 +4929,7 @@ function FocusFeedback:onFocusFeedbackWarehouse()
 end
 
 function FocusFeedback:onFocusFeedbackTravel()
-    pcall(function() self:_showTravelBookList() end)
+    pcall(function() self:_showTravelFlow() end)
 end
 
 -- V9: SimpleUI 公开入口（供 Custom Quick Action 调用）
@@ -6107,29 +6159,7 @@ function FocusFeedback:addToMainMenu(menu_items)
                     },
                 },
             },
-            {
-                text = "事件链（模恐）",
-                separator = true,
-                sub_item_table = {
-                    {
-                        text = "测试模式（连续触发·快进·无奖励·不收藏）",
-                        checked_func = function() return self:_mokouTestActive() end,
-                        callback = function()
-                            local on = not self:_mokouTestActive()
-                            G_reader_settings:saveSetting(settingKey("v18_mokou_test"), on)
-                            self:_showMessage(on and "模恐测试已开启：连续快进，奖励/收藏均禁用。"
-                                or "模恐测试已关闭。", 3)
-                        end,
-                    },
-                    {
-                        text = "立即开始测试事件链",
-                        callback = function()
-                            self:_mokouForceStart()
-                        end,
-                    },
-                },
             },
-        },
     }
 end
 
@@ -8359,7 +8389,7 @@ local INBOX_COOLDOWN_SLEEP = {"insomnia", "sleep_well", "nightmare"}
 local INBOX_COOLDOWN_EAT_SEC = 3 * 3600
 local INBOX_COOLDOWN_MOVIE_SEC = 2 * 24 * 3600
 local INBOX_COOLDOWN_SLEEP_SEC = 4 * 3600   -- 两次睡觉事件之间最小间隔4小时，防夜里反复睡觉
-local INBOX_MIN_GAP_SEC = 1800   -- 距上次来信至少30分钟才来信（防刷屏；测试可临时调小）
+local INBOX_MIN_GAP_SEC = 5400   -- 距上次来信至少1.5h才来信（旅行的书约1.5-2h一条）
 local INBOX_MAX_EVENTS = 8      -- 单次离线来信最多生成条数（防一次性爆量）
 
 local ADULT_INBOX_EVENTS = {
@@ -8439,7 +8469,7 @@ local ADULT_INBOX_EVENTS = {
       bs={
         { t="绝育成功，小猫变得更粘人了！", pts=1, conds={"情感up"} },
         { t="猫生气地抓伤了xx，xx开始思考宠物绝育的伦理问题。最终把猫带回了家。", conds={"知识up","逻辑up","辩证up"} },
-        { t="结果因为夜晚天黑看不清路，连书带猫一起滚落到了一处悬崖下面……", conds={"审美up"} },
+        { t="结果因为夜晚天黑看不清路，连书带猫一起滚落到了一处悬崖下面……", conds={"知识up","阅历up"}, chain_entry="misi" },
       }
     },
     -- 10 xx独自观看了电影《Lalaland》
@@ -8619,6 +8649,199 @@ local ADULT_INBOX_EVENTS = {
     },
     -- 40 xx路遇了一个冰淇淋并食用之。心情+2%
     { bg="xx路遇了一个冰淇淋并食用之。", mood=2, id="icecream" },
+    -- 41 xx路遇了一只蜥蜴，并跟对方商量了一下能不能骑，已同意。心情+2%
+    { bg="xx路遇一只蜥蜴，并跟对方商量了一下能不能骑，已同意。", mood=2, id="tr41" },
+    -- 42
+    { bg="xx在家里看电视，不知道看到了什么，兴奋地跳了起来。", id="tr42" },
+    -- 43
+    { bg="xx打电话给你，问你它能不能买一套恐龙玩具，但被你当作骚扰电话挂断了。", mood=-2, id="tr43" },
+    -- 44
+    { bg="xx网购了一张床。不知道要干嘛？！", id="tr44" },
+    -- 45
+    { bg="xx接到诈骗电话，被精妙的话术骗走了五块钱。要做好反诈意识哟。", pts=-1, id="tr45" },
+    -- 46 xx做了一页手账。（审美up）
+    { bg="xx做了一页手账。", conds={"审美up"}, id="tr46" },
+    -- 47
+    { bg="xx摔倒了……", id="tr47" },
+    -- 48
+    { bg="xx替猫铲了屎，然后闻了一下。", id="tr48" },
+    -- 49
+    { bg="xx给小兔拍摄了一个傻子视频。", id="tr49" },
+    -- 50
+    { bg="xx给小猫拍了一张很丑的照片，并投到丑猫厕。", id="tr50" },
+    -- 51
+    { bg="xx发消息给你，问它能不能买一个备用机。", id="tr51" },
+    -- 52
+    { bg="xx出去逛街，顺手买了包种子。", id="tr52" },
+    -- 53
+    { bg="xx出门了，但是没带钥匙，在楼下急得团团转。最后只能利用自己曼妙的身材从窗缝挤进去。", id="tr53" },
+    -- 54
+    { bg="xx的猫学会了开门。", id="tr54" },
+    -- 55
+    { bg="xx的猫把水杯弄倒了，水洒到了xx的笔记本电脑上……", id="tr55" },
+    -- 56
+    { bg="xx被猫捣乱气晕了。", id="tr56" },
+    -- 57
+    { bg="xx沉浸式抚摸小兔长耳朵十分钟。", id="tr57" },
+    -- 58
+    { bg="xx把自己的猫兔合照发到网上，被网民攻击猫兔混养。", mood=-2, id="tr58" },
+    -- 59
+    { bg="xx发了张自拍在朋友圈。", id="tr59" },
+    -- 60
+    { bg="xx开始cos福柯。", id="tr60" },
+    -- 61
+    { bg="xx找到了自己的梦幻之产。", id="tr61" },
+    -- 62
+    { bg="xx徜徉ao3一个小时。", mood=1, id="tr62" },
+    -- 63
+    { bg="xx看了场喜剧，笑晕了一个小时才醒。", id="tr63" },
+    -- 64
+    { bg="xx的空调遥控器电池没电了，被迫学会了用手机操控空调。", id="tr64" },
+    -- 65 xx路过民政局，搅黄了一对新人的婚事。（辩证up）
+    { bg="xx路过民政局，搅黄了一对新人的婚事。", conds={"辩证up"}, id="tr65" },
+    -- 66
+    { bg="xx开通了一项自动扣费，你想看看，但一想xx已经是成年书了，还是克制住了自己的好奇心。", id="tr66" },
+    -- 67
+    { bg="xx忧郁地听起了后摇。", id="tr67" },
+    -- 68 xx很土地听起了抖音热歌。（审美较低up）
+    { bg="xx很土地听起了抖音热歌。", conds={"审美较低up"}, id="tr68" },
+    -- 69
+    { bg="xx开始考虑买一只小狗……", id="tr69" },
+    -- 70
+    { bg="xx喜欢上了比格犬。", id="tr70" },
+    -- 71
+    { bg="xx发明了一种特别的装置可以解决它生活里的小烦恼，可惜你并不知道具体情况。", id="tr71" },
+    -- 72
+    { bg="xx突然原地哭了一分钟……", id="tr72" },
+    -- 73
+    { bg="xx把家里的帽子全部翻出来，挨个试戴了一遍。", id="tr73" },
+    -- 74
+    { bg="xx把家里的衣服全部翻出来，挨个试穿了一遍。", id="tr74" },
+    -- 75
+    { bg="xx给自己的书脊贴了十颗铆钉，但很快就都掉了。", id="tr75" },
+    -- 76
+    { bg="xx玩了一会跳一跳。", id="tr76" },
+    -- 77
+    { bg="xx试图跳起来摸到天花板的吊灯。", id="tr77" },
+    -- 78
+    { bg="xx开始唱歌并录了下来。（后面感觉很难听就自己删掉了）", id="tr78" },
+    -- 79
+    { bg="xx吃了一块小蛋糕。", id="tr79" },
+    -- 80
+    { bg="xx**********（由于对方设置，你无法查看这条动态）", id="tr80" },
+    -- 81
+    { bg="xx变了个魔术给自己看。", id="tr81" },
+    -- 82
+    { bg="xx买了副扑克牌。", id="tr82" },
+    -- 83
+    { bg="xx偷偷拔了小鸡的一根羽毛。", id="tr83" },
+    -- 84
+    { bg="xx注销了自己的一个账号。", id="tr84" },
+    -- 85
+    { bg="xx刷了十分钟微博。", id="tr85" },
+    -- 86 xx出门抓蝴蝶去了，打算做标本。（夏季up）
+    { bg="xx出门抓蝴蝶去了，打算做标本。", conds={"夏秋up"}, id="tr86" },
+    -- 87
+    { bg="xx一边洗澡一边吃香蕉，试图体验猴子的激情。", id="tr87" },
+    -- 88
+    { bg="xx在自己周围放了很多干燥剂，因为它感觉太湿了。", id="tr88" },
+    -- 89
+    { bg="xx房间的灯突然坏了，好黑暗。", id="tr89" },
+    -- 90
+    { bg="xx咬了一口沙发，并没有咬动。", id="tr90" },
+    -- 91
+    { bg="xx拖着一把椅子走来走去，发出刺耳的声音，很吵。", id="tr91" },
+    -- 92
+    { bg="xx和邻居发生了一点小矛盾。", mood=-1, id="tr92" },
+    -- 93
+    { bg="xx听了一张唱片。", id="tr93" },
+    -- 94
+    { bg="xx尝试了缝纫，很可惜失败了，不过好在没有受伤。", id="tr94" },
+    -- 95
+    { bg="xx喝了一杯小黄油咖啡。", id="tr95" },
+    -- 96
+    { bg="xx烤了个蛋糕。", mood=1, id="tr96" },
+    -- 97
+    { bg="xx手滑打碎了它最喜欢的玻璃杯……", mood=-1, id="tr97" },
+    -- 98
+    { bg="xx决定成为独角兽。", id="tr98" },
+    -- 99
+    { bg="xx打开了一个购物软件。", id="tr99" },
+    -- 100
+    { bg="xx来吃饭了，但是它自己并没有准备。xx吃着空气中的食物，味蕾早已嗨到天边。", id="tr100" },
+    -- 101
+    { bg="xx试图参加一场宠物展，可惜并没有人把书当作ta们的宠物。", id="tr101" },
+    -- 102
+    { bg="xx领了一份鸡蛋。", id="tr102" },
+    -- 103
+    { bg="xx打开冰箱，发现它之前放进去的食物发霉了……", id="tr103" },
+    -- 104
+    { bg="xx玩了一次旋转木马。", id="tr104" },
+    -- 105
+    { bg="xx逛了一分钟MINISO，索然无味地离开了。", id="tr105" },
+    -- 106
+    { bg="xx参加了一个挑战，混入书展一小时不被发现。挑战成功！", pts=1, id="tr106" },
+    -- 107
+    { bg="xx参加了一个派对，但只待了十分钟就走了。因为它太矮了没有人理它。", id="tr107" },
+    -- 108
+    { bg="xx买了个很丑的小东西，并且不愿意公开它的照片。", id="tr108" },
+    -- 109
+    { bg="xx捡到了一块钱硬币。", id="tr109" },
+    -- 110
+    { bg="xx伤心了，并没有理由。", id="tr110" },
+    -- 111
+    { bg="xx泡了个咖啡。", id="tr111" },
+    -- 112 xx误食了一些猫粮。（知识高于30不要发生）
+    { bg="xx误食了一些猫粮。", conds={"知识低门槛"}, id="tr112" },
+    -- 113 xx误食了一些兔粮。（知识高于30不要发生）
+    { bg="xx误食了一些兔粮。", conds={"知识低门槛"}, id="tr113" },
+    -- 114
+    { bg="xx在医院门口捡了一个借命红包。", id="tr114" },
+    -- 115
+    { bg="xx打开了衣柜，发现里面有一个小娃娃。", id="tr115" },
+    -- 116
+    { bg="xx打开了衣柜。", id="tr116" },
+    -- 117
+    { bg="xx打开了冰箱。", id="tr117" },
+    -- 118
+    { bg="xx打开了门。", id="tr118" },
+    -- 119
+    { bg="xx打开了所有房间的灯。", id="tr119" },
+    -- 120
+    { bg="xx计算了这个月的水电费。", id="tr120" },
+    -- 121-130 摸流浪动物
+    { bg="xx摸了一只流浪猫。", id="tr121" },
+    { bg="xx摸了一只流浪狗。", id="tr122" },
+    { bg="xx摸了一只流浪河马。", id="tr123" },
+    { bg="xx摸了一只流浪蜥蜴。", id="tr124" },
+    { bg="xx摸了一只流浪火烈鸟。", id="tr125" },
+    { bg="xx摸了一只流浪驼鹿。", id="tr126" },
+    { bg="xx摸了一只流浪羚羊。", id="tr127" },
+    { bg="xx摸了一只流浪海豚。", id="tr128" },
+    { bg="xx摸了一只流浪狮子。", id="tr129" },
+    { bg="xx摸了一只流浪长颈鹿。", id="tr130" },
+    { bg="xx吃了一个菠萝披萨。", id="tr131" },
+    { bg="xx吃了一个草莓布丁。", id="tr132" },
+    { bg="xx吃了一个香草冰淇淋。", id="tr133" },
+    { bg="xx吃了一根火腿肠。", id="tr134" },
+    { bg="xx喝了半瓶可乐。", id="tr135" },
+    { bg="xx打了个喷嚏……", id="tr136" },
+    { bg="xx爬了一座山，但是下来的时候是坐缆车的。", id="tr137" },
+    { bg="xx写了一会日记。", id="tr138" },
+    { bg="xx突然换了一条内裤。", id="tr139" },
+    { bg="xx在公园喂了五分钟鸽子。", id="tr140" },
+    { bg="xx对着镜子端详了十分钟。", id="tr141" },
+    { bg="xx抓到了一只蟑螂。", id="tr142" },
+    { bg="xx去了楼下便利店一趟。", id="tr143" },
+    { bg="xx试图游泳，却发现自己是纸制品。", mood=-2, id="tr144" },
+    -- 145 xx学会了乘坐电梯。（知识<30才能发生）
+    { bg="xx学会了乘坐电梯。", conds={"知识低门槛"}, id="tr145" },
+    { bg="xx喝可乐的时候，往吸管里连续吹气五分钟，听到了很多咕噜咕噜的气泡声。", id="tr146" },
+    { bg="xx用微波炉爆了一些爆米花。", id="tr147" },
+    { bg="xx打印了一些牛肉汉堡喂给碎纸机吃，但是碎纸机是vegan……xx闯祸了。", id="tr148" },
+    { bg="xx打了个耳洞（左边）！！！", id="tr149" },
+    { bg="xx打了个耳洞（右边）！！！", id="tr150" },
+    { bg="xx打了个舌钉，并开始含糊不清地自言自语……", id="tr151" },
 }
 local ADULT_INBOX_EVENTS_FLAT = nil  -- 惰性生成（主体+各分支展开）
 
@@ -8779,6 +9002,8 @@ function FocusFeedback:_inboxCondWeight(c, attrs, ctx)
     if c == "近日读完up" then return ctx.finished_recent and 2.0 or 0 end
     if c == "离线时间长up" then return ctx.offline_long and 1.6 or 0 end
     if c == "首次上线较晚up" then return ctx.first_online_late and 1.8 or 0 end
+    -- 硬门槛：仅当属性≤30 才可发生（如"知识高于30不要发生"）
+    if c == "知识低门槛" then return (attrs["知识"] or 0) <= 30 and 1.0 or 0 end
 
     -- 属性类：形态 属性名 + up/high/较低
     local attr = c:match("^([知识审美情感阅历逻辑辩证])")
@@ -8787,7 +9012,7 @@ function FocusFeedback:_inboxCondWeight(c, attrs, ctx)
         local v = attrs[attr] or 0
         local low = c:find("较低", 1, true) ~= nil
         local level = c:match("high$") and "high" or "up"
-        local k = level == "high" and 3 or 1.6
+        local k = level == "high" and 2 or 1.2   -- V19: 属性类加权整体下调（high 3→2 / up 1.6→1.2）
         if low then
             return (v <= 30) and k or (100 - v) / 100   -- 越低越高；>30 时随反比
         else
@@ -8911,16 +9136,95 @@ function FocusFeedback:_addFavor(entry, delta)
     self:_saveCollection(c)
 end
 
+-- ========== V19 好感暗线 ==========
+-- 阅读满1h → +1；离线满7h → -1；连续≥3天 → 额外-10；累计离线超30天停扣；摸鱼模式豁免离线惩罚
+
+-- 按书 index 调整好感（阅读累计 / 离线惩罚共用）
+function FocusFeedback:_favorByIndex(idx, delta)
+    local c = self:_readCollection()
+    for _, e in ipairs(c) do
+        if e.index == idx then
+            local f = type(e.favor) == "number" and e.favor or 0
+            e.favor = math.max(-100, math.min(100, math.floor(f + delta)))
+            break
+        end
+    end
+    self:_saveCollection(c)
+end
+
+-- 好感暗线·阅读：当前读的书每满1h好感+1（按书独立、跨会话累积；只在阅读钩子触发）
+function FocusFeedback:_favorReadCredit(diff)
+    if (diff or 0) < 1 then return end
+    local idx = self.reveal_index
+    if not idx then return end
+    local fa = G_reader_settings:readSetting(settingKey("v9_favor_read"), {}) or {}
+    if type(fa.idx) ~= "table" then fa.idx = {} end
+    local sec = (fa.idx[idx] or 0) + diff
+    local cred = math.floor(sec / 3600)
+    if cred > 0 then
+        sec = sec - cred * 3600
+        self:_favorByIndex(idx, cred)
+    end
+    fa.idx[idx] = sec
+    G_reader_settings:saveSetting(settingKey("v9_favor_read"), fa)
+end
+
+-- 好感暗线·离线：累计离线天数（仅统计≥30min的离开段，避免在开应用时被细碎 tick 计入）
+local OFFLINE_MIN_GAP = 30 * 60
+function FocusFeedback:_favorOfflineCheck()
+    local now = os.time()
+    local key = settingKey("v9_favor_off")
+    local ld = G_reader_settings:readSetting(key, {}) or {}
+    local last = type(ld.last) == "number" and ld.last or now
+    if last > now then last = now end
+    if ld.last and (now - last) >= OFFLINE_MIN_GAP then
+        local gap = now - last
+        local cum = (ld.cum or 0) + gap
+        ld.cum = cum
+        local slack = (self:_getActiveMode() == MODE_SLACK)
+        if not slack and cum <= 30 * 86400 then
+            local blocks = math.floor(gap / (7 * 3600))     -- 每满7h -1
+            if blocks > 0 then self:_favorAll(-blocks) end
+            local days = math.floor(gap / 86400)
+            local threes = math.floor(days / 3)             -- 连续满3天额外-10
+            if threes > 0 then self:_favorAll(-10 * threes) end
+        end
+        ld.cum = cum
+    end
+    ld.last = now
+    G_reader_settings:saveSetting(key, ld)
+end
+
+-- 好感暗线·全体：所有成年书统一调整（摸鱼豁免在调用处控制）
+function FocusFeedback:_favorAll(delta)
+    local c = self:_readCollection()
+    local changed = false
+    for _, e in ipairs(c) do
+        if e.reveal_date then
+            local f = type(e.favor) == "number" and e.favor or 0
+            local nf = math.max(-100, math.min(100, math.floor(f + delta)))
+            if nf ~= f then e.favor = nf; changed = true end
+        end
+    end
+    if changed then self:_saveCollection(c) end
+end
+
 -- 全局锁：是否存在任一进行中的事件链（同一时刻全局只允许一本书在链内）
 function FocusFeedback:_chainActiveBook()
     for _, e in ipairs(self:_readCollection()) do
-        if e.chain and e.chain.id == "mokou" then return e end
+        if e.chain and (e.chain.id == "mokou" or e.chain.id == "misi") then return e end
     end
     return nil
 end
 
 -- 该书写入一条旅行日志
 function FocusFeedback:_logTravel(entry, text, mood, pts)
+    -- 再次体验引导：事件文案只用于回放展示，不回写真实旅行日志，也不带日期/奖励
+    if self:_mokouGuided(entry) then
+        self._guide_events = self._guide_events or {}
+        table.insert(self._guide_events, text or "")
+        return
+    end
     local c = self:_readCollection()
     for _, e in ipairs(c) do
         if e.index == entry.index then
@@ -8933,7 +9237,8 @@ function FocusFeedback:_logTravel(entry, text, mood, pts)
     self:_saveCollection(c)
 end
 
--- 选择弹窗（样式对齐 _showEventPopup：固定宽、禁滚动、左对齐正文；按钮点击后关闭并回调）
+-- 选择弹窗：选项文本直接写进正文并标 a/b/c/d，用户按对应大写 A/B/C/D 按键；
+-- 弹窗宽度固定、内容随文案自动换行、过长自动滚动，绝不撑破边框。按钮点击后关闭并回调
 function FocusFeedback:_showChainChoice(title, body, opts)
     -- 再次体验引导：不弹窗，自动取脚本里预设的选择序号
     if self._chain_script then
@@ -8944,9 +9249,18 @@ function FocusFeedback:_showChainChoice(title, body, opts)
         return
     end
     local dialog
+    -- 选项标号：正文与按键都用大写 A/B/C/D。
+    -- 去掉选项文本里自带的首字母标号（如 "A.xxx"），由这里统一补一个大写字母，避免重复显示成"A. A.xxx"
+    local letters = { "A", "B", "C", "D", "E", "F", "G" }
+    local full_body = body or ""
+    for i, o in ipairs(opts or {}) do
+        local L = letters[i] or ("#" .. i)
+        local t = (o.text or ""):gsub("^%s*[A-Za-z][%.、]%s?", "")
+        full_body = full_body .. "\n\n" .. L .. ". " .. t
+    end
     local btns = {}
     for i, o in ipairs(opts or {}) do
-        btns[i] = { text = o.text, callback = function()
+        btns[i] = { text = letters[i] or ("#" .. i), callback = function()
             if dialog then UIManager:close(dialog) end
             if self._rec_index then self:_mokouRecordChoice(self._rec_index, i) end
             if o.cb then o.cb() end
@@ -8958,7 +9272,7 @@ function FocusFeedback:_showChainChoice(title, body, opts)
     dialog = ButtonDialog:new{
         title = "", title_align = "center",
         width = Screen:scaleBySize(560),
-        scrollable_content = false,
+        scrollable_content = true,   -- 文案过长时内容滚动，不撑破弹窗
         buttons = { btns },
     }
     local border_w = Size.border.window
@@ -8972,7 +9286,7 @@ function FocusFeedback:_showChainChoice(title, body, opts)
         table.insert(parts, tw)
         table.insert(parts, VerticalSpan:new{ width = Size.padding.default * 0.5 })
     end
-    local bodyTW = TextBoxWidget:new{ text = body or "", face = Font:getFace("cfont", 20), width = avail_w }
+    local bodyTW = TextBoxWidget:new{ text = full_body or "", face = Font:getFace("cfont", 20), width = avail_w }
     bodyTW.not_focusable = true
     table.insert(parts, bodyTW)
     local vertical = VerticalGroup:new{ align = "left", unpack(parts) }
@@ -8999,9 +9313,10 @@ function FocusFeedback:_mokouReply(entry, text, on_done)
     if dialog then dialog.onClose = function() self._chain_popup_up = false end end
 end
 
--- 测试模式开关（连续快进·无奖励·不收藏）
+-- 测试模式已下线：正式版恒为 false（清除旧设置里残留的测试标记，即使设备上残留过 true 也不生效，
+-- 让正式游玩始终走真实规则：00:00 窗口、约10%概率、奖励/收藏正常）
 function FocusFeedback:_mokouTestActive()
-    return G_reader_settings:readSetting(settingKey("v18_mokou_test"), false) or false
+    return false
 end
 
 -- 是否为"再次体验"引导模式（自动按第一次的选择走、无任何奖励/好感/积分/收藏）
@@ -9085,20 +9400,7 @@ function FocusFeedback:_mokouTryStart(now)
     return entry
 end
 
--- 测试便捷入口：立即开始（无视0点/概率/已完成）
-function FocusFeedback:_mokouForceStart()
-    if self:_chainActiveBook() then
-        self:_showMessage("已有一本书正在进行模恐事件链，请先让它结束。", 4)
-        return
-    end
-    G_reader_settings:saveSetting(settingKey("v18_mokou_test"), true)
-    local started = self:_mokouTryStart(os.time())
-    if started then
-        self:_mokouExecStep("mokouStep1", started)
-    else
-        self:_showMessage("没有可用测试书（需已有翻开的成年书且辩证≥10）。", 4)
-    end
-end
+-- 测试便捷入口已随测试模式一并移除（正式版入口见 _mokouTryStart）
 
 -- 浅拷贝脚本/路径列表（条目为 {c=}/{r=} 的小表）
 function FocusFeedback:_cloneList(t)
@@ -9148,25 +9450,58 @@ function FocusFeedback:_mokouReplayFromSouvenir(key)
     self:_mokouPlayGuided(e)
 end
 
--- 引导重放主循环：以 next=0 在选中逻辑里连续推进全部步骤，直到链结算清除为止
+-- 再次体验：逐步推进故事，优先展示事件文案（无日期/奖励），用户点"继续"推进到下一步
 function FocusFeedback:_mokouPlayGuided(entry)
-    local guard = 0
-    while true do
-        guard = guard + 1
-        if guard > 60 then break end
-        local c = self:_readCollection()
-        local e
-        for _, it in ipairs(c) do if it.index == entry.index then e = it break end end
-        if not e or not e.chain or not self:_mokouGuided(e) then break end
-        local node_before = e.chain.node
-        self._chain_script = e.chain.script
-        self._rec_index = nil
-        pcall(function() self:_mokouStep(e, os.time()) end)
-        self._chain_script = nil
-        local c2 = self:_readCollection()
-        local e2
-        for _, it in ipairs(c2) do if it.index == entry.index then e2 = it break end end
-        if e2 and e2.chain and e2.chain.node == node_before then break end
+    self._guide_events = {}
+    self:_mokouGuideAdvance(entry.index)
+end
+
+function FocusFeedback:_mokouFindBook(index)
+    if not index then return nil end
+    local c = self:_readCollection()
+    for _, it in ipairs(c) do if it.index == index then return it end end
+    return nil
+end
+
+-- 推进一个节点：执行一步，收集该步产生的事件文案；若该步无事件则继续推进下一节点
+function FocusFeedback:_mokouGuideAdvance(index)
+    local e = self:_mokouFindBook(index)
+    if not e or not e.chain or not self:_mokouGuided(e) then
+        self._guide_events = nil
+        self:_showMessage("（再次体验结束）", 2)
+        return
+    end
+    self._chain_script = e.chain.script
+    self._rec_index = nil
+    local ok, err = pcall(function() self:_mokouStep(e, os.time()) end)
+    if not ok then logger.warn("mokou guide advance error:", err) end
+    local evs = self._guide_events or {}
+    self._guide_events = {}
+    if #evs > 0 then
+        self:_mokouGuideShowEvents(index, evs, 1)
+    else
+        self:_mokouGuideAdvance(index)
+    end
+end
+
+-- 逐个展示本节点的事件文案；点"继续"展示下一条，展示完则推进下一节点
+function FocusFeedback:_mokouGuideShowEvents(index, list, k)
+    if k > #list then
+        self:_mokouGuideAdvance(index)
+        return
+    end
+    local dialog = self:_showEventPopup("旅行的书 · 再次体验", list[k] or "", nil, {
+        { text = "继续", callback = function()
+            self._chain_popup_up = false
+        end }
+    })
+    if dialog then
+        local prev = dialog.onClose
+        dialog.onClose = function()
+            self._chain_popup_up = false
+            if prev then prev() end
+            UIManager:nextTick(function() self:_mokouGuideShowEvents(index, list, k + 1) end)
+        end
     end
 end
 
@@ -9199,6 +9534,21 @@ end
 
 -- 纪念品展示名/介绍（接 _getItemDisplayName / _getItemIntro）
 function FocusFeedback:_mokouSouvenirDef(key)
+    -- 迷思链纪念品（复用同一展示函数，按 key 前缀分流）
+    if key and key:match("^souvenir_misi_") then
+        local eid = key:gsub("^souvenir_misi_", "")
+        local names = { wo_nest="窝里横", overconfident="自不量力", sacred_scholar="神圣的学者",
+            starve_fantasy="饿死前的幻想", knowledge_power="知识就是力量", gaokao_card="高三生体验卡",
+            glutton="小馋书！", crow_virtue="乌鸦的美德", knowledge_glory="知识的光辉",
+            asylum="森林尽头的疯人院", skeptic="怀疑主义者" }
+        local name = "迷思：" .. (names[eid] or eid)
+        local nick = "它"
+        local list = G_reader_settings:readSetting(settingKey("v9_misi_souvenirs"), {}) or {}
+        for _, rec in ipairs(list) do
+            if rec.key == key and rec.nick then nick = rec.nick break end
+        end
+        return { name = name, intro = "来自" .. nick .. "。一段深刻的迷思。" }
+    end
     if not key or not key:match("^souvenir_mokou_") then return nil end
     local ending_id = key:gsub("^souvenir_mokou_", "")
     local names = { school_gold = "优绩主义你赢了", home = "回家", zzz = "zzzzzz", cat_guilt = "猫之愧疚", silent = "缄默之口", neat = "洁癖之书", cold = "书的冷漠", bad = "坏结局", frank = "弗兰肯斯坦的命运" }
@@ -9711,12 +10061,313 @@ function FocusFeedback:_mokouStep1(entry)
     })
 end
 
+-- ========== V19 成长型事件链：迷思 ==========
+-- 数据驱动的多分支链。节点 kind：
+--   choice = 弹窗选择（prompt+opts），opts.flv = 能往下走+1 / 走到结局-1；
+--   text   = 事件日志（text/log 心情/属性），有 end 则为结局节点。
+-- delay = 进入该节点后需等待的秒数（再下一轮轮询触发）；延迟由节点自身携带。
+local MISI_END = {
+  wo_nest = "窝里横", overconfident = "自不量力", sacred_scholar = "神圣的学者",
+  starve_fantasy = "饿死前的幻想", knowledge_power = "知识就是力量", gaokao_card = "高三生体验卡",
+  glutton = "小馋书！", crow_virtue = "乌鸦的美德", knowledge_glory = "知识的光辉",
+  asylum = "森林尽头的疯人院", skeptic = "怀疑主义者",
+}
+local MISI_NODES = {
+  cliff = { kind="choice", prompt="xx和猫一起滚落到了悬崖下面，你觉得悬崖之下是？",
+    opts={ {t="A.是它们的家", flv=-1, n="home"},
+           {t="B.是一处森林", flv=1,  n="forest"},
+           {t="C.是一所宫殿", flv=-1, n="palace1"} } },
+  home = { kind="text", delay=3600, mood=5,
+    text="xx和猫滚落悬崖，发现下面还真是它们的家！xx和猫开心地回家了。心情+5%。", eid="wo_nest" },
+  forest = { kind="text", delay=3600,
+    text="xx和猫来到一处森林里，这里到处是凶恶的野兽和歹毒的花草，xx和猫很害怕。", n="cabin_choice" },
+  cabin_choice = { kind="choice", delay=86400,
+    prompt="xx带着猫穿行在恐怖森林里，这时，它们发现了一个小木屋，你决定让它们：",
+    opts={ {t="A.进去打劫。", flv=-1, n="rob"},
+           {t="B.礼貌地敲敲门。", flv=1, n="knock"},
+           {t="C.说不定是陷阱，快离开。", flv=1, n="leave"} } },
+  rob = { kind="text", delay=3600,
+    text="xx和猫决定去神秘小木屋里打劫，没想到它们忘了自己只是两个手无缚鸡之力的小东西，被木屋的主人扔了出去。", eid="overconfident" },
+  knock = { kind="text", delay=3600,
+    text="xx和猫有礼貌地敲了敲门，没想到根本没有人理它们。但是它们还是坚持不懈地敲击了一个小时，仿佛有个架子鼓手梦。最终，似乎是它们的诚意感动了木屋的主人，木屋的门打开了，一只巨型乌鸦居高临下地站在门内。", n="gift_choice" },
+  gift_choice = { kind="choice", delay=86400,
+    prompt="乌鸦看着门口可怜的一书一猫，决定送xx一个礼物，请你替xx在三样礼物中选择一样。",
+    opts={ {t="A.一个卷轴", flv=-1, n="scroll"},
+           {t="B.一瓶诡异药水", flv=1, n="potion"},
+           {t="C.一顿美食", flv=1, n="food"} } },
+  scroll = { kind="text", delay=3600,
+    text="xx和猫拿着乌鸦赠送的卷轴研究了起来，半小时后，还没研究出结果，它俩就饿死了……", eid="sacred_scholar" },
+  potion = { kind="text", delay=3600,
+    text="xx和猫拿着乌鸦赠送的药水研究了起来，半小时后，还没研究出结果，它俩已经快要饿死了。情急之下，xx决定喝一口神秘药水。", n="potion_choice" },
+  potion_choice = { kind="choice", delay=86400,
+    prompt="xx濒临饿死时，喝了一口神秘药水，你觉得它会：",
+    opts={ {t="A.变成猫", flv=-1, n="starve"},
+           {t="B.回到选择的那一刻", flv=1, n="gift_choice"} } },
+  starve = { kind="text", eid="starve_fantasy" },
+  food = { kind="text", delay=3600,
+    text="xx和猫选择了一顿美食，乌鸦觉得它们很务实，欣赏地将它们引进屋内。一顿美餐过后，乌鸦告诉xx，自己是森林里最聪明的生物，要求xx和它比拼智力。乌鸦给xx出了一道题目……", n="quiz_choice" },
+  quiz_choice = { kind="choice", delay=86400,
+    prompt="乌鸦给xx出了一道题目：小团团是什么颜色的？请你替xx作答。",
+    opts={ {t="A.黑色", flv=-1, n="quiz_wrongA"},
+           {t="B.白色", flv=-1, n="quiz_wrongB"},
+           {t="C.黑白色", flv=-1, n="quiz_wrongC"},
+           {t="D.不知道", flv=1, n="quiz_d"} } },
+  quiz_wrongA = { kind="text", delay=3600, text="xx回答错误，惨遭乌鸦杀害。", eid="sacred_scholar" },
+  quiz_wrongB = { kind="text", delay=3600, text="xx回答错误，惨遭乌鸦杀害。", eid="sacred_scholar" },
+  quiz_wrongC = { kind="text", delay=3600, text="xx回答正确，惨遭乌鸦杀害。", eid="sacred_scholar" },
+  quiz_d = { kind="text", delay=3600, attrs={知识=5},
+    text="听完xx的作答，乌鸦爽朗一笑，哈哈，小团团是我的猫，你又没见过，怎么会知道它是什么颜色呢？为了奖励你的诚实，我会将毕生知识传递于你。属性知识+5。", n="step_choice" },
+  step_choice = { kind="choice", delay=86400,
+    prompt="xx得到了乌鸦的知识，感觉自己现在超级聪明，轻松地带着猫走出了森林。请为xx决定它的下一步行动：",
+    opts={ {t="A.知识就是力量，去工地搬砖补贴家用", flv=-1, n="brick"},
+           {t="B.知识就是力量，去当地下拳手赚大钱", flv=-1, n="boxer"},
+           {t="C.知识就是知识，去学校当老师", flv=1, n="teacher"} } },
+  brick = { kind="text", delay=3*86400, text="xx在工地干了几天，结果被砖头砸伤脚趾，只能回家修养。", eid="knowledge_power" },
+  boxer = { kind="text", delay=3*86400, text="你这个狠心的主人，居然让一本书去打拳击，太可怕了。xx在拳击台上被打成了重伤。", eid="knowledge_power" },
+  teacher = { kind="text", delay=10*86400,
+    text="xx找了个高中学校干了一段时间，学生们都很喜欢xx，成绩突飞猛进。哎！也许这就是书之魅力吧。", n="transfer_choice" },
+  transfer_choice = { kind="choice", delay=86400,
+    prompt="xx在高中里当了一名老师，这时学校决定把它调走，你会建议它调到：",
+    opts={ {t="A.高三班主任", flv=-1, n="gaokao"},
+           {t="B.食堂炒菜", flv=1, n="kitchen"} } },
+  gaokao = { kind="text", delay=5*86400, text="xx在高三当了几天班主任，然后因为太累猝死了。", eid="gaokao_card" },
+  kitchen = { kind="text", delay=5*86400,
+    text="xx在学校食堂里悠闲地炒起了菜，但是它的厨艺太烂了，居然意外毒死了一个学生。", n="kidnap_choice" },
+  kidnap_choice = { kind="choice", delay=86400,
+    prompt="xx摊上事了！它毒死了一个学生，成为了世界通缉犯。你会选择让它躲到：",
+    opts={ {t="A.乌鸦的木屋", flv=1, n="crowhouse"},
+           {t="B.之前没去的宫殿", flv=-1, n="palace2"} } },
+  crowhouse = { kind="text", delay=3*86400,
+    text="乌鸦看见xx又回到了此处，本来很开心，一听它的遭遇，开始生气。乌鸦恨铁不成钢地说：你你你有了那么多知识，居然去当高中老师！哪怕你去当大学老师呢？！", n="professor_choice" },
+  professor_choice = { kind="choice", delay=3600,
+    prompt="乌鸦让xx去当一个大学老师，xx的选择是：",
+    opts={ {t="A.欧坤呀", flv=-1, n="tsinghua"},
+           {t="B.补药……", flv=-1, n="cooked"} } },
+  tsinghua = { kind="text", delay=5*86400, attrs={知识=5,阅历=5},
+    text="xx听从了乌鸦的建议，来到清华大学成为了一名教授。很快，它利用自己的知识，在科研方面做出了巨大贡献。知识+5。阅历+5。", eid="knowledge_glory" },
+  cooked = { kind="text", delay=3*3600,
+    text="xx没有听乌鸦的建议，它忘记了这个乌鸦多么邪恶，恼羞成怒的乌鸦把xx给煮了吃掉。", eid="crow_virtue" },
+  palace2 = { kind="text", delay=3*86400, mood=10,
+    text="xx这次走进了一个宫殿，看见里面有许许多多美味的食物，在家里只能吃棉花糖和饼干的xx一下就受不了了！开始胡吃海塞。心情+10%。", eid="glutton" },
+  leave = { kind="text", delay=3600, text="xx和猫非常警惕，离开了这座木屋。", n="mushroom_choice" },
+  mushroom_choice = { kind="choice", delay=86400,
+    prompt="xx和猫离开木屋后，在森林里发现了一颗蘑菇。蘑菇色泽鲜艳，看起来很好吃，而此时的xx和猫都已经饿坏了。你会建议它们？",
+    opts={ {t="A.赶紧吃掉，别饿死了。", flv=-1, n="mush_eat"},
+           {t="B.感觉有毒，不能吃。", flv=-1, n="mush_no"},
+           {t="C.拿着蘑菇去敲木屋的门。", flv=1, n="knock"} } },
+  mush_eat = { kind="text", delay=3600,
+    text="xx和猫一起吃掉了蘑菇，饱腹感得到了缓解、不对，是饥饿感得到了满足……什么我在说什么……kqkaojejwqknbe！”！hsbjwka~n（jsiowiajkala；，jjdnskaj", eid="asylum" },
+  mush_no = { kind="text", delay=3600,
+    text="xx对猫说，这个蘑菇肯定有毒，别吃！此后，每当它们遇见蘑菇时，都对彼此这么说。十天以后，它俩饿死在了森林里。", eid="skeptic" },
+  palace1 = { kind="text", delay=3600, mood=10,
+    text="xx和猫进入悬崖下的宫殿，看见里面有许许多多美味的食物，在家里只能吃棉花糖和饼干的xx一下就受不了了！带着小猫开始胡吃海塞。心情+10%。", eid="glutton" },
+}
+
+-- 在收集中注入一条迷思链（坠崖门槛触发时）。emporio 用内存中的 c 判断全局单链锁。
+function FocusFeedback:_misiTryStart(c, e, now)
+    if e.chain_done_misi then return false end
+    for _, it in ipairs(c) do
+        if it.chain then return false end   -- 全局单链锁：已有模恐/迷思进行中
+    end
+    e.chain = { id = "misi", node = "cliff", started = now or os.time(), next = now or os.time(), window = false, path = {} }
+    return true
+end
+
+-- 迷思结局结算：记完成标记 → 纪念品入库 → 清进行中链。无最终事件文案（正文已在 text 节点写过）
+function FocusFeedback:_misiSettle(entry, ending_id)
+    local test = self:_mokouSkipping(entry)
+    local c = self:_readCollection()
+    local e
+    for _, it in ipairs(c) do if it.index == entry.index then e = it break end end
+    if not e then return end
+    local play_path = e.chain and e.chain.play or {}
+    if not test then e.chain_done_misi = true end
+    e.chain = nil
+    self:_saveCollection(c)
+    if test then return nil end
+    local key = "souvenir_misi_" .. ending_id
+    local inv = self:_readInventory()
+    inv[key] = (inv[key] or 0) + 1
+    self:_saveInventory(inv)
+    local list = G_reader_settings:readSetting(settingKey("v9_misi_souvenirs"), {}) or {}
+    table.insert(list, { key = key, index = entry.index, ending = ending_id, nick = entry.nickname,
+        at = os.time(), path = self:_cloneList(play_path), variant = nil })
+    G_reader_settings:saveSetting(settingKey("v9_misi_souvenirs"), list)
+    return key
+end
+
+-- 简单确认弹窗（其后执行 on_done；再次体验引导下自动续接）
+function FocusFeedback:_misiReply(entry, text, on_done)
+    if self:_mokouGuided(entry) then
+        self._chain_popup_up = false
+        if on_done then on_done() end
+        return
+    end
+    local dialog = self:_showEventPopup("迷思", text or "", nil, {
+        { text = "确定", callback = function()
+            self._chain_popup_up = false
+            if on_done then on_done() end
+        end }
+    })
+    if dialog then dialog.onClose = function() self._chain_popup_up = false end end
+end
+
+-- 文案里的 "xx" 替换为书的昵称
+function FocusFeedback:_misiText(entry, s)
+    if not s or s == "" then return "" end
+    return s:gsub("xx", self:_nick(entry))
+end
+
+-- 执行一个 text 节点：写事件 → 结算奖励 →（结局结算）或（推进下一节点）
+function FocusFeedback:_misiExecText(entry, nd)
+    local txt = (nd.text and nd.text ~= "") and self:_misiText(entry, nd.text) or nil
+    if txt then self:_logTravel(entry, txt) end
+    if (nd.mood or 0) ~= 0 or (nd.pts or 0) ~= 0 or (nd.attrs and next(nd.attrs)) then
+        self:_applyMokouRewards(entry, nd.mood, nd.pts, nd.attrs)
+    end
+    if nd.eid then
+        local ending_name = MISI_END[nd.eid] or nd.eid
+        self:_misiSettle(entry, nd.eid)
+        self:_misiReply(entry, self:_nick(entry) .. "……（结局：" .. ending_name .. "）")
+    elseif nd.n then
+        local nnd = MISI_NODES[nd.n]
+        self:_mokouSetNode(entry, nd.n, (nnd and nnd.delay) or 0, false)
+    end
+end
+
+-- 展示一个 choice 节点（选项大写；正式游玩记录选择/好感，再次体验按脚本自动走）
+function FocusFeedback:_misiShowChoice(entry, nd)
+    if self:_mokouGuided(entry) then
+        self._chain_script = entry.chain and entry.chain.script
+        self._rec_index = nil
+    else
+        self._chain_script = nil
+        self._rec_index = entry.index
+    end
+    local opts = {}
+    for i, o in ipairs(nd.opts) do
+        opts[i] = { text = o.t, cb = function()
+            self._chain_popup_up = false
+            if o.flv and o.flv ~= 0 then self:_addFavor(entry, o.flv) end
+            local nnd = MISI_NODES[o.n]
+            self:_mokouSetNode(entry, o.n, (nnd and nnd.delay) or 0, false)
+        end }
+    end
+    self:_showChainChoice("迷思", self:_misiText(entry, nd.prompt), opts)
+end
+
+-- 迷思步进：驱动当前节点。choice 用 _open 标记防止重复；text 到点即执行
+function FocusFeedback:_misiStep(entry, now)
+    local ch = entry.chain
+    if not ch then return end
+    local node = ch.node
+    local base = node:gsub("_open$", "")
+    local nd = MISI_NODES[base]
+    if not nd then return end
+    if not self:_mokouGuided(entry) and (now or os.time()) < (ch.next or 0) then return end
+    if node:find("_open$") then
+        -- 选择弹窗被点掉后兜底重弹，避免永久卡死
+        if nd.kind == "choice" and not self._chain_popup_up then
+            self._chain_popup_up = true
+            self:_misiShowChoice(entry, nd)
+        end
+        return
+    end
+    if nd.kind == "text" then
+        self:_misiExecText(entry, nd)
+    else
+        -- 首次进入选择节点：先记一行剧情事件，再展示选项
+        self:_logTravel(entry, self:_misiText(entry, nd.prompt))
+        self:_mokouSetNode(entry, base .. "_open", 0, false)
+        self._chain_popup_up = true
+        self:_misiShowChoice(entry, nd)
+    end
+end
+
+-- 从纪念品"再次体验"开始引导重放：按第一次的选择走，不做新选择，无任何奖励
+function FocusFeedback:_misiReplayFromSouvenir(key)
+    local list = G_reader_settings:readSetting(settingKey("v9_misi_souvenirs"), {}) or {}
+    local rec
+    for _, r in ipairs(list) do
+        if r.key == key then rec = r break end
+    end
+    if not rec or not rec.path then
+        self:_showMessage("该纪念品没有可重放的故事路径。", 4)
+        return
+    end
+    if self:_chainActiveBook() then
+        self:_showMessage("已有一本书正在进行事件链，请先让它结束。", 4)
+        return
+    end
+    local c = self:_readCollection()
+    local e
+    for _, it in ipairs(c) do
+        if it.index == rec.index and it.reveal_date then e = it break end
+    end
+    if not e then
+        self:_showMessage("当初经历这本书的书已不在收藏里，无法再次体验。", 4)
+        return
+    end
+    e.chain = { id = "misi", node = "cliff", started = os.time(), next = 0, window = true,
+                guide = true, path = {}, script = self:_cloneList(rec.path) }
+    self:_saveCollection(c)
+    self:_misiPlayGuided(e)
+end
+
+function FocusFeedback:_misiPlayGuided(entry)
+    self._guide_events = {}
+    self:_misiGuideAdvance(entry.index)
+end
+
+function FocusFeedback:_misiGuideAdvance(index)
+    local e = self:_mokouFindBook(index)
+    if not e or not e.chain or not self:_mokouGuided(e) then
+        self._guide_events = nil
+        self:_showMessage("（再次体验结束）", 2)
+        return
+    end
+    self._chain_script = e.chain.script
+    local ok, err = pcall(function() self:_misiStep(e, os.time()) end)
+    if not ok then logger.warn("misi guide advance error:", err) end
+    local evs = self._guide_events or {}
+    self._guide_events = {}
+    if #evs > 0 then
+        self:_misiGuideShowEvents(index, evs, 1)
+    else
+        self:_misiGuideAdvance(index)
+    end
+end
+
+function FocusFeedback:_misiGuideShowEvents(index, list, k)
+    if k > #list then
+        self:_misiGuideAdvance(index)
+        return
+    end
+    local dialog = self:_showEventPopup("旅行的书 · 再次体验", list[k] or "", nil, {
+        { text = "继续", callback = function()
+            self._chain_popup_up = false
+        end }
+    })
+    if dialog then
+        local prev = dialog.onClose
+        dialog.onClose = function()
+            self._chain_popup_up = false
+            if prev then prev() end
+            UIManager:nextTick(function() self:_misiGuideShowEvents(index, list, k + 1) end)
+        end
+    end
+end
+
 -- V18 周期入口：推进进行中链 + 触发入口专判
 function FocusFeedback:_chainCheck()
     local now = os.time()
     local active = self:_chainActiveBook()
     if active then
-        pcall(function() self:_mokouStep(active, now) end)
+        if active.chain.id == "mokou" then
+            pcall(function() self:_mokouStep(active, now) end)
+        else
+            pcall(function() self:_misiStep(active, now) end)
+        end
         return
     end
     local started = self:_mokouTryStart(now)
@@ -9747,8 +10398,9 @@ function FocusFeedback:_genInboxLetter(entry, offline_sec, now, banned)
     ctx.first_online_late = ctx.hour >= 11
     ctx.finished_recent = false
 
-    -- 事件数量：约1条/小时，至少1条（离线稀疏错落；池不足时自动变少）
-    local keep = math.max(1, math.floor(offline_sec / 3600))
+    -- 事件数量：约1条/1.5-2h，至少1条（离线稀疏错落；池不足时自动变少）
+    local interval = math.random(5400, 7200)   -- 旅行的书：1.5h~2h一条
+    local keep = math.max(1, math.floor(offline_sec / interval))
     if keep > INBOX_MAX_EVENTS then keep = INBOX_MAX_EVENTS end   -- 防一次性爆量
 
     -- 冷却过滤：进食组3h / 电影组2天 距上次触发
@@ -9760,7 +10412,8 @@ function FocusFeedback:_genInboxLetter(entry, offline_sec, now, banned)
         if cand.cdgrp == "EAT" and (cd.eat and now - cd.eat < INBOX_COOLDOWN_EAT_SEC) then ok = false end
         if cand.cdgrp == "MOVIE" and (cd.mov and now - cd.mov < INBOX_COOLDOWN_MOVIE_SEC) then ok = false end
         if cand.cdgrp == "SLEEP" and (cd.slp and now - cd.slp < INBOX_COOLDOWN_SLEEP_SEC) then ok = false end
-        if cand.chain_entry then ok = false end   -- 成长型事件链入口：由 _mokouTryStart 专判，不走普通动态池
+        if cand.chain_entry == "mokou" then ok = false end   -- 模恐入口由 _mokouTryStart 专判，不走普通动态池
+        if cand.chain_entry == "misi" and entry.chain_done_misi then ok = false end  -- 迷思已完结的书不再刷出坠崖入口（每书仅作入口一次）
         if ok then table.insert(pool, cand) end
     end
 
@@ -9900,6 +10553,10 @@ function FocusFeedback:_showInboxLetters()
                             item = ev.item,
                             key = ev.flatid or ev.text,   -- 去重键：事件id；无id时用文案
                         })
+                        -- 迷思门槛：坠崖事件触发时，若该书未完结且全局无进行中链，则启动迷思链
+                        if ev.cand and ev.cand.chain_entry == "misi" then
+                            self:_misiTryStart(c, e, now)
+                        end
                     end
                     table.sort(tlog, function(a, b) return (a.ts or 0) < (b.ts or 0) end)
                     e.travel_log = tlog
@@ -9916,12 +10573,12 @@ function FocusFeedback:_showInboxLetters()
     if changed then self:_saveCollection(c) end
 end
 
--- 旅行日志清理：每次最多删一条"最早且超过24h"的旧记录（渐进式，不一下子清空）
+-- 旅行日志清理：每次最多删一条"最早且超过72h"的旧记录（渐进式，不一下子清空）
 function FocusFeedback:_travelCleanup(e, max)
     local tlog = e.travel_log
     if not tlog or #tlog == 0 then return false end
     local now = os.time()
-    local cutoff = now - 24 * 3600
+    local cutoff = now - 72 * 3600   -- 保留最近72h（3天）的旅行日志
     max = max or 1
     local removed = false
     for _ = 1, max do
@@ -9994,6 +10651,28 @@ function FocusFeedback:_showTravelBookList()
     UIManager:show(menu)
 end
 
+-- 快捷手势直达：直接打开第一本有旅行的养成书弹窗，并接上/下一本导航（无需先过书单）
+function FocusFeedback:_showTravelFlow()
+    local c = self:_readCollection()
+    local entries = {}
+    local any_adult = false
+    for _, e in ipairs(c) do
+        if e.reveal_date then
+            any_adult = true
+            if e.travel_log and #e.travel_log > 0 then table.insert(entries, e) end
+        end
+    end
+    if #entries == 0 then
+        if any_adult then
+            self:_showMessage("这本书还没有旅行日记。\n离线一段时间或阅读中，会有动态悄悄记录下来。", 5)
+        else
+            self:_showMessage("还没有成年的书。", 5)
+        end
+        return
+    end
+    self:_showTravelLogDialog(entries[1], 1, { list = entries, idx = 1 })
+end
+
 -- 中英混排断行：按可见宽度大致 n 个半角宽度一行
 function FocusFeedback:_travelWrap(s, n)
     s = tostring(s or "")
@@ -10018,7 +10697,8 @@ function FocusFeedback:_travelWrap(s, n)
 end
 
 -- 旅行的书：单本动态日志的大弹窗（分页查看；右下角落款日期；底部 查看档案/确定）
-function FocusFeedback:_showTravelLogDialog(e, page)
+-- flow 提供时（快捷手势直达）追加一行的上/下一本书导航
+function FocusFeedback:_showTravelLogDialog(e, page, flow)
     local tlog = e.travel_log or {}
     table.sort(tlog, function(a, b) return (a.ts or 0) < (b.ts or 0) end)
     if #tlog == 0 then
@@ -10041,20 +10721,36 @@ function FocusFeedback:_showTravelLogDialog(e, page)
     for i = 1, math.floor(#lines / 2) do
         lines[i], lines[#lines - i + 1] = lines[#lines - i + 1], lines[i]
     end
-    local per_page = 8   -- 字号加大后减少每页行数，防止撑破弹窗
-    local pages = math.max(1, math.ceil(#lines / per_page))
-    if page < 1 then page = 1 elseif page > pages then page = pages end
-    local pageLines = {}
-    for i = (page - 1) * per_page + 1, math.min(page * per_page, #lines) do
-        table.insert(pageLines, lines[i])
-    end
-    -- 弹窗宽度：以实际屏宽收窄并左右留白，保证窗口边框看得见、文字与边缘有舒适边距
     local margin_x = Screen:scaleBySize(36)   -- 左右外侧留白
     local dlg_w = math.min(Screen:scaleBySize(600), Screen:getWidth() - 2 * margin_x)
     if dlg_w < Screen:scaleBySize(200) then dlg_w = Screen:scaleBySize(200) end
     local body_w = dlg_w - 2 * (Size.border.window + Size.padding.default) - 2 * Size.padding.default
-    -- 正文：直接参照渲染舒服的常规弹窗，用 TextBoxWidget 按可用宽度可靠地自动软换行（能正确解析中文标点与 \n）
+    -- 按实际渲染高度分页：每条动态软换行后可能占多行，用测量高度累加，
+    -- 超过单页上限即翻下一页，保证长文案（如事件链大段结局）不会撑破弹窗
     local BODY_FACE = Font:getFace("cfont", 20)   -- 旅行动态使用比常规弹窗大一号的字号
+    local GAP = Size.padding.small
+    local max_h = math.floor(Screen:getHeight() * 0.62)   -- 给标题、两行按钮、边框、落款留足空间
+    local pageIndexes = {}
+    local bucket = {}
+    local acc = 0
+    for li, line in ipairs(lines) do
+        local liner = TextBoxWidget:new{ text = line, face = BODY_FACE, width = body_w }
+        local h = math.max(1, liner:getHeight())
+        if #bucket > 0 and acc + h > max_h then
+            table.insert(pageIndexes, bucket)
+            bucket = {}
+            acc = 0
+        end
+        table.insert(bucket, li)
+        acc = acc + h + GAP
+    end
+    if #bucket > 0 then table.insert(pageIndexes, bucket) end
+    local pages = math.max(1, #pageIndexes)
+    if page < 1 then page = 1 elseif page > pages then page = pages end
+    local pageLines = {}
+    local cur_ids = pageIndexes[page] or pageIndexes[1] or {}
+    for _, li in ipairs(cur_ids) do table.insert(pageLines, lines[li]) end
+    -- 正文：用 TextBoxWidget 按可用宽度可靠地自动软换行（能正确解析中文标点与 \n）
     local body_text = table.concat(pageLines, "\n")
     if body_text == "" then body_text = "（无内容）" end
     local bodyTW = TextBoxWidget:new{
@@ -10069,17 +10765,43 @@ function FocusFeedback:_showTravelLogDialog(e, page)
     local buttons = {}
     local navrow = {}
     if page > 1 then
-        table.insert(navrow, { text = "◀ 上一页", callback = function() self:_reopenTravel(e, page - 1) end })
+        table.insert(navrow, { text = "◀ 上一页", callback = function() self:_reopenTravel(e, page - 1, flow) end })
     else
         table.insert(navrow, { text = "上一页", enabled = false })
     end
     table.insert(navrow, { text = string.format("%d / %d", page, pages), enabled = false })
     if page < pages then
-        table.insert(navrow, { text = "下一页 ▶", callback = function() self:_reopenTravel(e, page + 1) end })
+        table.insert(navrow, { text = "下一页 ▶", callback = function() self:_reopenTravel(e, page + 1, flow) end })
     else
         table.insert(navrow, { text = "下一页", enabled = false })
     end
     table.insert(buttons, navrow)
+    -- 快捷手势直达：追加一行的 上一本书/下一本书 导航
+    if flow and flow.list and #flow.list > 1 then
+        local idx = flow.idx or 1
+        local n = #flow.list
+        local bookrow = {}
+        if idx > 1 then
+            table.insert(bookrow, { text = "◀ 上一本书", callback = function()
+                if self._travel_dlg then UIManager:close(self._travel_dlg) end
+                self._travel_dlg = nil
+                self:_showTravelLogDialog(flow.list[idx - 1], 1, { list = flow.list, idx = idx - 1 })
+            end })
+        else
+            table.insert(bookrow, { text = "上一本书", enabled = false })
+        end
+        table.insert(bookrow, { text = string.format("%d / %d 本", idx, n), enabled = false })
+        if idx < n then
+            table.insert(bookrow, { text = "下一本书 ▶", callback = function()
+                if self._travel_dlg then UIManager:close(self._travel_dlg) end
+                self._travel_dlg = nil
+                self:_showTravelLogDialog(flow.list[idx + 1], 1, { list = flow.list, idx = idx + 1 })
+            end })
+        else
+            table.insert(bookrow, { text = "下一本书", enabled = false })
+        end
+        table.insert(buttons, bookrow)
+    end
     table.insert(buttons, {
         { text = "查看档案", callback = function() self:_showBookInfo(e) end },
         { text = "确定", callback = function() if self._travel_dlg then UIManager:close(self._travel_dlg) end self._travel_dlg = nil end },
@@ -10115,10 +10837,10 @@ function FocusFeedback:_showTravelLogDialog(e, page)
     UIManager:show(dialog)
 end
 
-function FocusFeedback:_reopenTravel(e, page)
+function FocusFeedback:_reopenTravel(e, page, flow)
     if self._travel_dlg then UIManager:close(self._travel_dlg) end
     self._travel_dlg = nil
-    self:_showTravelLogDialog(e, page)
+    self:_showTravelLogDialog(e, page, flow)
 end
 
 -- 在线阅读时也随机补记录动态（30~90分钟一条，写给当前翻开的书）
@@ -10146,7 +10868,7 @@ function FocusFeedback:_travelInlineCheck()
                     })
                     e.travel_log = tlog
                     self:_recordInboxCd(e, letter, now)   -- 同步冷却，进食/电影/睡觉不能再短时反复
-                    e.travel_inline = now + math.random(2400, 5400)  -- 40~90分钟后再记录一条
+                    e.travel_inline = now + math.random(5400, 7200)  -- 1.5~2小时后再记录一条
                     changed = true
                     if self:_travelCleanup(e, 1) then changed = true end
                 end
