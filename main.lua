@@ -227,19 +227,19 @@ local MOOD_IMMUNE_DURATION = 72 * 3600      -- 72小时心情下限90%
 -- ========== V15 书之属性系统 ==========
 local ATTR_KEYS = {"知识", "审美", "情感", "阅历", "逻辑", "辩证"}
 local BOOK_CATEGORIES = {"文学", "类型小说", "历史", "哲学", "社会科学", "自然科学", "实用技术", "艺术"}
--- 书籍分类 -> 阅读时影响的属性
+-- 书籍分类 -> 阅读时影响的属性（每个分类只加唯一属性，纳入零和/最大化可成长之一端）
 local CATEGORY_ATTRS = {
-    ["文学"]     = {"情感", "审美"},
-    ["类型小说"] = {"情感"},
-    ["历史"]     = {"知识", "阅历"},
-    ["哲学"]     = {"逻辑", "辩证"},
-    ["社会科学"] = {"知识", "辩证"},
-    ["自然科学"] = {"阅历", "逻辑"},
+    ["文学"]     = {"情感"},
+    ["类型小说"] = {"阅历"},
+    ["历史"]     = {"辩证"},
+    ["哲学"]     = {"逻辑"},
+    ["社会科学"] = {"知识"},
+    ["自然科学"] = {"辩证"},
     ["实用技术"] = {"知识"},
-    ["艺术"]     = {"审美", "知识"},
+    ["艺术"]     = {"审美"},
 }
 local ATTR_WEIGHT_STRENGTH = 2      -- 画像加权强度：weight = 1 + 2*sim（温和梯度，不压倒性）
-local ATTR_READ_GAIN_PER_H = 1      -- 阅读1h +1%
+local ATTR_READ_GAIN_PER_H = 0.5    -- 阅读1h +0.5%（V19: 由1减半）
 local ATTR_EVENT_GAIN = 0.4         -- 普通事件 +0.4%
 local ATTR_SPECIAL_GAIN = 1         -- 特殊事件 +1%
 local ATTR_BOOKMARK_GAIN = 0.1      -- 书签掉落 +0.1%
@@ -1522,6 +1522,19 @@ end
 
 -- ========== V15 书之属性系统 ==========
 
+-- V19: 相对属性轴（此消彼长的零和配对）。每对轴总量上限 100，三对共 300。
+-- 越靠左的端越偏感性/直觉，越靠右的端越偏理性/分析。
+local ATTR_OPP = {
+    ["情感"] = "逻辑", ["逻辑"] = "情感",
+    ["审美"] = "知识", ["知识"] = "审美",
+    ["阅历"] = "辩证", ["辩证"] = "阅历",
+}
+local ATTR_AXIS_CAP = 100   -- 单一轴两端合计上限
+
+-- V20: 雷达图顶点顺序。此顺序使相对属性对（审美-知识 / 情感-逻辑 / 阅历-辩证）
+-- 落在六边形的对边顶点（相差 180°），呈对称对望。
+local RADAR_AXES = {"审美", "知识", "情感", "逻辑", "阅历", "辩证"}
+
 -- 读取当前领养期的六维属性（nil 表示尚未初始化）
 function FocusFeedback:_readAttributes()
     return G_reader_settings:readSetting(settingKey("v15_attributes"), nil)
@@ -1547,6 +1560,45 @@ function FocusFeedback:_addAttribute(attr, value)
     local attrs = self:_initAttributes()
     attrs[attr] = math.min(100, math.max(0, (attrs[attr] or 0) + value))
     self:_saveAttributes(attrs)
+end
+
+-- V19: 零和增长。把 attr 增加 gain，遵循"此消彼长"：
+--   1) 若 attr 已满 100，读同类书 → 不加不减（保持 100）
+--   2) 若 attr 所在轴另一方(ATTR_OPP)已满 100，则把满的一端对称滑落，
+--      使轴两端合计不超过 ATTR_AXIS_CAP(100)，满出的量挪给本端。
+-- attrs 可为全局领养期属性(v15_attributes)，或某成年书的 entry.attributes。
+function FocusFeedback:_zeroSumGrow(attrs, attr, gain)
+    if not attrs or not attr or not gain or gain <= 0 then return attrs end
+    local opp = ATTR_OPP[attr]
+    if not opp then
+        -- 无相对轴（理论不出现）：退化回普通封顶增长
+        attrs[attr] = math.min(100, (attrs[attr] or 0) + gain)
+        return attrs
+    end
+    local cur = attrs[attr] or 0
+    local cur_opp = attrs[opp] or 0
+    -- (1) 本端已满：读同类书不加不减，不再累加
+    if cur >= 100 then return attrs end
+    -- 尝试给本端 +gain（封顶 100）
+    local added = math.min(gain, 100 - cur)
+    local new_cur = cur + added
+    -- (2) 轴总量校验：new_cur + cur_opp 不得超过轴上限
+    local axis_sum = new_cur + cur_opp
+    local overflow = axis_sum - ATTR_AXIS_CAP
+    if overflow > 0 then
+        -- 对称滑落满值端：从对端借位，使轴合计落回上限
+        if cur_opp >= overflow then
+            cur_opp = cur_opp - overflow   -- 对端让出 overflow
+        else
+            -- 对端不够让满，只能减掉本端多出的部分，保持轴 = 上限
+            local backoff = overflow - cur_opp
+            new_cur = new_cur - backoff
+            cur_opp = 0
+        end
+    end
+    attrs[attr] = new_cur
+    attrs[opp] = cur_opp
+    return attrs
 end
 
 -- 随机取一个属性（用于书签掉落/特殊事件）
@@ -1634,7 +1686,7 @@ function FocusFeedback:_ensureBookCategory()
     end)
 end
 
--- 阅读时长累计 -> 属性增长（每 1h 对应属性 +1%）
+-- 阅读时长累计 -> 属性增长（零和；每 1h 对应属性 +0.5%，满值读同类不加不减）
 function FocusFeedback:_growAttributesFromReading(diff)
     if not self:_readAdopted() then return end
     local key = self:_getBookKey()
@@ -1645,9 +1697,12 @@ function FocusFeedback:_growAttributesFromReading(diff)
     if not attrs_list then return end
     local gain = (diff / 3600) * ATTR_READ_GAIN_PER_H
     if gain <= 0 then return end
+    -- 零和：每个分类只喂一个属性；轴全满则不加不减
+    local attrs = self:_initAttributes()
     for _, attr in ipairs(attrs_list) do
-        self:_addAttribute(attr, gain)
+        attrs = self:_zeroSumGrow(attrs, attr, gain)
     end
+    self:_saveAttributes(attrs)
 end
 
 -- 余弦相似度：用户属性向量 A 与内容标签向量 T
@@ -2350,8 +2405,7 @@ function FocusFeedback:_wakeWithCoffee(callback)
     stat.coffee = (stat.coffee or 0) + 1
     stat.wake_coffee = (stat.wake_coffee or 0) + 1
     self:_saveDailyStat(stat)
-    -- V15: 使用一次咖啡唤醒 +0.4% 辩证
-    self:_addAttribute("辩证", ATTR_EVENT_GAIN)
+    -- V19: 咖啡唤醒不再加属性（纳入零和体系后取消）
 
     self._pending_dialogue = "谁把我苦醒了……"
     if callback then callback() end
@@ -2380,8 +2434,7 @@ function FocusFeedback:_useClover(callback)
     local stat = self:_getDailyStat()
     stat.clover = (stat.clover or 0) + 1
     self:_saveDailyStat(stat)
-    -- V15: 使用一次四叶草 +0.4% 审美
-    self:_addAttribute("审美", ATTR_EVENT_GAIN)
+    -- V19: 使用四叶草不再加属性（纳入零和体系后取消）
 
     self._pending_dialogue = "凡事发生皆利于我！"
     if callback then callback() end
@@ -4074,10 +4127,106 @@ function FocusFeedback:_showBookDetailMenu(entry)
     UIManager:show(menu)
 end
 
--- 书的信息弹窗：生日/成年日/年龄/六维属性
+-- ========== V20 六边形雷达图 ==========
+
+-- 生成一个可嵌入弹窗的自绘雷达图控件（鸭子类型 widget：getSize/paintTo）。
+-- 六条轴对应 RADAR_AXES，相对属性对在顶点上对称对望；数值 0~100 线性映射到半径。
+function FocusFeedback:_makeRadarChart(attrs, size)
+    size = size or Screen:scaleBySize(280)
+    local chart = {
+        size = size,
+        attrs = attrs or {},
+        dimen = Geom:new{ w = size, h = size },
+        not_focusable = true,
+        is_visible = true,
+    }
+    function chart:getSize() return self.dimen end
+    function chart:getWidth() return self.size end
+    function chart:getHeight() return self.size end
+    function chart:getInnerSize() return { w = self.size, h = self.size } end
+    function chart:paintTo(bb, x, y)
+        -- 渲染整体设防：任一绘图原语失败仅记录，不打断弹窗/不崩溃
+        local ok, err = pcall(self._render, self, bb, x, y)
+        if not ok then logger.warn("radar paint error: " .. tostring(err)) end
+    end
+    -- 平铺点表（{x0,y0,x1,y1,...}）勾边或多边形填充；新旧 API 兼容
+    function chart:_poly(bb, pts, color, w, fill)
+        if bb.drawPolygon then
+            local ok, e = pcall(function() bb:drawPolygon(pts, color, w, fill) end)
+            if not ok and bb.drawPoly then pcall(function() bb:drawPoly(pts, color, w, fill) end) end
+            return
+        end
+        if bb.drawPoly then pcall(function() bb:drawPoly(pts, color, w, fill) end) end
+    end
+    function chart:_render(bb, px, py)
+        local n = #RADAR_AXES
+        local S = self.size
+        local cx, cy = px + S/2, py + S/2
+        local half = S/2
+        local R_max = half - Screen:scaleBySize(6)
+        local label_r = R_max + Screen:scaleBySize(14)
+        local thin = math.max(1, Screen:scaleBySize(1))
+        -- 网格：3 圈六边形
+        for ring = 1, 3 do
+            local fr = ring * R_max / 3
+            local pts = {}
+            for i = 1, n do
+                local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
+                pts[2*i-1] = cx + fr * math.cos(ang)
+                pts[2*i]   = cy + fr * math.sin(ang)
+            end
+            self:_poly(bb, pts, Blitbuffer.COLOR_DARK_GRAY, thin, false)
+            -- 外圈与内圈从圆心拉辐条（中圈略，避免过密）
+            if ring == 3 or ring == 1 then
+                for i = 1, n do
+                    local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
+                    bb:drawLine(cx, cy,
+                        cx + fr * math.cos(ang), cy + fr * math.sin(ang),
+                        Blitbuffer.COLOR_DARK_GRAY, thin)
+                end
+            end
+        end
+        -- 数据多边形：填充 + 描边
+        local dpts = {}
+        for i, a in ipairs(RADAR_AXES) do
+            local v = math.max(0, math.min(100, tonumber(self.attrs[a]) or 0))
+            local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
+            dpts[2*i-1] = cx + R_max * math.cos(ang) * (v / 100)
+            dpts[2*i]   = cy + R_max * math.sin(ang) * (v / 100)
+        end
+        self:_poly(bb, dpts, Blitbuffer.COLOR_GREEN, thin, true)
+        self:_poly(bb, dpts, Blitbuffer.COLOR_GREEN, math.max(1, Screen:scaleBySize(2)), false)
+        -- 顶点数据点
+        for i = 1, n do
+            bb:drawRect(dpts[2*i-1]-2, dpts[2*i]-2, 5, 5, Blitbuffer.COLOR_GREEN, 1)
+        end
+        -- 轴标签：名称 + 数值
+        local face = Font:getFace("cfont", 13)
+        for i, a in ipairs(RADAR_AXES) do
+            local v = math.max(0, math.min(100, tonumber(self.attrs[a]) or 0))
+            local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
+            local lx = cx + label_r * math.cos(ang)
+            local ly = cy + label_r * math.sin(ang)
+            local label = a .. tostring(v)
+            local wpx = 0
+            for ch in label:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+                local byte = ch:byte()
+                wpx = wpx + ((byte and byte > 127) and 13 or 8)
+            end
+            bb:drawText(lx - wpx/2, ly - 8, label, face, 13, Blitbuffer.COLOR_BLACK)
+        end
+    end
+    return chart
+end
+
+-- 书的信息弹窗：生日/成年日/年龄/六维属性（含六边形雷达图）
 function FocusFeedback:_showBookInfo(entry)
     local book = self.book_data[entry.index] or { title = "未知", author = "", quote = "" }
-    local attrs = entry.attributes or {}
+    -- 成年书用自身 attributes；领养期(全局 live)属性未落入 entry，回退到 v15_attributes
+    local attrs = entry.attributes
+    if not attrs or next(attrs) == nil then
+        attrs = self:_readAttributes() or {}
+    end
 
     local function formatDate(date_str)
         if not date_str or date_str == "" then return "未知" end
@@ -4099,24 +4248,15 @@ function FocusFeedback:_showBookInfo(entry)
         end
     end
 
-    local lines = {
-        string.format("书名：《%s》", book.title),
-        string.format("作者：%s", book.author or ""),
-        "",
-        string.format("生日（领养日）：%s", formatDate(entry.adopt_date)),
-        string.format("成年日（翻开日）：%s", formatDate(entry.reveal_date)),
-        string.format("年龄：%s", age_text),
-        "",
-        "书之属性：",
-    }
-    for _, attr in ipairs(ATTR_KEYS) do
-        table.insert(lines, string.format("%s：%d%%", attr, attrs[attr] or 0))
-    end
+    local border_w = Size.border.window
+    local padding_w = Size.padding.default
 
     local dialog
     dialog = ButtonDialog:new{
-        title = table.concat(lines, "\n"),
-        title_align = "left",
+        title = "",
+        title_align = "center",
+        width = Screen:scaleBySize(560),
+        scrollable_content = false,
         buttons = {
             {
                 {
@@ -4128,6 +4268,64 @@ function FocusFeedback:_showBookInfo(entry)
             },
         },
     }
+    local avail_w = dialog.width - 2 * (border_w + padding_w)
+    local parts = {}
+
+    -- 标题：书名 + 作者
+    local head = string.format("《%s》", book.title)
+    if book.author and book.author ~= "" then head = head .. "　" .. book.author end
+    table.insert(parts, centerIn(TextWidget:new{
+        text = head,
+        face = Font:getFace("cfont", 22),
+    }, avail_w))
+    table.insert(parts, VerticalSpan:new{ width = Size.padding.small })
+
+    -- 六边形雷达图
+    local ok_radar, chart = pcall(function() return self:_makeRadarChart(attrs, Screen:scaleBySize(280)) end)
+    if ok_radar and chart then
+        table.insert(parts, centerIn(chart, avail_w))
+        table.insert(parts, VerticalSpan:new{ width = Size.padding.small })
+    end
+
+    -- 横线
+    local line_w = math.min(Screen:scaleBySize(480), avail_w)
+    local ok_hl, HorizontalLine = pcall(require, "ui/widget/horizontal_line")
+    if ok_hl and HorizontalLine then
+        table.insert(parts, centerIn(HorizontalLine:new{
+            width = line_w,
+            height = Screen:scaleBySize(2),
+            color = Blitbuffer.COLOR_DARK_GRAY,
+        }, avail_w))
+        table.insert(parts, VerticalSpan:new{ width = Size.padding.small })
+    end
+
+    -- 三对相对属性（此消彼长，轴和各 100）
+    local pair_axes = { {"审美", "知识"}, {"情感", "逻辑"}, {"阅历", "辩证"} }
+    for _, pair in ipairs(pair_axes) do
+        local a, b = pair[1], pair[2]
+        local va, vb = attrs[a] or 0, attrs[b] or 0
+        table.insert(parts, centerIn(TextWidget:new{
+            text = string.format("%s %d%%　|　%s %d%%　(轴和 %d)", a, va, b, vb, va + vb),
+            face = Font:getFace("cfont", 16),
+        }, avail_w))
+    end
+
+    -- 基本信息
+    table.insert(parts, VerticalSpan:new{ width = Size.padding.small })
+    table.insert(parts, centerIn(TextWidget:new{
+        text = string.format("生日 %s　|　年龄 %s", formatDate(entry.adopt_date), age_text),
+        face = Font:getFace("cfont", 14),
+    }, avail_w))
+    if entry.reveal_date and entry.reveal_date ~= "" then
+        table.insert(parts, centerIn(TextWidget:new{
+            text = string.format("翻开日 %s", formatDate(entry.reveal_date)),
+            face = Font:getFace("cfont", 14),
+        }, avail_w))
+    end
+
+    local content = VerticalGroup:new{ align = "center", unpack(parts) }
+    content.not_focusable = true
+    dialog:addWidget(content)
     UIManager:show(dialog)
 end
 
@@ -5418,8 +5616,7 @@ function FocusFeedback:_triggerBookmark()
     if #quotes == 0 then return "书签掉落", "一片书签" end
     local nickname = self:_readNickname()
     local quote = quotes[math.random(1, #quotes)]
-    -- V15: 书签掉落 +0.1% 随机属性
-    self:_addAttribute(self:_randomAttrKey(), ATTR_BOOKMARK_GAIN)
+    -- V19: 书签掉落不再增加属性（纳入零和体系后取消）
 
     -- V7: 前缀单独一行，书签内容另起一行（内部再按18字符断行）
     local text = "（书的昵称）身上掉落了一片书签：\n" .. quote
@@ -5483,8 +5680,7 @@ function FocusFeedback:_triggerStranger()
         return 1 + ATTR_WEIGHT_STRENGTH * self:_cosineSim(attrs, s.tags or {})
     end)
     local nickname = self:_readNickname()
-    -- V15: 遇见陌生人 +0.4% 阅历
-    self:_addAttribute("阅历", ATTR_EVENT_GAIN)
+    -- V19: 遇见陌生人不再加属性（纳入零和体系后取消）
 
     -- V7: 记录已遇见
     if not met_set[stranger.key] then
@@ -5570,8 +5766,7 @@ function FocusFeedback:_triggerBookFriend()
     if #books == 0 or #templates == 0 then return "书际关系", "一些物品" end
 
     local nickname = self:_readNickname()
-    -- V15: 一次书际关系 +0.4% 情感
-    self:_addAttribute("情感", ATTR_EVENT_GAIN)
+    -- V19: 一次书际关系不再加属性（纳入零和体系后取消）
 
     local template = templates[math.random(1, #templates)]
     local book_title = books[math.random(1, #books)]
@@ -5618,8 +5813,7 @@ end
 -- 随机事件-书掉入巴别塔图书馆
 function FocusFeedback:_triggerBabel()
     local nickname = self:_readNickname()
-    -- V15: 一次巴别图书馆事件 +0.4% 知识
-    self:_addAttribute("知识", ATTR_EVENT_GAIN)
+    -- V19: 一次巴别图书馆事件不再加属性（纳入零和体系后取消）
     local text = "宇宙（别人管它叫图书馆）由许多六边形的回廊组成，数目不能确定，也许是无限的……（书的昵称）掉入了巴别图书馆，这里有许多它的同类，还有一位失明的阿根廷诗人，都在知识的海洋中寻觅着什么……（书的昵称）想起自己诞生之初第一次仰头望见银河的感受，选择了加入它们。"
     text = text:gsub("（书的昵称）", function() return nickname end)
 
@@ -5637,8 +5831,7 @@ end
 -- 随机事件-书飞走了……
 function FocusFeedback:_triggerFlyAway()
     local nickname = self:_readNickname()
-    -- V15: 书飞走了 +0.4% 逻辑
-    self:_addAttribute("逻辑", ATTR_EVENT_GAIN)
+    -- V19: 书飞走了不再加属性（纳入零和体系后取消）
     local text = "（书的昵称）出门玩耍，路过堪萨斯州的大草原时，一阵猛烈的旋风突然来临。周围的房子、女孩和黑色小梗犬都被大风卷了起来，（书的昵称）也是，它吓得吱哇乱叫。"
     text = text:gsub("（书的昵称）", function() return nickname end)
 
@@ -5686,8 +5879,7 @@ end
 function FocusFeedback:_triggerSpecialEvent(event_def)
     if not event_def then return "特殊事件", "一份礼物" end
     local nickname = self:_readNickname()
-    -- V15: 特殊事件 +1% 随机属性
-    self:_addAttribute(self:_randomAttrKey(), ATTR_SPECIAL_GAIN)
+    -- V19: 特殊事件不再加属性（纳入零和体系后取消）
 
     local text = (event_def.text or ""):gsub("（书的昵称）", function() return nickname end)
     local title = event_def.title or "特殊事件"
@@ -9013,7 +9205,11 @@ function FocusFeedback:_inboxCondWeight(c, attrs, ctx)
             if v > 40 then return 0 end
             return (v <= 30) and k or (100 - v) / 100
         else
-            return (v >= 70) and k or v / 100
+            -- V19: 连续动态加权曲线（高斯钟形）：属性越高越容易触发（0→峰值上升），
+            -- 但接近满级(90+)平滑回落回普通池，避免某属性满 100 时产生压倒性优势。
+            local mu, sigma = 70, 20
+            local bell = math.exp(-((v - mu) * (v - mu)) / (2 * sigma * sigma))
+            return math.max(k * bell, 0.2)
         end
     end
     -- 特殊
@@ -9580,9 +9776,12 @@ function FocusFeedback:_applyMokouRewards(entry, mood, pts, attrs)
     if mood and mood ~= 0 then self:_saveMood(self:_readMood() + mood) end
     if pts and pts ~= 0 then self:_savePoints(self:_readPoints() + pts) end
     if attrs then
-        for attr, gain in pairs(attrs) do
-            if gain and gain ~= 0 then self:_addBookAttr(entry, attr, gain) end
+        -- V19: 事件链"加属性"全部换算成 2 倍积分；加成不足 1 则取消不换算
+        local extra = 0
+        for _, gain in pairs(attrs) do
+            if gain and gain >= 1 then extra = extra + gain * 2 end
         end
+        if extra > 0 then self:_savePoints(self:_readPoints() + extra) end
     end
 end
 
