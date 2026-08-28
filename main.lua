@@ -10735,7 +10735,7 @@ function FocusFeedback:_showTravelLogDialog(e, page, flow)
     local acc = 0
     for li, line in ipairs(lines) do
         local liner = TextBoxWidget:new{ text = line, face = BODY_FACE, width = body_w }
-        local h = math.max(1, liner:getHeight())
+        local h = math.max(1, liner:getSize().h)
         if #bucket > 0 and acc + h > max_h then
             table.insert(pageIndexes, bucket)
             bucket = {}
