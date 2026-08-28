@@ -8159,17 +8159,19 @@ function FocusFeedback:_rollDraw()
 end
 
 -- 抽签弹窗（每日首次阅读自动弹出；开启时立即抽今日第一签）
-function FocusFeedback:_showDrawDialog()
+function FocusFeedback:_showDrawDialog(force)
     -- 防止同一时刻重复弹窗（用户在操作签筒前不叠加新弹窗）
     -- 兜底：若上次弹窗已超过10分钟未操作（如切书/休眠导致弹窗被系统关闭），视为已关闭可重弹
-    if self.draw_dialog_open then
+    -- force=true：菜单内主动补抽（被点掉后想再抽），绕过防重直接弹出
+    if self.draw_dialog_open and not force then
         if self.draw_dialog_at and os.time() - self.draw_dialog_at < 600 then
             return
         end
         self.draw_dialog_open = false
     end
     local d = self:_readDrawDay()
-    if d.date == todayKey() then
+    -- 今日已有签运才视为"抽过"；仅 date==今天而 fx==nil（如点过"明日再说"）时仍允许补抽
+    if d.date == todayKey() and d.fx then
         return
     end
     self.draw_dialog_open = true
@@ -8249,26 +8251,19 @@ function FocusFeedback:_showDrawInfo()
         title = string.format("今日签运 · %s\n剩余%d天\n\n%s", sign_name, remain_days, fx_text)
         buttons = {
             {
-                {text = "关闭抽签模式", callback = function()
-                    UIManager:close(dialog)
-                    self:_confirmCloseDraw()
-                end},
                 {text = "知道了", callback = function() UIManager:close(dialog) end},
             },
         }
     else
-        -- 今日未抽签：提供抽签入口
+        -- 今日未抽签：提供抽签入口；不允许中途关闭（开启后持续7天自动结束）
         title = string.format("今日待抽签\n剩余%d天\n\n点击「抽签」抽取今日运势。", remain_days)
         buttons = {
             {
                 {text = "抽签", callback = function()
                     UIManager:close(dialog)
-                    self:_showDrawDialog()
+                    self:_showDrawDialog(true)   -- force：被点掉后可在此强制补抽
                 end},
-                {text = "关闭抽签模式", callback = function()
-                    UIManager:close(dialog)
-                    self:_confirmCloseDraw()
-                end},
+                {text = "取消", callback = function() UIManager:close(dialog) end},
             },
         }
     end
@@ -8301,18 +8296,18 @@ function FocusFeedback:_confirmStartDraw()
     UIManager:show(dialog)
 end
 
+-- 抽签模式不可中途关闭（开启后持续7天、到期自动结束）；保留入口仅作提示
 function FocusFeedback:_confirmCloseDraw()
+    local m = self:_readModeState()
+    local remain = math.max(0, (m.started_at or 0) + DRAW_DURATION - os.time())
+    local remain_days = math.floor(remain / 86400) + 1
     local dialog
     dialog = ButtonDialog:new{
-        title = "手动关闭抽签模式？\n关闭后即可重新选择模式。",
+        title = "抽签模式不可中途关闭。\n\n开启后持续7天、到期自动结束（冷却20天后可再次开启）。\n当前剩余：" .. remain_days .. "天",
         title_align = "center",
         buttons = {
             {
-                {text = "关闭", callback = function()
-                    UIManager:close(dialog)
-                    self:_closeMode(MODE_DRAW)
-                end},
-                {text = "取消", callback = function() UIManager:close(dialog) end},
+                {text = "知道了", callback = function() UIManager:close(dialog) end},
             },
         },
     }
@@ -9014,7 +9009,9 @@ function FocusFeedback:_inboxCondWeight(c, attrs, ctx)
         local level = c:match("high$") and "high" or "up"
         local k = level == "high" and 2 or 1.2   -- V19: 属性类加权整体下调（high 3→2 / up 1.6→1.2）
         if low then
-            return (v <= 30) and k or (100 - v) / 100   -- 越低越高；>30 时随反比
+            -- "较低"：硬性门槛 40，属性>40 不再触发；≤30 给满权重，31~40 随反比渐降
+            if v > 40 then return 0 end
+            return (v <= 30) and k or (100 - v) / 100
         else
             return (v >= 70) and k or v / 100
         end
@@ -10747,19 +10744,28 @@ function FocusFeedback:_showTravelLogDialog(e, page, flow)
     if #bucket > 0 then table.insert(pageIndexes, bucket) end
     local pages = math.max(1, #pageIndexes)
     if page < 1 then page = 1 elseif page > pages then page = pages end
-    local pageLines = {}
     local cur_ids = pageIndexes[page] or pageIndexes[1] or {}
-    for _, li in ipairs(cur_ids) do table.insert(pageLines, lines[li]) end
-    -- 正文：用 TextBoxWidget 按可用宽度可靠地自动软换行（能正确解析中文标点与 \n）
-    local body_text = table.concat(pageLines, "\n")
-    if body_text == "" then body_text = "（无内容）" end
-    local bodyTW = TextBoxWidget:new{
-        text = body_text,
-        face = BODY_FACE,
-        width = body_w,
-        alignment = "left",
-    }
-    bodyTW.not_focusable = true
+    -- 正文：每条事件一个独立 TextBoxWidget，两条事件之间用 VerticalSpan 留出比行距略大的间隔
+    local contentBody = VerticalGroup:new{ align = "left" }
+    local EVENT_GAP = Screen:scaleBySize(8)   -- 两条事件之间的额外间隔（略大于单事件内行距）
+    for _, li in ipairs(cur_ids) do
+        if contentBody[1] then
+            table.insert(contentBody, VerticalSpan:new{ width = EVENT_GAP })
+        end
+        local egb = TextBoxWidget:new{
+            text = lines[li],
+            face = BODY_FACE,
+            width = body_w,
+            alignment = "left",
+        }
+        egb.not_focusable = true
+        table.insert(contentBody, egb)
+    end
+    if not contentBody[1] then
+        local egb = TextBoxWidget:new{ text = "（无内容）", face = BODY_FACE, width = body_w, alignment = "left" }
+        egb.not_focusable = true
+        table.insert(contentBody, egb)
+    end
 
     -- 底部两行按钮：上一行翻页，下一行 查看档案 / 确定
     local buttons = {}
@@ -10818,7 +10824,7 @@ function FocusFeedback:_showTravelLogDialog(e, page, flow)
     dialog.show_parent = nil
 
     -- 内容组装（最后页右下角落款日期）
-    local parts = { bodyTW }
+    local parts = { contentBody }
     if page == pages then
         local last = tlog[#tlog]
         local sign_dt = os.date("%Y.%m.%d", (last and last.ts) or os.time())
