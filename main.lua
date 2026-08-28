@@ -1304,7 +1304,8 @@ function FocusFeedback:_showDailyTaskDialog()
         local state_w = TextWidget:new{
             text = t.claimed and "今日任务已完成，奖励已领取" or "已完成，可领取奖励",
             face = Font:getFace("cfont", 15),
-            fgcolor = Blitbuffer.COLOR_GREEN,
+            -- 设备调色板仅灰度（无 COLOR_GREEN），用黑色作为完成状态的强调色
+            fgcolor = Blitbuffer.COLOR_BLACK,
         }
         table.insert(parts, centerIn(state_w, avail_w))
     end
@@ -4002,7 +4003,7 @@ function FocusFeedback:_showBookDetailMenu(entry)
         },
     }
     local menu = Menu:new{
-        title = string.format("《%s》", book.title),
+        title = entry.nickname or string.format("《%s》", book.title),
         item_table = items,
         width = Screen:getWidth(),
         is_borderless = true,
@@ -4018,6 +4019,9 @@ end
 -- 之前用普通 Lua table 作为子控件插入弹窗后，事件经 widget 树传播时
 -- 会在 widgetcontainer.lua 的 propagateEvent 处因 handleEvent 为 nil 而崩溃。
 -- 六条轴对应 RADAR_AXES，相对属性对在顶点上对称对望；数值 0~100 线性映射到半径。
+-- 注意：KOReader v2025+ 的 BlitBuffer 只提供 paintRect/paintCircle/setPixel(Clamped) 等
+-- 基础原语，没有 drawPolygon/drawLine/drawRect/drawText，也没有彩色常量（仅灰度 eInk 调色板）。
+-- 因此这里用 Bresenham 画线、扫描线填充多边形、TextWidget 渲染标签，全部基于可用 API。
 local RadarChart = WidgetContainer:extend{
     size = nil,
     attrs = {},
@@ -4025,10 +4029,24 @@ local RadarChart = WidgetContainer:extend{
     is_visible = true,
 }
 function RadarChart:init()
-    self.size = self.size or Screen:scaleBySize(280)
+    self.size = self.size or Screen:scaleBySize(300)
     self.dimen = Geom:new{ w = self.size, h = self.size }
     self.is_visible = true
     self.not_focusable = true
+    -- 预生成轴标签（TextWidget），paint 时直接定位绘制，避免每帧重建
+    self._labels = {}
+    local ok, face = pcall(Font.getFace, Font, "cfont", 13)
+    if ok and face then
+        for i, a in ipairs(RADAR_AXES) do
+            local v = math.max(0, math.min(100, tonumber(self.attrs[a]) or 0))
+            local ok2, lbl = pcall(TextWidget.new, TextWidget, {
+                text = a .. tostring(v),
+                face = face,
+                fgcolor = Blitbuffer.COLOR_BLACK,
+            })
+            if ok2 and lbl then self._labels[i] = lbl end
+        end
+    end
 end
 function RadarChart:getSize()
     return self.dimen
@@ -4045,42 +4063,99 @@ end
 function RadarChart:paintTo(bb, x, y)
     -- 渲染整体设防：任一绘图原语失败仅记录，不打断弹窗/不崩溃
     local ok, err = pcall(self._renderRadar, self, bb, x, y)
-    if not ok then logger.warn("radar paint error: " .. tostring(err)) end
-end
--- 平铺点表（{x0,y0,x1,y1,...}）勾边或多边形填充；新旧 API 兼容
-function RadarChart:_poly(bb, pts, color, w, fill)
-    if bb.drawPolygon then
-        local ok, e = pcall(function() bb:drawPolygon(pts, color, w, fill) end)
-        if not ok and bb.drawPoly then pcall(function() bb:drawPoly(pts, color, w, fill) end) end
-        return
+    if not ok then
+        logger.warn("radar paint error: " .. tostring(err))
+        -- 兜底：画一个空心圆示意雷达区域，避免整块空白
+        pcall(function()
+            bb:paintCircle(x + self.size/2, y + self.size/2,
+                math.floor(self.size/2) - Screen:scaleBySize(6), Blitbuffer.COLOR_DARK_GRAY, 1)
+        end)
     end
-    if bb.drawPoly then pcall(function() bb:drawPoly(pts, color, w, fill) end) end
+end
+-- Bresenham 直线；width>1 时沿线画小方块实现粗线
+function RadarChart:_line(bb, x0, y0, x1, y1, color, w)
+    -- 端点取整：多边形顶点是浮点数，不取整会导致终点永远无法精确命中而死循环
+    x0, y0 = math.floor(x0 + 0.5), math.floor(y0 + 0.5)
+    x1, y1 = math.floor(x1 + 0.5), math.floor(y1 + 0.5)
+    local dx = math.abs(x1 - x0)
+    local dy = math.abs(y1 - y0)
+    local sx = x0 < x1 and 1 or -1
+    local sy = y0 < y1 and 1 or -1
+    local err = dx - dy
+    w = math.max(1, math.floor(w or 1))
+    local half = math.floor(w / 2)
+    while true do
+        if w <= 1 then
+            bb:setPixelClamped(x0, y0, color)
+        else
+            bb:paintRect(x0 - half, y0 - half, w, w, color)
+        end
+        if x0 == x1 and y0 == y1 then break end
+        local e2 = 2 * err
+        if e2 > -dy then err = err - dy; x0 = x0 + sx end
+        if e2 < dx then err = err + dx; y0 = y0 + sy end
+    end
+end
+-- 扫描线填充多边形（pts: {x0,y0,x1,y1,...}，偶数个点，逆序无关）
+function RadarChart:_fillPoly(bb, pts, color)
+    local n = #pts / 2
+    if n < 3 then return end
+    local xs, ys = {}, {}
+    local ymin, ymax = math.huge, -math.huge
+    for i = 1, n do
+        xs[i], ys[i] = pts[2*i-1], pts[2*i]
+        ymin = math.min(ymin, ys[i])
+        ymax = math.max(ymax, ys[i])
+    end
+    ymin, ymax = math.floor(ymin), math.ceil(ymax)
+    local nodes, scan = {}, {}
+    for y = ymin, ymax do
+        local cnt = 0
+        local yf = y + 0.5
+        for i = 1, n do
+            local x1, y1 = xs[i], ys[i]
+            local j = i % n + 1
+            local x2, y2 = xs[j], ys[j]
+            if (y1 <= yf and y2 > yf) or (y2 <= yf and y1 > yf) then
+                cnt = cnt + 1
+                nodes[cnt] = x1 + (yf - y1) * (x2 - x1) / (y2 - y1)
+            end
+        end
+        if cnt > 0 then
+            for i = 1, cnt do scan[i] = nodes[i] end
+            table.sort(scan, function(a, b) return a < b end)
+            for i = 1, cnt - 1, 2 do
+                local xa = math.floor(scan[i])
+                local xb = math.ceil(scan[i + 1])
+                if xb > xa then
+                    bb:paintRect(xa, y, xb - xa, 1, color)
+                end
+            end
+        end
+    end
 end
 function RadarChart:_renderRadar(bb, px, py)
     local n = #RADAR_AXES
     local S = self.size
     local cx, cy = px + S/2, py + S/2
     local half = S/2
-    local R_max = half - Screen:scaleBySize(6)
-    local label_r = R_max + Screen:scaleBySize(14)
+    -- 预留四周余量给轴标签，标签可全部落在画布内
+    local R_max = half - Screen:scaleBySize(44)
+    local label_r = R_max + Screen:scaleBySize(18)
     local thin = math.max(1, Screen:scaleBySize(1))
-    -- 网格：3 圈六边形
+    -- 网格：3 圈六边形 + 内外圈辐条
     for ring = 1, 3 do
         local fr = ring * R_max / 3
-        local pts = {}
-        for i = 1, n do
-            local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
-            pts[2*i-1] = cx + fr * math.cos(ang)
-            pts[2*i]   = cy + fr * math.sin(ang)
-        end
-        self:_poly(bb, pts, Blitbuffer.COLOR_DARK_GRAY, thin, false)
-        -- 外圈与内圈从圆心拉辐条（中圈略，避免过密）
-        if ring == 3 or ring == 1 then
-            for i = 1, n do
-                local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
-                bb:drawLine(cx, cy,
-                    cx + fr * math.cos(ang), cy + fr * math.sin(ang),
-                    Blitbuffer.COLOR_DARK_GRAY, thin)
+        local px0, py0
+        for i = 1, n + 1 do
+            local ii = i > n and 1 or i
+            local ang = (ii - 1) * (2 * math.pi / n) - math.pi / 2
+            local vx = cx + fr * math.cos(ang)
+            local vy = cy + fr * math.sin(ang)
+            if px0 then self:_line(bb, px0, py0, vx, vy, Blitbuffer.COLOR_DARK_GRAY, thin) end
+            px0, py0 = vx, vy
+            if ring == 3 or ring == 1 then
+                self:_line(bb, cx, cy, vx, vy, Blitbuffer.COLOR_DARK_GRAY, thin)
             end
         end
     end
@@ -4092,26 +4167,29 @@ function RadarChart:_renderRadar(bb, px, py)
         dpts[2*i-1] = cx + R_max * math.cos(ang) * (v / 100)
         dpts[2*i]   = cy + R_max * math.sin(ang) * (v / 100)
     end
-    self:_poly(bb, dpts, Blitbuffer.COLOR_GREEN, thin, true)
-    self:_poly(bb, dpts, Blitbuffer.COLOR_GREEN, math.max(1, Screen:scaleBySize(2)), false)
+    self:_fillPoly(bb, dpts, Blitbuffer.COLOR_GRAY)
+    local thick = math.max(1, Screen:scaleBySize(2))
+    for i = 1, n do
+        local j = i % n + 1
+        self:_line(bb, dpts[2*i-1], dpts[2*i], dpts[2*j-1], dpts[2*j], Blitbuffer.COLOR_BLACK, thick)
+    end
     -- 顶点数据点
     for i = 1, n do
-        bb:drawRect(dpts[2*i-1]-2, dpts[2*i]-2, 5, 5, Blitbuffer.COLOR_GREEN, 1)
+        bb:paintRect(dpts[2*i-1] - 2, dpts[2*i] - 2, 5, 5, Blitbuffer.COLOR_BLACK)
     end
-    -- 轴标签：名称 + 数值
-    local face = Font:getFace("cfont", 13)
-    for i, a in ipairs(RADAR_AXES) do
-        local v = math.max(0, math.min(100, tonumber(self.attrs[a]) or 0))
-        local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
-        local lx = cx + label_r * math.cos(ang)
-        local ly = cy + label_r * math.sin(ang)
-        local label = a .. tostring(v)
-        local wpx = 0
-        for ch in label:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-            local byte = ch:byte()
-            wpx = wpx + ((byte and byte > 127) and 13 or 8)
+    -- 轴标签：名称 + 数值（夹紧到画布内，避免被裁掉）
+    for i, lbl in ipairs(self._labels) do
+        if lbl then
+            local ang = (i - 1) * (2 * math.pi / n) - math.pi / 2
+            local lx = cx + label_r * math.cos(ang)
+            local ly = cy + label_r * math.sin(ang)
+            local sz = lbl:getSize()
+            local tx = lx - sz.w / 2
+            local ty = ly - sz.h / 2
+            tx = math.max(px + 1, math.min(px + S - sz.w - 1, tx))
+            ty = math.max(py + 1, math.min(py + S - sz.h - 1, ty))
+            lbl:paintTo(bb, tx, ty)
         end
-        bb:drawText(lx - wpx/2, ly - 8, label, face, 13, Blitbuffer.COLOR_BLACK)
     end
 end
 
@@ -4172,8 +4250,9 @@ function FocusFeedback:_showBookInfo(entry)
     local avail_w = dialog.width - 2 * (border_w + padding_w)
     local parts = {}
 
-    -- 标题：书名 + 作者
-    local head = string.format("《%s》", book.title)
+    -- 标题：昵称 + 作者（最上方放昵称而非书名）
+    local nick_name = entry.nickname or book.title
+    local head = nick_name
     if book.author and book.author ~= "" then head = head .. "　" .. book.author end
     table.insert(parts, centerIn(TextWidget:new{
         text = head,
@@ -4182,7 +4261,8 @@ function FocusFeedback:_showBookInfo(entry)
     table.insert(parts, VerticalSpan:new{ width = Size.padding.small })
 
     -- 六边形雷达图
-    local ok_radar, chart = pcall(function() return self:_makeRadarChart(attrs, Screen:scaleBySize(280)) end)
+    local radar_size = math.max(Screen:scaleBySize(180), math.min(Screen:scaleBySize(300), avail_w - Screen:scaleBySize(8)))
+    local ok_radar, chart = pcall(function() return self:_makeRadarChart(attrs, radar_size) end)
     if ok_radar and chart then
         table.insert(parts, centerIn(chart, avail_w))
         table.insert(parts, VerticalSpan:new{ width = Size.padding.small })
