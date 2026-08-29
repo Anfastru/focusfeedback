@@ -2721,6 +2721,51 @@ function FocusFeedback:_collectibleKeys()
     return set
 end
 
+-- 收藏品图鉴：有序、分组、保序的收藏列表（供自绘图鉴分页展示）
+-- 与 _collectibleKeys 同一套来源，但保留顺序与来源分组，避免分页时顺序乱跳。
+function FocusFeedback:_collectibleList()
+    local inv = self:_readInventory() or {}
+    local list = {}
+    local function push(group, key, name, intro)
+        if not key or key == "" then return end
+        table.insert(list, {
+            key = key,
+            name = tostring(name or key),
+            intro = tostring(intro or ""),
+            group = tostring(group or ""),
+            owned = (inv[key] or 0) > 0,
+        })
+    end
+    -- ① 每日任务·特殊奖励（固定顺序 s1..s8，与 SPECIAL_TASK_REWARDS 的 key 对应）
+    for _, k in ipairs({"s1","s2","s3","s4","s5","s6","s7","s8"}) do
+        local def = SPECIAL_TASK_REWARDS[k]
+        if def then push("每日任务·特殊", def.key, def.name, def.intro) end
+    end
+    -- ② 陌生人纪念品 / ③ 特殊事件纪念品（运行时 event_data 存在才有）
+    if self.event_data and type(self.event_data) == "table" then
+        for _, s in ipairs(self.event_data.strangers or {}) do
+            if s and type(s) == "table" and s.reward_key then
+                push("遇见的人", s.reward_key, s.reward_name, s.item_intro)
+            end
+        end
+        for _, e in ipairs(self.event_data.special_events or {}) do
+            if e and type(e) == "table" and e.reward_key then
+                push("特殊事件", e.reward_key, e.reward_name, e.item_intro)
+            end
+        end
+    end
+    -- ④⑤ 事件链纪念品（模恐/迷思）——新增纪念品在此登记后自然进入图鉴
+    for _, grp in ipairs(COLLECTIBLE_CHAIN_ENDINGS or {}) do
+        local src = tostring(grp.prefix or ""):match("mokou") and "模恐结局" or "迷思结局"
+        for _, eid in ipairs(grp.endings or {}) do
+            local key = tostring(grp.prefix or "") .. tostring(eid or "")
+            local mdef = self:_mokouSouvenirDef(key)
+            push(src, key, mdef and mdef.name or eid, mdef and mdef.intro or "")
+        end
+    end
+    return list
+end
+
 -- 收集进度：owned/total + 百分比（参考图鉴读完书页面顶部统计形态）
 function FocusFeedback:_collectibleProgress()
     local inv = self:_readInventory()
@@ -2798,7 +2843,7 @@ function FocusFeedback:_showWarehouse()
         key = "__collect_stats",
         text = stats_text,
         mandatory = "",
-        callback = function() self:_showMessage("特殊物品收集进度。\n来源：遇见陌生人 / 特殊事件 / 每日任务特殊任务 / 事件链纪念品", 5) end,
+        callback = function() self:_showCollectibleGallery() end,
     })
     local menu = Menu:new{
         title = "仓库",
@@ -4196,6 +4241,321 @@ end
 -- 生成雷达图实例
 function FocusFeedback:_makeRadarChart(attrs, size)
     return RadarChart:new{ size = size, attrs = attrs or {} }
+end
+
+-- ========== V21 特殊物品收集·自绘图鉴（分页陈列墙） ==========
+-- 稳定第一位：真正 WidgetContainer 实例（继承 handleEvent，避免事件传播崩溃）；
+-- 全部绘制原语集中 pcall 兜底；文本用单行 TextWidget + UTF-8 安全截断，绝不跨格溢出。
+-- 交互：底部左/中/右三段是 [上一页 | 页码 | 下一页]，点网格空白处即关闭（安全退路）。
+
+-- UTF-8 安全字节截断：不破坏多字节字符，超出补省略号
+local function clipUTF8(s, maxBytes)
+    s = tostring(s or "")
+    if #s <= maxBytes then return s end
+    local t = string.sub(s, 1, maxBytes)
+    -- 先回退掉被截断的续字节（0x80-0xBF）
+    while #t > 0 do
+        local last = string.byte(t, -1)
+        if last and last >= 0x80 and last <= 0xBF then
+            t = string.sub(t, 1, -2)
+        else
+            break
+        end
+    end
+    -- 再清掉可能残留的孤立前导字节（多字节字符头字节，0xC0+），避免乱码
+    while #t > 0 do
+        local last = string.byte(t, -1)
+        if last and last >= 0xC0 then
+            t = string.sub(t, 1, -2)
+        else
+            break
+        end
+    end
+    return t .. "…"
+end
+
+local CollectibleGallery = WidgetContainer:extend{
+    items = {},          -- _collectibleList() 产物：{key,name,intro,group,owned}
+    pageSize = 18,
+    page = 1,
+    not_focusable = true,
+    is_visible = true,
+    tapToCloseCallback = nil,   -- 运行时设置：点空白处关闭
+}
+function CollectibleGallery:init()
+    self.width = Screen:getWidth()
+    self.height = Screen:getHeight()
+    self.dimen = Geom:new{ w = self.width, h = self.height }
+    self.not_focusable = true
+    self.is_visible = true
+    -- 布局参数（scaleBySize 保证跨屏自适应）
+    local PAD = Screen:scaleBySize(14)
+    local TITLE_H = Screen:scaleBySize(42)
+    local FOOT_H = Screen:scaleBySize(58)
+    self._PAD = PAD
+    self._TITLE_H = TITLE_H
+    self._FOOT_H = FOOT_H
+    self._gridTop = PAD + TITLE_H + PAD
+    self._footTop = self.height - PAD - FOOT_H
+    -- 网格：每行 3 格，格高由名称/来源两行决定
+    local perRow = 3
+    local gapH = Screen:scaleBySize(10)
+    local gapV = Screen:scaleBySize(10)
+    local cell_w = (self.width - 2 * PAD - (perRow - 1) * gapH) / perRow
+    local cell_h = Screen:scaleBySize(54)
+    local grid_h = self._footTop - self._gridTop
+    local rows = math.max(1, math.floor((grid_h + gapV) / (cell_h + gapV)))
+    self._perRow = perRow
+    self._gapH = gapH
+    self._gapV = gapV
+    self._cellW = cell_w
+    self._cellH = cell_h
+    self._rows = rows
+    local total = #self.items
+    self.pageSize = math.max(1, perRow * rows)
+    self.pages = math.max(1, math.ceil(total / self.pageSize))
+    if self.page < 1 then self.page = 1 elseif self.page > self.pages then self.page = self.pages end
+    -- 预构建所有名/来源 TextWidget（单行、UTF-8 截断），paint 时零重建
+    self._cells = {}
+    local okN, faceN = pcall(Font.getFace, Font, "cfont", 16)
+    local okS, faceS = pcall(Font.getFace, Font, "cfont", 11)
+    if okN and okS and faceN and faceS then
+        local maxB = math.max(6, math.floor(cell_w / 16 * 2))  -- 中文约 3 字节/字，留余量
+        for _, it in ipairs(self.items) do
+            local cwTxt, cw = pcall(TextWidget.new, TextWidget, {
+                text = clipUTF8(it.name or it.key, maxB), face = faceN,
+                fgcolor = Blitbuffer.COLOR_BLACK,
+            })
+            local csTxt, cs = pcall(TextWidget.new, TextWidget, {
+                text = clipUTF8(it.group or "", maxB), face = faceS,
+                fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            })
+            table.insert(self._cells, {
+                name = cw and cwTxt, src = cs and csTxt,
+                owned = it.owned or false,
+                key = it.key, group = it.group,
+            })
+        end
+    end
+end
+function CollectibleGallery:getSize() return self.dimen end
+function CollectibleGallery:getWidth() return self.width end
+function CollectibleGallery:getHeight() return self.height end
+function CollectibleGallery:getInnerSize() return { w = self.width, h = self.height } end
+
+-- 翻页（越界钳制）；失败仅记录不崩溃
+function CollectibleGallery:_turn(d)
+    local np = (self.page or 1) + d
+    np = math.max(1, math.min(self.pages or 1, np))
+    if np ~= (self.page or 1) then
+        self.page = np
+        self._pageCache = nil   -- 页码变化后强制重建当前页指示
+        local ok, err = pcall(function() self:invalidate() end)
+        if not ok then logger.warn("gallery refresh error: " .. tostring(err)) end
+    end
+end
+-- 关闭
+function CollectibleGallery:_close()
+    pcall(function() UIManager:close(self) end)
+end
+-- 命中测试：底栏三段（上一页/页码/下一页）+ 标题栏右侧 ✕；其余空白 → 触发关闭
+function CollectibleGallery:onTapEvent(ev)
+    if not (ev and ev.pos) then return true end
+    local x, y = ev.pos.x, ev.pos.y
+    local SW, SH = self.width, self.height
+    local ok, hit = pcall(function()
+        if y >= self._footTop then
+            local third = SW / 3
+            if x < third then return "prev"
+            elseif x >= 2 * third then return "next"
+            else return "none" end
+        end
+        if y <= self._gridTop then
+            -- 标题栏右侧 ✕ 关闭区
+            if x >= SW - Screen:scaleBySize(56) then return "close" end
+            return "none"
+        end
+        return "none"   -- 网格区：视为空白 → 关闭
+    end)
+    if not ok then return true end
+    if hit == "prev" then self:_turn(-1) return true end
+    if hit == "next" then self:_turn(1) return true end
+    if hit == "close" then self:_close() return true end
+    if hit == "none" then
+        -- 返回 false 触发 tapToCloseCallback（点空白关闭）
+        return false
+    end
+    return true
+end
+function CollectibleGallery:onClose()
+    return true
+end
+-- 渲染主体（整体 pcall 兜底，任一原语失败仅记录并画空框示意，不崩溃）
+function CollectibleGallery:re_render(bb, x0, y0)
+    local ok, err = pcall(self._render, self, bb, x0, y0)
+    if not ok then
+        logger.warn("gallery render error: " .. tostring(err))
+        local ok2, r = pcall(function()
+            bb:paintRect(x0, y0, self.width, self.height, Blitbuffer.COLOR_WHITE)
+            bb:paintRect(x0, y0, self.width, self.height, Blitbuffer.COLOR_BLACK, 1)
+        end)
+        if not ok2 or r == false then end
+    end
+end
+function CollectibleGallery:paintTo(bb, x, y)
+    self:re_render(bb, x or 0, y or 0)
+end
+function CollectibleGallery:_render(bb, px, py)
+    local W, H = self.width, self.height
+    -- 清底
+    bb:paintRect(px, py, W, H, Blitbuffer.COLOR_WHITE)
+    local PAD = self._PAD
+    local _BLACK = Blitbuffer.COLOR_BLACK
+    local _GRAY = Blitbuffer.COLOR_DARK_GRAY
+    local _LGRAY = Blitbuffer.COLOR_GRAY
+    -- 标题栏
+    bb:paintRect(px, py, W, self._TITLE_H, Blitbuffer.COLOR_WHITE)
+    bb:paintRect(px, py + self._TITLE_H, W, 1, _LGRAY)
+    -- 标题 = 收集进度 + 页码；✕ 在右侧
+    local okT, title = pcall(self._titleText, self)
+    if okT and title then title:paintTo(bb, px + PAD, py + (self._TITLE_H - title:getSize().h) / 2) end
+    local okP, pageTxt = pcall(self._pageText, self)
+    if okP and pageTxt then
+        local sz = pageTxt:getSize()
+        pageTxt:paintTo(bb, px + W - PAD - sz.w - Screen:scaleBySize(56), py + (self._TITLE_H - sz.h) / 2)
+    end
+    -- 网格
+    local per = self._perRow
+    local cellW, cellH = self._cellW, self._cellH
+    local gapH, gapV = self._gapH, self._gapV
+    local start = (self.page - 1) * self.pageSize
+    local col, row = 0, 0
+    for i = 1, self.pageSize do
+        local idx = start + i
+        if idx > #self._cells then break end
+        col, row = (i - 1) % per, math.floor((i - 1) / per)
+        local gx = px + PAD + col * (cellW + gapH)
+        local gy = py + self._gridTop + row * (cellH + gapV)
+        local cell = self._cells[idx]
+        local owned = cell and cell.owned
+        local border = owned and _BLACK or _GRAY
+        -- 格子：已得实心浅灰底+黑边；未得空心虚边
+        if owned then
+            bb:paintRect(gx, gy, cellW, cellH, Blitbuffer.COLOR_GRAY)
+        end
+        bb:paintRect(gx, gy, cellW, 1, border)
+        bb:paintRect(gx, gy + cellH - 1, cellW, 1, border)
+        bb:paintRect(gx, gy, 1, cellH, border)
+        bb:paintRect(gx + cellW - 1, gy, 1, cellH, border)
+        if not owned then
+            -- 虚线内纹，示意"未获得"
+            local dash = math.max(2, Screen:scaleBySize(1))
+            local step = math.max(4, Screen:scaleBySize(3))
+            local dy = gy + cellH / 2
+            for dx = gx + 3, gx + cellW - 4, step + dash do
+                bb:paintRect(dx, dy, dash, Screen:scaleBySize(1), _LGRAY)
+            end
+        end
+        -- 格子文字：来源（小字，上）+ 名称（大字，下），均单行截断
+        if cell and cell.src then
+            local sz = cell.src:getSize()
+            cell.src:paintTo(bb, gx + (cellW - math.min(sz.w, cellW - 2)) / 2, gy + 2)
+        end
+        if cell and cell.name then
+            local nz = cell.name:getSize()
+            local ny = gy + cellH - nz.h - Screen:scaleBySize(3)
+            cell.name:paintTo(bb, gx + (cellW - math.min(nz.w, cellW - 2)) / 2, ny)
+        end
+    end
+    -- 底栏
+    bb:paintRect(px, py + H - self._FOOT_H, W, 1, _GRAY)
+    local okFoot, foot = pcall(self._footText, self)
+    if okFoot and foot then
+        local sz = foot:getSize()
+        foot:paintTo(bb, px + (W - sz.w) / 2, py + H - (self._FOOT_H - sz.h) / 2 - sz.h)
+    end
+    -- 底栏左右按钮文字
+    local okL, lt = pcall(function()
+        return TextWidget:new{ text = "‹ 上一页", face = self:_fc(),
+            fgcolor = Blitbuffer.COLOR_BLACK }
+    end)
+    if okL and lt then lt:paintTo(bb, px + PAD, py + H - self._FOOT_H + (self._FOOT_H - lt:getSize().h) / 2) end
+    local okR, rt = pcall(function()
+        return TextWidget:new{ text = "下一页 ›", face = self:_fc(),
+            fgcolor = Blitbuffer.COLOR_BLACK }
+    end)
+    if okR and rt then
+        local sz = rt:getSize()
+        rt:paintTo(bb, px + W - PAD - sz.w, py + H - self._FOOT_H + (self._FOOT_H - sz.h) / 2)
+    end
+end
+function CollectibleGallery:_fc()
+    if not self._faceFoot then
+        local ok, f = pcall(Font.getFace, Font, "cfont", 16)
+        self._faceFoot = ok and f or nil
+    end
+    return self._faceFoot
+end
+function CollectibleGallery:_titleText()
+    if not self._titleCache then
+        local owned = 0
+        for _, c in ipairs(self._cells) do if c.owned then owned = owned + 1 end end
+        local total = #self._cells
+        local pct = total > 0 and math.floor(owned / total * 100 + 0.5) or 0
+        local ok, f = pcall(Font.getFace, Font, "cfont", 18)
+        local text = string.format("特殊物品收集　%d / %d（%d%%）", owned, total, pct)
+        local ok2, tw = pcall(TextWidget.new, TextWidget,
+            { text = text, face = ok and f or nil, fgcolor = Blitbuffer.COLOR_BLACK })
+        self._titleCache = ok2 and tw or nil
+    end
+    return self._titleCache
+end
+function CollectibleGallery:_pageText()
+    if not self._pageCache then
+        local ok, f = pcall(Font.getFace, Font, "cfont", 14)
+        local text = string.format("第 %d / %d 页", self.page or 1, self.pages or 1)
+        local ok2, tw = pcall(TextWidget.new, TextWidget,
+            { text = text, face = ok and f or nil, fgcolor = Blitbuffer.COLOR_BLACK })
+        self._pageCache = ok2 and tw or nil
+    end
+    return self._pageCache
+end
+function CollectibleGallery:_footText()
+    if not self._footCache then
+        local hint = (#self._cells or 0) > 0 and "点空白关闭 · 已得深框 / 未得虚纹" or "暂无收藏目标"
+        local ok, f = pcall(Font.getFace, Font, "cfont", 12)
+        local ok2, tw = pcall(TextWidget.new, TextWidget,
+            { text = hint, face = ok and f or nil, fgcolor = Blitbuffer.COLOR_DARK_GRAY })
+        self._footCache = ok2 and tw or nil
+    end
+    return self._footCache
+end
+
+-- 打开收藏品自绘图鉴弹窗
+function FocusFeedback:_showCollectibleGallery()
+    -- 收集列表在 event_data 缺失时也要稳定可用（本地来源始终存在）
+    local okList, items = pcall(function() return self:_collectibleList() end)
+    if not okList then items = nil end
+    items = type(items) == "table" and items or {}
+    if #items == 0 then
+        self:_showMessage("暂时还没有可收集的物品目标。", 4)
+        return
+    end
+    local ok, gallery = pcall(function()
+        return CollectibleGallery:new{ items = items }
+    end)
+    if not (ok and gallery) then
+        self:_showMessage("自绘图鉴打开失败，请稍后再试。", 4)
+        return
+    end
+    gallery.tapToCloseCallback = function() gallery:_close() end
+    local okShow, errShow = pcall(function()
+        UIManager:show(gallery)
+    end)
+    if not okShow then
+        logger.warn("show collectible gallery error: " .. tostring(errShow))
+        if errShow then self:_showMessage("自绘图鉴打开失败。", 4) end
+    end
 end
 
 -- 书的信息弹窗：生日/成年日/年龄/六维属性（含六边形雷达图）
