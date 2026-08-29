@@ -4280,11 +4280,13 @@ local CollectibleGallery = WidgetContainer:extend{
     page = 1,
     not_focusable = true,
     is_visible = true,
-    tapToCloseCallback = nil,   -- 运行时设置：点空白处关闭
 }
 function CollectibleGallery:init()
-    self.width = Screen:getWidth()
-    self.height = Screen:getHeight()
+    -- 内容区尺寸（约占屏；由外部 ButtonDialog 托管生命周期/关闭，避免顶层 show 卡死）
+    local Win = Screen:getWidth() or 600
+    local Hin = Screen:getHeight() or 800
+    self.width = math.max(80, math.floor(Win * 0.92))
+    self.height = math.max(120, math.floor(Hin * 0.66))
     self.dimen = Geom:new{ w = self.width, h = self.height }
     self.not_focusable = true
     self.is_visible = true
@@ -4330,8 +4332,11 @@ function CollectibleGallery:init()
                 text = clipUTF8(it.group or "", maxB), face = faceS,
                 fgcolor = Blitbuffer.COLOR_DARK_GRAY,
             })
+            -- 只保留真 widget（table）；创建失败一律置 nil，杜绝 boolean 混入导致绘制崩溃
+            local nameWidget = type(cwTxt) == "table" and cwTxt or nil
+            local srcWidget = type(csTxt) == "table" and csTxt or nil
             table.insert(self._cells, {
-                name = cw and cwTxt, src = cs and csTxt,
+                name = nameWidget, src = srcWidget,
                 owned = it.owned or false,
                 key = it.key, group = it.group,
             })
@@ -4343,53 +4348,6 @@ function CollectibleGallery:getWidth() return self.width end
 function CollectibleGallery:getHeight() return self.height end
 function CollectibleGallery:getInnerSize() return { w = self.width, h = self.height } end
 
--- 翻页（越界钳制）；失败仅记录不崩溃
-function CollectibleGallery:_turn(d)
-    local np = (self.page or 1) + d
-    np = math.max(1, math.min(self.pages or 1, np))
-    if np ~= (self.page or 1) then
-        self.page = np
-        self._pageCache = nil   -- 页码变化后强制重建当前页指示
-        local ok, err = pcall(function() self:invalidate() end)
-        if not ok then logger.warn("gallery refresh error: " .. tostring(err)) end
-    end
-end
--- 关闭
-function CollectibleGallery:_close()
-    pcall(function() UIManager:close(self) end)
-end
--- 命中测试：底栏三段（上一页/页码/下一页）+ 标题栏右侧 ✕；其余空白 → 触发关闭
-function CollectibleGallery:onTapEvent(ev)
-    if not (ev and ev.pos) then return true end
-    local x, y = ev.pos.x, ev.pos.y
-    local SW, SH = self.width, self.height
-    local ok, hit = pcall(function()
-        if y >= self._footTop then
-            local third = SW / 3
-            if x < third then return "prev"
-            elseif x >= 2 * third then return "next"
-            else return "none" end
-        end
-        if y <= self._gridTop then
-            -- 标题栏右侧 ✕ 关闭区
-            if x >= SW - Screen:scaleBySize(56) then return "close" end
-            return "none"
-        end
-        return "none"   -- 网格区：视为空白 → 关闭
-    end)
-    if not ok then return true end
-    if hit == "prev" then self:_turn(-1) return true end
-    if hit == "next" then self:_turn(1) return true end
-    if hit == "close" then self:_close() return true end
-    if hit == "none" then
-        -- 返回 false 触发 tapToCloseCallback（点空白关闭）
-        return false
-    end
-    return true
-end
-function CollectibleGallery:onClose()
-    return true
-end
 -- 渲染主体（整体 pcall 兜底，任一原语失败仅记录并画空框示意，不崩溃）
 function CollectibleGallery:re_render(bb, x0, y0)
     local ok, err = pcall(self._render, self, bb, x0, y0)
@@ -4474,20 +4432,6 @@ function CollectibleGallery:_render(bb, px, py)
         local sz = foot:getSize()
         foot:paintTo(bb, px + (W - sz.w) / 2, py + H - (self._FOOT_H - sz.h) / 2 - sz.h)
     end
-    -- 底栏左右按钮文字
-    local okL, lt = pcall(function()
-        return TextWidget:new{ text = "‹ 上一页", face = self:_fc(),
-            fgcolor = Blitbuffer.COLOR_BLACK }
-    end)
-    if okL and lt then lt:paintTo(bb, px + PAD, py + H - self._FOOT_H + (self._FOOT_H - lt:getSize().h) / 2) end
-    local okR, rt = pcall(function()
-        return TextWidget:new{ text = "下一页 ›", face = self:_fc(),
-            fgcolor = Blitbuffer.COLOR_BLACK }
-    end)
-    if okR and rt then
-        local sz = rt:getSize()
-        rt:paintTo(bb, px + W - PAD - sz.w, py + H - self._FOOT_H + (self._FOOT_H - sz.h) / 2)
-    end
 end
 function CollectibleGallery:_fc()
     if not self._faceFoot then
@@ -4522,7 +4466,7 @@ function CollectibleGallery:_pageText()
 end
 function CollectibleGallery:_footText()
     if not self._footCache then
-        local hint = (#self._cells or 0) > 0 and "点空白关闭 · 已得深框 / 未得虚纹" or "暂无收藏目标"
+        local hint = (#self._cells or 0) > 0 and "已得深框 / 未得虚纹 · 底部按钮翻页" or "暂无收藏目标"
         local ok, f = pcall(Font.getFace, Font, "cfont", 12)
         local ok2, tw = pcall(TextWidget.new, TextWidget,
             { text = hint, face = ok and f or nil, fgcolor = Blitbuffer.COLOR_DARK_GRAY })
@@ -4531,7 +4475,8 @@ function CollectibleGallery:_footText()
     return self._footCache
 end
 
--- 打开收藏品自绘图鉴弹窗
+-- 打开收藏品自绘图鉴弹窗（ButtonDialog 托管：内容渲染失败仍有关闭按钮，绝不白屏卡死）
+-- 翻页采用"每页重建 dialog"：最稳，避免自绘内容原地刷新的框架兼容风险。
 function FocusFeedback:_showCollectibleGallery()
     -- 收集列表在 event_data 缺失时也要稳定可用（本地来源始终存在）
     local okList, items = pcall(function() return self:_collectibleList() end)
@@ -4541,21 +4486,54 @@ function FocusFeedback:_showCollectibleGallery()
         self:_showMessage("暂时还没有可收集的物品目标。", 4)
         return
     end
-    local ok, gallery = pcall(function()
-        return CollectibleGallery:new{ items = items }
-    end)
-    if not (ok and gallery) then
-        self:_showMessage("自绘图鉴打开失败，请稍后再试。", 4)
-        return
+    local cur = math.max(1, self._galleryPage or 1)
+    local dialog  -- 供按钮回调关闭自身
+    local function popup(page)
+        local g = CollectibleGallery:new{ items = items, page = page }
+        if not (g and g.dimen) then
+            self:_showMessage("自绘图鉴打开失败，请稍后再试。", 4)
+            return
+        end
+        local pages = math.max(1, g.pages or 1)
+        local owned, total = 0, #(g._cells or {})
+        for _, c in ipairs(g._cells or {}) do if c.owned then owned = owned + 1 end end
+        local pct = total > 0 and math.floor(owned / total * 100 + 0.5) or 0
+        local title = string.format("特殊物品收集　%d / %d（%d%%）　·　第 %d/%d 页",
+            owned, total, pct, page, pages)
+        g.not_focusable = true
+        local okBtn, d = pcall(function()
+            return ButtonDialog:new{
+                title = title,
+                title_align = "center",
+                buttons = {
+                    {
+                        { text = "‹ 上一页", enabled = page > 1,
+                          callback = function() self._galleryPage = page - 1; UIManager:close(d); popup(page - 1) end },
+                        { text = "下一页 ›", enabled = page < pages,
+                          callback = function() self._galleryPage = page + 1; UIManager:close(d); popup(page + 1) end },
+                        { text = "关闭",
+                          callback = function() self._galleryPage = nil; UIManager:close(d) end },
+                    },
+                },
+            }
+        end)
+        if not (okBtn and d) then
+            self:_showMessage("自绘图鉴打开失败，请稍后再试。", 4)
+            return
+        end
+        local okAdd, addErr = pcall(function() d:addWidget(g) end)
+        if not okAdd then
+            logger.warn("gallery addWidget error: " .. tostring(addErr))
+            self:_showMessage("自绘图鉴打开失败，请稍后再试。", 4)
+            return
+        end
+        dialog = d
+        local okShow, errShow = pcall(function() UIManager:show(d) end)
+        if not okShow then
+            logger.warn("show collectible gallery error: " .. tostring(errShow))
+        end
     end
-    gallery.tapToCloseCallback = function() gallery:_close() end
-    local okShow, errShow = pcall(function()
-        UIManager:show(gallery)
-    end)
-    if not okShow then
-        logger.warn("show collectible gallery error: " .. tostring(errShow))
-        if errShow then self:_showMessage("自绘图鉴打开失败。", 4) end
-    end
+    popup(math.max(1, math.min(cur, items and math.ceil(#items / 15) or 1)))
 end
 
 -- 书的信息弹窗：生日/成年日/年龄/六维属性（含六边形雷达图）
