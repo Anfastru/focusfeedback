@@ -4282,17 +4282,15 @@ local CollectibleGallery = WidgetContainer:extend{
     is_visible = true,
 }
 function CollectibleGallery:init()
-    -- 内容区尺寸（约占屏；由外部 ButtonDialog 托管生命周期/关闭，避免顶层 show 卡死）
+    -- 尺寸：默认约占屏；若构造时传入 width/height 则用之（供 ButtonDialog 内容区适配）
     local Win = Screen:getWidth() or 600
     local Hin = Screen:getHeight() or 800
-    self.width = math.max(80, math.floor(Win * 0.92))
-    -- 高度留足给 ButtonDialog 的标题+底部按钮，确保“上一页/下一页/关闭”永远可见
-    self.height = math.max(120, math.floor(Hin * 0.52))
+    if not self.width or self.width <= 0 then self.width = math.max(80, math.floor(Win * 0.92)) end
+    -- 高度默认留足给底部按钮，确保按钮永远可见
+    if not self.height or self.height <= 0 then self.height = math.max(120, math.floor(Hin * 0.5)) end
     self.dimen = Geom:new{ w = self.width, h = self.height }
     self.not_focusable = true
     self.is_visible = true
-    -- 吞掉网格内所有点按：空白处绝不翻页/滚动（只靠底部按钮操作）
-    self.onTapEvent = function() return true end
     -- 布局参数（scaleBySize 保证跨屏自适应）
     local PAD = Screen:scaleBySize(14)
     local TITLE_H = Screen:scaleBySize(42)
@@ -4491,48 +4489,56 @@ function FocusFeedback:_showCollectibleGallery()
         return
     end
     local cur = math.max(1, self._galleryPage or 1)
-    local dialog  -- 供按钮回调关闭自身
     local function popup(page)
-        local g = CollectibleGallery:new{ items = items, page = page }
+        -- 与插件内已验证可用的雷达弹窗保持同构：定宽、内容不滚动、not_focusable、按钮用 UIManager:close(dialog)
+        local border_w = Size.border.window
+        local padding_w = Size.padding.default
+        local dialog_width = Screen:scaleBySize(560)
+        local avail_w = math.max(80, dialog_width - 2 * (border_w + padding_w))
+        local avail_h = math.max(120, math.floor(Screen:getHeight() * 0.5))
+
+        local g = CollectibleGallery:new{ items = items, page = page, width = avail_w, height = avail_h }
         if not (g and g.dimen) then
             self:_showMessage("自绘图鉴打开失败，请稍后再试。", 4)
             return
         end
         local pages = math.max(1, g.pages or 1)
-        local owned, total = 0, #(g._cells or {})
-        for _, c in ipairs(g._cells or {}) do if c.owned then owned = owned + 1 end end
-        local pct = total > 0 and math.floor(owned / total * 100 + 0.5) or 0
-        local title = string.format("特殊物品收集　%d / %d（%d%%）　·　第 %d/%d 页",
-            owned, total, pct, page, pages)
-        g.not_focusable = true
-        local okBtn, d = pcall(function()
-            return ButtonDialog:new{
-                title = title,
-                title_align = "center",
-                buttons = {
-                    {
-                        { text = "‹ 上一页", enabled = page > 1,
-                          callback = function() self._galleryPage = page - 1; UIManager:close(d); popup(page - 1) end },
-                        { text = "下一页 ›", enabled = page < pages,
-                          callback = function() self._galleryPage = page + 1; UIManager:close(d); popup(page + 1) end },
-                        { text = "关闭",
-                          callback = function() self._galleryPage = nil; UIManager:close(d) end },
-                    },
+
+        local dialog
+        dialog = ButtonDialog:new{
+            title = "",
+            title_align = "center",
+            width = dialog_width,
+            scrollable_content = false,
+            buttons = {
+                {
+                    { text = "上一页", enabled = page > 1,
+                      callback = function()
+                          self._galleryPage = page - 1
+                          UIManager:close(dialog)
+                          popup(page - 1)
+                      end },
+                    { text = "下一页", enabled = page < pages,
+                      callback = function()
+                          self._galleryPage = page + 1
+                          UIManager:close(dialog)
+                          popup(page + 1)
+                      end },
+                    { text = "关闭",
+                      callback = function()
+                          self._galleryPage = nil
+                          UIManager:close(dialog)
+                      end },
                 },
-            }
-        end)
-        if not (okBtn and d) then
-            self:_showMessage("自绘图鉴打开失败，请稍后再试。", 4)
-            return
-        end
-        local okAdd, addErr = pcall(function() d:addWidget(g) end)
+            },
+        }
+        local okAdd, addErr = pcall(function() dialog:addWidget(g) end)
         if not okAdd then
             logger.warn("gallery addWidget error: " .. tostring(addErr))
             self:_showMessage("自绘图鉴打开失败，请稍后再试。", 4)
             return
         end
-        dialog = d
-        local okShow, errShow = pcall(function() UIManager:show(d) end)
+        local okShow, errShow = pcall(function() UIManager:show(dialog) end)
         if not okShow then
             logger.warn("show collectible gallery error: " .. tostring(errShow))
         end
