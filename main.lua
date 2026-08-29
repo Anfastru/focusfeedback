@@ -4587,6 +4587,14 @@ function FocusFeedback:_showBookInfo(entry)
         buttons = {
             {
                 {
+                    -- 赠送四叶草：消耗仓库四叶草，许愿属性并好感+1
+                    text = string.format("赠送四叶草(×%d)", (self:_readInventory().clover or 0)),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:_giftWishPanel(entry)
+                    end,
+                },
+                {
                     text = "关闭",
                     callback = function()
                         UIManager:close(dialog)
@@ -4656,6 +4664,135 @@ function FocusFeedback:_showBookInfo(entry)
     content.not_focusable = true
     dialog:addWidget(content)
     UIManager:show(dialog)
+end
+
+-- ========== 赠送四叶草（V22）==========
+-- 六维相对轴：审美⇄知识、情感⇄逻辑、阅历⇄辩证（与雷达图一致）
+local CLOVER_KEYS = { "审美", "知识", "情感", "逻辑", "阅历", "辩证" }
+local CLOVER_AXIS = { ["审美"] = "知识", ["知识"] = "审美", ["情感"] = "逻辑", ["逻辑"] = "情感", ["阅历"] = "辩证", ["辩证"] = "阅历" }
+local function _clampN(v, lo, hi)
+    if v < lo then return lo elseif v > hi then return hi end
+    return v
+end
+
+-- 许愿面板：六维单选 + 跳过（纯随机）+ 返回
+function FocusFeedback:_giftWishPanel(entry)
+    if not entry then return end
+    local inv = self:_readInventory()
+    if (inv.clover or 0) < 1 then
+        self:_showMessage("没有四叶草了><\n四叶草可在商超购买。", 4)
+        self:_showBookInfo(entry)   -- 回到档案
+        return
+    end
+    local e = entry
+    do
+        local c = self:_readCollection()
+        for _, x in ipairs(c) do if x.index == entry.index then e = x break end end
+    end
+    local attrs = (type(e.attributes) == "table" and next(e.attributes) and e.attributes) or (self:_readAttributes() or {})
+    local dims = { { "审美", "情感", "阅历" }, { "知识", "逻辑", "辩证" } }
+    local buttons = {}
+    for _, row in ipairs(dims) do
+        local btns = {}
+        for _, key in ipairs(row) do
+            local v = attrs[key] or 0
+            table.insert(btns, {
+                text = string.format("%s %d", key, v),
+                callback = function() self:_giftResolve(entry, key) end,
+            })
+        end
+        table.insert(buttons, btns)
+    end
+    table.insert(buttons, {
+        { text = "跳过(纯随机)", callback = function() self:_giftResolve(entry, nil) end },
+        { text = "返回", callback = function() self:_showBookInfo(entry) end },
+    })
+    UIManager:show(ButtonDialog:new{
+        title = string.format("赠送四叶草×%d · 给%s", inv.clover or 0, self:_nick(entry)),
+        title_align = "center",
+        width = Screen:scaleBySize(560),
+        scrollable_content = false,
+        buttons = buttons,
+    })
+end
+
+function FocusFeedback:_giftResolve(entry, wish)
+    local ok, text = self:_doGiftClover(entry, wish)
+    self:_showMessage(text, 5)
+    self:_showBookInfo(entry)   -- 刷新档案（库存/好感/属性）
+end
+
+-- 核心：判定落点 + 扣四叶草 + 属性更新 + 好感+1
+-- 返回 (成功?, 提示文本)。失败(属性已满/无草)则不消耗、不加好感。
+function FocusFeedback:_doGiftClover(entry, wish)
+    if not entry then return false, "找不到这本书。" end
+    local inv = self:_readInventory()
+    if (inv.clover or 0) < 1 then return false, "没有四叶草了><\n四叶草可在商超购买。" end
+    local c = self:_readCollection()
+    local e
+    for _, x in ipairs(c) do if x.index == entry.index then e = x break end end
+    e = e or entry
+    local attrs = type(e.attributes) == "table" and e.attributes or nil
+    if not attrs or next(attrs) == nil then
+        attrs = self:_readAttributes() or {}
+        e.attributes = attrs
+    end
+    local favor = self:_getFavor(e)
+
+    -- 1) 判定目标属性
+    local target, note
+    if wish then
+        -- 许愿：成功率随好感线性 + 随机扰动
+        local p = _clampN(0.45 + 0.0035 * favor + (math.random() - 0.5) * 0.10, 0.10, 0.85)
+        local opp = CLOVER_AXIS[wish]
+        if math.random() <= p then
+            target = wish
+            note = string.format("四叶草的祝福被它欣然接受：%s", wish)
+        else
+            -- 失败：低好感越偏向对立轴
+            local q = _clampN(0.68 - 0.0030 * favor, 0.35, 0.85)
+            if opp and math.random() <= q then
+                target = opp
+                note = string.format("它有些心不在焉，祝福偏向了相对属性（%s）", opp)
+            else
+                local others = {}
+                for _, k in ipairs(CLOVER_KEYS) do
+                    if k ~= wish and k ~= opp then others[#others + 1] = k end
+                end
+                target = others[math.random(#others)]
+                note = string.format("祝福没能传到心坎，随机偏落在（%s）", target)
+            end
+        end
+    else
+        -- 跳过：纯随机
+        target = CLOVER_KEYS[math.random(#CLOVER_KEYS)]
+        note = "它承接了一片随心的四叶草"
+    end
+
+    -- 2) 轴处理：对轴和不满100净增，满100则从对轴转移
+    local opp = CLOVER_AXIS[target]
+    local tv = attrs[target] or 0
+    local ov = attrs[opp] or 0
+    if tv >= 100 then
+        return false, string.format("%s 已到上限（100%%），四叶草无法再提升它。", target)
+    end
+    if (tv + ov) >= 100 then
+        if ov <= 0 then
+            return false, string.format("%s 已达上限，四叶草无法再提升。", target)
+        end
+        attrs[target] = tv + 1
+        attrs[opp] = ov - 1
+    else
+        attrs[target] = tv + 1
+    end
+
+    -- 3) 消耗四叶草 + 好感+1（主动投入，不受模恐跳过影响，直接走 collection）
+    inv.clover = inv.clover - 1
+    self:_saveInventory(inv)
+    e.favor = math.max(-100, math.min(100, math.floor((type(e.favor) == "number" and e.favor or 0) + 1)))
+    self:_saveCollection(c)
+
+    return true, string.format("%s　·　%s %d%%", note, target, attrs[target] or 0)
 end
 
 -- 读完书籍列表
