@@ -4286,10 +4286,13 @@ function CollectibleGallery:init()
     local Win = Screen:getWidth() or 600
     local Hin = Screen:getHeight() or 800
     self.width = math.max(80, math.floor(Win * 0.92))
-    self.height = math.max(120, math.floor(Hin * 0.66))
+    -- 高度留足给 ButtonDialog 的标题+底部按钮，确保“上一页/下一页/关闭”永远可见
+    self.height = math.max(120, math.floor(Hin * 0.52))
     self.dimen = Geom:new{ w = self.width, h = self.height }
     self.not_focusable = true
     self.is_visible = true
+    -- 吞掉网格内所有点按：空白处绝不翻页/滚动（只靠底部按钮操作）
+    self.onTapEvent = function() return true end
     -- 布局参数（scaleBySize 保证跨屏自适应）
     local PAD = Screen:scaleBySize(14)
     local TITLE_H = Screen:scaleBySize(42)
@@ -4324,17 +4327,18 @@ function CollectibleGallery:init()
     if okN and okS and faceN and faceS then
         local maxB = math.max(6, math.floor(cell_w / 16 * 2))  -- 中文约 3 字节/字，留余量
         for _, it in ipairs(self.items) do
-            local cwTxt, cw = pcall(TextWidget.new, TextWidget, {
+            -- pcall 返回 (ok, widget)：first=布尔成功标志，second=真 widget
+            local okName, nameWidget = pcall(TextWidget.new, TextWidget, {
                 text = clipUTF8(it.name or it.key, maxB), face = faceN,
                 fgcolor = Blitbuffer.COLOR_BLACK,
             })
-            local csTxt, cs = pcall(TextWidget.new, TextWidget, {
+            local okSrc, srcWidget = pcall(TextWidget.new, TextWidget, {
                 text = clipUTF8(it.group or "", maxB), face = faceS,
                 fgcolor = Blitbuffer.COLOR_DARK_GRAY,
             })
             -- 只保留真 widget（table）；创建失败一律置 nil，杜绝 boolean 混入导致绘制崩溃
-            local nameWidget = type(cwTxt) == "table" and cwTxt or nil
-            local srcWidget = type(csTxt) == "table" and csTxt or nil
+            nameWidget = okName and type(nameWidget) == "table" and nameWidget or nil
+            srcWidget = okSrc and type(srcWidget) == "table" and srcWidget or nil
             table.insert(self._cells, {
                 name = nameWidget, src = srcWidget,
                 owned = it.owned or false,
