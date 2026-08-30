@@ -244,6 +244,9 @@ local ATTR_EVENT_GAIN = 0.4         -- 普通事件 +0.4%
 local ATTR_SPECIAL_GAIN = 1         -- 特殊事件 +1%
 local ATTR_BOOKMARK_GAIN = 0.1      -- 书签掉落 +0.1%
 
+-- V23 出门（冒险事件链）数据表（在下文"出门（V23）"处填充）
+local RETURN_EVENTS = {}
+
 -- 长期模式周期配置（天数/目标阅读天数/目标时长/入场费/物品奖励数/积分/低落卡/睡眠卡）
 local LONG_CYCLES = {
     {days = 21,  target_days = 20, target_sec = 25 * 3600,    fee = 0,  reward_items = 1, reward_pts = 0,  mood_card = 0,  sleep_card = 0},
@@ -2668,6 +2671,9 @@ function FocusFeedback:_getItemDisplayName(key)
     -- V18: 成长型事件链纪念品
     local mdef = self:_mokouSouvenirDef(key)
     if mdef then return mdef.name end
+    -- V23: 出门（冒险事件链）特殊纪念品
+    local odef = self:_outdoorSouvenirDef(key)
+    if odef then return odef.name end
     return names[key] or key
 end
 
@@ -2704,6 +2710,9 @@ function FocusFeedback:_getItemIntro(key)
     -- V18: 成长型事件链纪念品介绍
     local mdef = self:_mokouSouvenirDef(key)
     if mdef then return mdef.intro end
+    -- V23: 出门特殊纪念品介绍
+    local odef = self:_outdoorSouvenirDef(key)
+    if odef then return odef.intro end
     return "一个神秘的物品。"
 end
 
@@ -2717,6 +2726,12 @@ function FocusFeedback:_collectibleKeys()
     end
     for _, grp in ipairs(COLLECTIBLE_CHAIN_ENDINGS) do
         for _, eid in ipairs(grp.endings) do set[grp.prefix .. eid] = true end
+    end
+    -- V23: 出门特殊纪念品
+    for _, evt in ipairs(RETURN_EVENTS) do
+        for _, o in ipairs(evt.options) do
+            if o.special and o.special.key then set[o.special.key] = true end
+        end
     end
     return set
 end
@@ -2761,6 +2776,16 @@ function FocusFeedback:_collectibleList()
             local key = tostring(grp.prefix or "") .. tostring(eid or "")
             local mdef = self:_mokouSouvenirDef(key)
             push(src, key, mdef and mdef.name or eid, mdef and mdef.intro or "")
+        end
+    end
+    -- ⑥ 出门（冒险事件链）特殊纪念品
+    local seen = {}
+    for _, evt in ipairs(RETURN_EVENTS or {}) do
+        for _, o in ipairs(evt.options or {}) do
+            if o.special and o.special.key and not seen[o.special.key] then
+                seen[o.special.key] = true
+                push("出门纪念品", o.special.key, o.special.name, o.special.intro)
+            end
         end
     end
     return list
@@ -4546,6 +4571,49 @@ function FocusFeedback:_showCollectibleGallery()
     popup(math.max(1, math.min(cur, items and math.ceil(#items / 15) or 1)))
 end
 
+-- ========== 九型性格（V23）连续映射 ==========
+local NINE_KEYS = { "知识", "审美", "情感", "逻辑", "辩证", "阅历" }
+local NINE_NAMES = { "完美主义者", "助人者", "成就者", "浪漫主义者", "观察者", "忠诚者", "享乐者", "挑战者", "和平者" }
+-- 九个原型点（高=70 中=50 低=30，顺序与 NINE_KEYS 一致）
+local NINE_ARCH = {
+    { 50, 50, 30, 70, 50, 50 },   -- 1 完美主义者
+    { 30, 50, 70, 30, 50, 30 },   -- 2 助人者
+    { 50, 50, 50, 70, 30, 70 },   -- 3 成就者
+    { 30, 70, 70, 30, 50, 30 },   -- 4 浪漫主义者
+    { 70, 30, 30, 70, 50, 50 },   -- 5 观察者
+    { 30, 30, 50, 50, 70, 50 },   -- 6 忠诚者
+    { 30, 50, 50, 30, 70, 70 },   -- 7 享乐者
+    { 50, 30, 30, 50, 70, 70 },   -- 8 挑战者
+    { 50, 50, 50, 30, 30, 70 },   -- 9 和平者
+}
+-- 计算连续映射九型：返回 {num, name, wing(邻号), affinity}
+function FocusFeedback:_nineType(attrs)
+    attrs = attrs or {}
+    local function dist(p)
+        local s = 0
+        for i, k in ipairs(NINE_KEYS) do
+            local d = ((attrs[k] or 0) - p[i])
+            s = s + d * d
+        end
+        return math.sqrt(s)
+    end
+    local ds = {}
+    local best, best_d = 1, math.huge
+    for i = 1, #NINE_ARCH do
+        local d = dist(NINE_ARCH[i])
+        ds[i] = d
+        if d < best_d then best, best_d = i, d end
+    end
+    -- 侧翼＝主型两个邻号中较近者（九型圆环相邻，1↔9）
+    local n1 = ((best - 2) % 9) + 1
+    local n2 = (best % 9) + 1
+    local wing = (ds[n1] <= ds[n2]) and n1 or n2
+    -- 亲和度＝距离反算（典型贴合约 80% 上下）
+    local aff = math.floor(100 - best_d / 2.5)
+    aff = math.max(5, math.min(99, aff))
+    return { num = best, name = NINE_NAMES[best], wing = wing, affinity = aff }
+end
+
 -- 书的信息弹窗：生日/成年日/年龄/六维属性（含六边形雷达图）
 function FocusFeedback:_showBookInfo(entry)
     local book = self.book_data[entry.index] or { title = "未知", author = "", quote = "" }
@@ -4592,6 +4660,14 @@ function FocusFeedback:_showBookInfo(entry)
                     callback = function()
                         UIManager:close(dialog)
                         self:_giftWishPanel(entry)
+                    end,
+                },
+                {
+                    -- 出门：消耗10积分开一局冒险事件，暗线好感+1
+                    text = "出门(10积分)",
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:_outdoorStart(entry)
                     end,
                 },
                 {
@@ -4649,6 +4725,16 @@ function FocusFeedback:_showBookInfo(entry)
 
     -- 基本信息
     table.insert(parts, VerticalSpan:new{ width = Size.padding.small })
+
+    -- 九型性格（连续映射，只显示主型+侧翼+亲和度）
+    local ok_nt, nt = pcall(function() return self:_nineType(attrs) end)
+    if ok_nt and nt and nt.name then
+        table.insert(parts, centerIn(TextWidget:new{
+            text = string.format("%s %dw%d · 亲和 %d%%", nt.name, nt.num, nt.wing, nt.affinity),
+            face = Font:getFace("cfont", 16),
+        }, avail_w))
+    end
+
     table.insert(parts, centerIn(TextWidget:new{
         text = string.format("生日 %s　|　年龄 %s", formatDate(entry.adopt_date), age_text),
         face = Font:getFace("cfont", 14),
@@ -4664,6 +4750,377 @@ function FocusFeedback:_showBookInfo(entry)
     content.not_focusable = true
     dialog:addWidget(content)
     UIManager:show(dialog)
+end
+
+-- ========== 出门（V23）冒险事件链 ==========
+-- 共 18 个事件，每事件三选一；不标难度/属性（文案中的难度仅供作者，引擎忽略）。
+-- 成败由契合分 f 判定（属性主导+好感+阅读）。成功统一走掉档/特殊纪念品；失败扣心情。
+RETURN_EVENTS = {
+    { intro = "①xx出门了，它遇见了一只巨型美洲狮，你会建议它：", options = {
+        { text = "抚摸这个萌物。", attr = "审美",
+          succ = "美洲狮愉悦地蹭了蹭xx。", fail = "美洲狮感觉被冒犯了，朝着xx一顿嘶吼。" },
+        { text = "骑着美洲狮跑来跑去。", attr = "知识",
+          succ = "xx骑着美洲狮，在狮子宽阔的背上看到了很多它平时看不见的风景。",
+          fail = "你你你把我当什么了？！美洲狮不可置信地把xx甩了下来，并抢了它一些钱当作自己的精神损失费。" },
+        { text = "收养美洲狮。", attr = "情感",
+          succ = "xx成功收养了美洲狮，它家里多了一个巨大的家伙。", fail = "不自量力的xx被美洲狮咬成了重伤……需要住院疗养。" },
+    }},
+    { intro = "②xx出门了，它来到了整个城市的最高处，你觉得那里是：", options = {
+        { text = "珠穆朗玛峰。", attr = "知识",
+          succ = "是的，那是人类精神的高峰。", fail = "傻子，珠穆朗玛峰不在城市里。" },
+        { text = "一颗不断跳动的心脏。", attr = "情感",
+          succ = "只祈祷不要失去这颗心。", fail = "xx太重了，心脏被它踩扁了。" },
+        { text = "高层大气。", attr = "逻辑",
+          succ = "它俯瞰着地面，看到了它想要知道的一切。",
+          fail = "什么鬼，xx又不能飞，你非要让它去高层大气，害它摔死了。" },
+    }},
+    { intro = "③xx出门了，它来到一家KTV，你会建议它：", options = {
+        { text = "进去唱一首美丽的歌。", attr = "情感",
+          succ = "全KTV的人都被xx美丽的歌声迷住了……乖乖支付了演唱会门票钱。", fail = "xx唱得特别难听，被所有人讨厌了。" },
+        { text = "这与你的计划无关，离开。", attr = "逻辑",
+          succ = "xx听从了你的建议，离开了。被暗中观察的人类记者评为秩序标兵小书。",
+          fail = "xx失去了一个实现它的歌手梦的机会……" },
+        { text = "进门看看有没有认识的书。", attr = "阅历",
+          succ = "xx走了进去，发现它的一些好朋友在这里，xx获得了一些免费瓜子。",
+          fail = "xx走了进去，但环顾一圈发现有0个认识的书，xx感觉好尴尬。",
+          special = { key = "person", name = "人脉的力量", intro = "人脉的力量，就是能够让你吃到KTV免费瓜子。" } },
+    }},
+    { intro = "④xx出门了，但在它打开门的时候，发现门外有一具陌生的尸体，你会建议它：", options = {
+        { text = "报警。", attr = "逻辑",
+          succ = "警察同志接到报警电话，马上上门来带走了尸体。",
+          fail = "大胆！体制内警察怎么样你不知道吗？！警察来了，但是随便问了几句就走了，留下xx和尸体大眼瞪小眼。" },
+        { text = "别傻了，世界上有死人很正常。", attr = "阅历",
+          succ = "xx视若无睹地绕过它出了门，度过了愉悦的一天。",
+          fail = "xx努力想要无视它，但它失败了，只好硬着头皮把尸体处理掉。" },
+        { text = "高端的食材往往只需要最朴素的烹饪方式。", attr = "辩证",
+          succ = "xx虽然是第一次煮尸体，但它的厨艺天赋让它获得了大成功，美味尸体品鉴中。",
+          fail = "太搞笑了，居然有一本书想吃尸体。好难吃。好难吃。" },
+    }},
+    { intro = "⑤xx出门了，来到一家电影院，你会建议它：", options = {
+        { text = "看一部《肖申克的救赎》。", attr = "阅历",
+          succ = "经过你的一番选择，xx已经对豆瓣电影top250了如指掌。", fail = "xx看完了，但感觉自己变得很土。" },
+        { text = "看一部漫威。", attr = "辩证",
+          succ = "xx无可救药地爱上这些紧身衣人类。", fail = "就这样，小xx的人生被毁了。" },
+        { text = "看一部《圣山》。", attr = "审美",
+          succ = "xx在这大型艺术装置面前，唯有沉默……",
+          fail = "哇，你居然认为这么艺术的电影能够上院线，有点辱佐杜洛夫斯基了。",
+          special = { key = "saint", name = "圣山", intro = "朋友，看镜头。" } },
+    }},
+    { intro = "⑥xx出门了，它来到一家医院。你会建议它：", options = {
+        { text = "去应聘当医生。", attr = "辩证",
+          succ = "经过一番拉扯，xx居然真的通过笔试面试成为了一名医生。社会地位大提高！", fail = "不出所料，xx被赶了出来。" },
+        { text = "偷件白大褂做晴天娃娃。", attr = "审美",
+          succ = "医生失去的只是一件白大褂，xx得到的可是一个挂在窗户外美丽摇曳的晴天娃娃啊！！",
+          fail = "医生发现了xx的行为，生气地把它赶了出去。" },
+        { text = "做一套全身体检。", attr = "知识",
+          succ = "xx做了一套全身体检，发现自己非常健康。",
+          fail = "xx做了一套全身体检，结果，检查出来了……弱智……" },
+    }},
+    { intro = "⑦xx出门了，它来到一个殡仪馆，你会建议它：", options = {
+        { text = "随机开棺欣赏一下尸体面容。", attr = "审美",
+          succ = "xx看到了一些美丽尸体，并顺手偷了一些陪葬品。", fail = "xx开第一口棺的时候就被发现了。" },
+        { text = "分析一下尸体成分。", attr = "知识",
+          succ = "xx认真地研究了一下它们，发现那是一些肉、氧气和感情。",
+          fail = "xx将尸体切片放在显微镜下，但还没来得及观察，就被腐烂的味道熏晕了。" },
+        { text = "亲吻。", attr = "情感",
+          succ = "xx亲吻了一具将不会再出现于地面之上的肉身，感觉内心被丰沛的情感充盈着。",
+          fail = "xx亲吻尸体时，对方突然诈尸了……吓晕……" },
+    }},
+    { intro = "⑧xx出门了，今天它决定完成一个恶作剧，你会建议它：", options = {
+        { text = "往浅水泳池里倒一杯水将其变成深水区。", attr = "知识",
+          succ = "xx往泳池里倒了一杯水，水位升高淹死了一位小朋友。",
+          fail = "傻xx，忘记了一杯水对人类和对书是不一样的。" },
+        { text = "为人类和书类牵线促成一对跨物种恋。", attr = "情感",
+          succ = "xx成功让一位人类爱上了读书。", fail = "很可惜，人类和书类的情感并不相通。" },
+        { text = "将一粒绿豆混入红豆池。", attr = "逻辑",
+          succ = "xx成功整蛊到了一位红绿色盲。",
+          fail = "一整天都没有人购买红豆，也没有人买绿豆，黄豆黑豆也是。" },
+    }},
+    { intro = "⑨xx出门了，这是一个雨夜，还没走多久，xx就遇到了一只鬼，你会建议它：", options = {
+        { text = "用爱感化对方。", attr = "情感",
+          succ = "鬼看着xx真诚的双眼，微笑着离开了。",
+          fail = "鬼感觉xx莫名其妙，自言自语道真是见鬼了……" },
+        { text = "驱赶它！", attr = "逻辑",
+          succ = "xx成功驱赶走了这只鬼，让周围的居民不用再提心吊胆。",
+          fail = "莫名其妙为什么要赶走鬼？xx被愤怒的鬼强制捐出一些钱用于鬼权运动的开展。" },
+        { text = "和它打招呼。", attr = "阅历",
+          succ = "xx和鬼打了个招呼，鬼友善地回应了，它们将会成为好朋友。",
+          fail = "xx和鬼打了个招呼，没想到鬼鸟都不鸟它。" },
+    }},
+    { intro = "⑩xx出门了，它路过一个美团骑手，你会建议它：", options = {
+        { text = "敬礼，致敬人民的食物守护者。", attr = "逻辑",
+          succ = "美团骑手被感动得热泪盈眶，给了xx一个塔斯汀鸡块。",
+          fail = "美团骑手感觉莫名其妙，骑着电动车走了，带起一阵烟尘。" },
+        { text = "不动声色地闻一下。", attr = "阅历",
+          succ = "xx闻到了淘宝闪购爆品团塔斯汀香辣鸡腿堡的味道，也闻到了一些生活。",
+          fail = "骑手感觉遇到变态了赶紧跑路。" },
+        { text = "偷外卖。", attr = "辩证",
+          succ = "xx成功偷走了一份淘宝闪购塔斯汀爆品团香辣鸡腿堡。",
+          fail = "xx被骑手发现了，人家本来上班就烦，还遇到这种坏东西！xx被殴打了一顿。" },
+    }},
+    { intro = "⑪xx出门了，看见天空中有个巨大的倒计时，你觉得那是：", options = {
+        { text = "地球的生命倒计时。", attr = "阅历",
+          succ = "你说得对，那是地球的生命倒计时。xx紧盯着倒计时，将手中的纸杯扔进可回收垃圾箱，空中的时间增加了一秒。",
+          fail = "那根本不是什么地球的生命倒计时！没人关心这个。" },
+        { text = "xx自己的生命倒计时。", attr = "辩证",
+          succ = "你说得对，xx剩下的每一秒它都将紧紧握在手中。",
+          fail = "那根本不是xx的生命倒计时！没人会关心一本小书还能活多久。" },
+        { text = "艺术的生命倒计时。", attr = "审美",
+          succ = "你说得对，艺术会不断死去，又不断复活。",
+          fail = "你还不明白吗？没人会关心艺术能活多久。",
+          special = { key = "tears", name = "文艺比的眼泪", intro = "谁偷走了文艺比的一滴泪？" } },
+    }},
+    { intro = "⑫xx出门了，它发现了一个kindle阅读器，你会建议它：", options = {
+        { text = "讨论一下传统纸书与电纸书的优缺点。", attr = "辩证",
+          succ = "xx和kindle进行了一次愉快的交谈。",
+          fail = "xx试图和kindle搭话，但是发现它们的语言根本不通……xx使用的是中文，kindle使用的是c语言。",
+          special = { key = "eread", name = "电纸书", intro = "电纸书是人类进步的电梯……" } },
+        { text = "欣赏一会kindle简洁美观的设计。", attr = "审美",
+          succ = "xx欣赏着kindle简洁美观的设计，沦陷了……",
+          fail = "xx感觉欣赏不来。开玩笑！论美丽，电纸书怎么能比得上纸书……" },
+        { text = "xx向kindle学习了一些理工技术。", attr = "知识",
+          succ = "通过kindle教授给它的理工技巧，xx成功为自己装上了一块屏幕，正式迈入现代社会。",
+          fail = "xx试图学习一些理工技术，可惜它智商不高，失败了……kindle放弃了这本愚笨的书。" },
+    }},
+    { intro = "⑬xx出门了，它搭乘了一辆高铁，却发现，自己的座位上有一个陌生人类。你会建议它：", options = {
+        { text = "欣赏对方的穿搭。", attr = "审美",
+          succ = "对方被xx盯得不知所措，羞涩地离开了。",
+          fail = "对方发现xx只是一个会在小红书学习主体性技巧的阳光小书，于是肆无忌惮地继续占座。" },
+        { text = "列举法条告诉对方占座的错误性。", attr = "知识",
+          succ = "对方被xx唬住了，赶紧离开。",
+          fail = "对方觉得xx小红书视频刷多了，于是肆无忌惮地继续占座。" },
+        { text = "试图用大爱感化对方。", attr = "情感",
+          succ = "对方被xx的善良和理智感动了，主动离开。",
+          fail = "对方发现xx宛如古早言情小说中的女主角，于是肆无忌惮地继续占座。" },
+    }},
+    { intro = "⑭xx出门了，却遇到热心市民催它结婚，你会建议它：", options = {
+        { text = "理性地跟对方解释自己是独身主义者。", attr = "知识",
+          succ = "对方惊叹于xx的独立和自信，夸赞了它。", fail = "很遗憾，对方看起来并不觉得这种东西会存在。" },
+        { text = "告诉对方情感不应该被体制束缚。", attr = "情感",
+          succ = "对方接受了一些更新潮的观念，若有所思地离开了。", fail = "对方看起来似乎听不明白……" },
+        { text = "告诉对方婚姻法只针对人类。", attr = "逻辑",
+          succ = "这一招真是立竿见影，对方恍然大悟地离开了。",
+          fail = "对方看起来似乎分不清楚人类与书类的区别……" },
+    }},
+    { intro = "⑮xx出门了，它今天一不小心走了很久，抬头一看居然已在银河系，你会建议它：", options = {
+        { text = "去找波江人玩玩呢。", attr = "情感",
+          succ = "岩石朋友我们喜欢你。", fail = "银河系很大，地球和波江座都那么渺小，xx并没有找到。",
+          special = { key = "nh3", name = "一瓶氨气", intro = "一个让波江朋友感到舒适的气体环境，虽然ta们无法进入这个瓶子。" } },
+        { text = "掉头沿着反方向走回去。", attr = "逻辑",
+          succ = "经过一番万里长征，xx终于回到了地球上。真是上山容易下山难啊！",
+          fail = "xx迷路了，永远迷失在了庞大的宇宙里……" },
+        { text = "造一艘飞船飞回去。", attr = "阅历",
+          succ = "你说得对，xx对此早已见怪不怪，它淡定地造了一艘飞船飞回了地球。",
+          fail = "想多了，朋友。它甚至连一块稍大一点的金属也搬不起来。" },
+    }},
+    { intro = "⑯xx出门了，路过一家五金店，你会告诉它：", options = {
+        { text = "五金店里卖五金。", attr = "逻辑",
+          succ = "xx恍然大悟。", fail = "xx的智商虽然不高，但你的智商也是更败一筹呀。" },
+        { text = "家里的水管坏了。", attr = "阅历",
+          succ = "xx购入了几颗膨胀螺丝成功修好。", fail = "xx莫名其妙地看着你。" },
+        { text = "我有网红五金店机器人自组教程。", attr = "辩证",
+          succ = "xx跟随着教程购买了所有需要的零件，并成功组装出了一件美丽的五金机器人。",
+          fail = "xx搜了一些差评避雷给你看。",
+          special = { key = "robot", name = "五金自组机器人", intro = "一个用五金店的原材料组装起来的机器人，这期走的是原始工业风。" } },
+    }},
+    { intro = "⑰xx出门了，它来到一个喷泉旁边，你会建议它：", options = {
+        { text = "往喷泉里面放一些碎纸屑。", attr = "辩证",
+          succ = "喷泉收到了一堆碎纸屑，感觉很开心，决定赠送xx一个礼物。",
+          fail = "喷泉被碎纸屑污染了，需要xx花钱净化……" },
+        { text = "许个愿吧。", attr = "审美",
+          succ = "",
+          fail = "它只是一个普通的公园喷泉，没有花里胡哨的许愿功能。",
+          sub = {
+            question = "猜猜看，xx许的愿望是？",
+            choices = {
+                { text = "A.想要很多很多爱", kind = "favor", value = 20 },
+                { text = "B.想要很多很多钱", kind = "drop" },
+            },
+          } },
+        { text = "看看里面的硬币。", attr = "知识",
+          succ = "xx捞出了里面的硬币，发现那是一块极其稀有的金币！",
+          fail = "xx想要捞出里面的硬币，却失足掉进了水里……" },
+    }},
+    { intro = "⑱xx出门了，却发现外面下起了倾盆大雨，你会建议它：", options = {
+        { text = "打伞出门。", attr = "逻辑",
+          succ = "xx打着伞出门购入了自己一直想吃的黄油，好美味！",
+          fail = "xx刚走了几百米，大风就把伞刮跑了，xx只能慌忙跑到路边的屋檐下躲雨。" },
+        { text = "待在家里。", attr = "知识",
+          succ = "xx待在家里看了一整天电视机。", fail = "xx待在家里没有事情可做，书页都快发霉了……" },
+        { text = "不打伞出门。", attr = "辩证",
+          succ = "xx变得湿漉漉的，但是雨滴落在身上的声音让它非常开心。",
+          fail = "雨水把xx的书页全都泡坏了，好难受＞＜……" },
+    }},
+}
+
+-- 出门特殊纪念品定义查询（供仓库显示）
+function FocusFeedback:_outdoorSouvenirDef(key)
+    for _, evt in ipairs(RETURN_EVENTS) do
+        for _, o in ipairs(evt.options) do
+            if o.special and o.special.key == key then return o.special end
+        end
+    end
+    return nil
+end
+
+-- 契合分 f（0~100）：属性主导 + 好感 + 阅读。越贴合本书本性越高。
+function FocusFeedback:_outdoorFit(entry, attr)
+    local attrs = entry.attributes
+    if not attrs or next(attrs) == nil then attrs = self:_readAttributes() or {} end
+    local order = {}
+    for _, k in ipairs(ATTR_KEYS) do table.insert(order, { k = k, v = attrs[k] or 0 }) end
+    table.sort(order, function(a, b) return a.v > b.v end)
+    local rank_scores = { 70, 62, 54, 38, 28, 20 }
+    local score = 20
+    for i, o in ipairs(order) do
+        if o.k == attr then score = rank_scores[i] or 20 break end
+    end
+    local favor = self:_getFavor(entry)
+    local read = (self:_recentReadSeconds() >= 6 * 3600) and 6 or 0
+    local f = score + favor * 0.15 + read
+    return math.max(0, math.min(100, f))
+end
+
+-- 成功掉档（连续滑动）：f 越高越偏高档。1=积分+20；2=积分+15 心情+10%；3=积分+15 免疫卡×1
+function FocusFeedback:_outdoorDrop(f)
+    local function lerp(a, b, t) return a + (b - a) * t end
+    local t = math.max(0, math.min(1, (f - 30) / 65))
+    local w1 = lerp(0.80, 0.10, t)
+    local w2 = lerp(0.15, 0.40, t)
+    local w3 = lerp(0.05, 0.50, t)
+    local r = math.random() * (w1 + w2 + w3)
+    local tier
+    if r < w1 then tier = 1 elseif r < w1 + w2 then tier = 2 else tier = 3 end
+    if tier == 1 then
+        self:_addPoints(20)
+        return "积分 +20"
+    elseif tier == 2 then
+        self:_addPoints(15)
+        self:_saveMood(self:_readMood() + 10)
+        return "积分 +15、心情 +10%"
+    else
+        self:_addPoints(15)
+        local inv = self:_readInventory()
+        local card = (math.random(2) == 1) and "mood_immune" or "sleep_immune"
+        inv[card] = (inv[card] or 0) + 1
+        self:_saveInventory(inv)
+        local cname = (card == "mood_immune") and "低落免疫卡" or "睡眠免疫卡"
+        return "积分 +15、" .. cname .. " ×1"
+    end
+end
+
+-- 特殊纪念品：仅标注选项、成功且 f 高时小概率开（连续，非一刀切）
+function FocusFeedback:_outdoorSpecial(f, opt)
+    if not (opt and opt.special) then return nil end
+    local p = math.max(0, math.min(30, (f - 40) / 2))
+    if math.random() * 100 > p then return nil end
+    local inv = self:_readInventory()
+    inv[opt.special.key] = (inv[opt.special.key] or 0) + 1
+    self:_saveInventory(inv)
+    return opt.special
+end
+
+-- 出门入口：需 ≥10 积分；消耗 10 积分 + 暗线好感+1（不显示）
+function FocusFeedback:_outdoorStart(entry)
+    if not entry then return end
+    local pts = self:_readPoints()
+    if pts < 10 then
+        self:_showMessage("积分不足，出门需要 10 积分。", 4)
+        return
+    end
+    self:_savePoints(pts - 10)
+    local c = self:_readCollection()
+    for _, e in ipairs(c) do
+        if e.index == entry.index then
+            local fv = type(e.favor) == "number" and e.favor or 0
+            e.favor = math.max(-100, math.min(100, fv + 1))
+            break
+        end
+    end
+    self:_saveCollection(c)
+
+    local nick = self:_nick(entry)
+    local function rep(s) return string.gsub(s or "", "xx", tostring(nick)) end
+    local evt = RETURN_EVENTS[math.random(#RETURN_EVENTS)]
+    local btns = {}
+    local dialog
+    for _, opt in ipairs(evt.options) do
+        table.insert(btns, {
+            text = rep(opt.text),
+            callback = function()
+                UIManager:close(dialog)
+                self:_outdoorResolve(entry, evt, opt)
+            end,
+        })
+    end
+    dialog = ButtonDialog:new{
+        title = rep(evt.intro),
+        title_align = "left",
+        width = Screen:scaleBySize(560),
+        buttons = btns,
+    }
+    UIManager:show(dialog)
+end
+
+-- 出门结算：契合分判定成败 → 成功掉档/特殊，失败扣心情
+function FocusFeedback:_outdoorResolve(entry, evt, opt)
+    if not opt then return end
+    local nick = self:_nick(entry)
+    local function rep(s) return string.gsub(s or "", "xx", tostring(nick)) end
+    local f = self:_outdoorFit(entry, opt.attr)
+    local success = (f + math.random(-10, 10)) >= 60
+
+    if not success then
+        self:_saveMood(self:_readMood() - 5)
+        self:_showMessage(rep(opt.fail) .. "\n\n心情 -5", 6)
+        return
+    end
+
+    -- 成功：带子分支（喷泉许愿）则先开子选择
+    if opt.sub then
+        local subDlg
+        local subBtns = {}
+        for _, ch in ipairs(opt.sub.choices) do
+            table.insert(subBtns, {
+                text = ch.text,
+                callback = function()
+                    UIManager:close(subDlg)
+                    if ch.kind == "favor" then
+                        local c = self:_readCollection()
+                        for _, e in ipairs(c) do
+                            if e.index == entry.index then
+                                local fv = type(e.favor) == "number" and e.favor or 0
+                                e.favor = math.max(-100, math.min(100, fv + ch.value))
+                                break
+                            end
+                        end
+                        self:_saveCollection(c)
+                        self:_showMessage("许愿成功！", 5)
+                    else
+                        local dropTxt = self:_outdoorDrop(f)
+                        self:_showMessage("许愿成功！\n\n" .. dropTxt, 5)
+                    end
+                end,
+            })
+        end
+        subDlg = ButtonDialog:new{
+            title = rep(opt.sub.question),
+            title_align = "left",
+            width = Screen:scaleBySize(560),
+            buttons = subBtns,
+        }
+        UIManager:show(subDlg)
+        return
+    end
+
+    -- 普通成功：掉档 + 可能特殊纪念品
+    local lines = { rep(opt.succ or "") }
+    table.insert(lines, self:_outdoorDrop(f))
+    local sp = self:_outdoorSpecial(f, opt)
+    if sp then
+        table.insert(lines, "特殊纪念品：" .. sp.name .. "（已入仓库）")
+    end
+    self:_showMessage(table.concat(lines, "\n\n"), 7)
 end
 
 -- ========== 赠送四叶草（V22）==========
@@ -4747,20 +5204,20 @@ function FocusFeedback:_doGiftClover(entry, wish)
         local opp = CLOVER_AXIS[wish]
         if math.random() <= p then
             target = wish
-            note = string.format("四叶草的祝福被它欣然接受：%s", wish)
+            note = "书愉悦地收下！"
         else
             -- 失败：低好感越偏向对立轴
             local q = _clampN(0.68 - 0.0030 * favor, 0.35, 0.85)
             if opp and math.random() <= q then
                 target = opp
-                note = string.format("它有些心不在焉，祝福偏向了相对属性（%s）", opp)
+                note = "恭喜您，许愿大失败！"
             else
                 local others = {}
                 for _, k in ipairs(CLOVER_KEYS) do
                     if k ~= wish and k ~= opp then others[#others + 1] = k end
                 end
                 target = others[math.random(#others)]
-                note = string.format("祝福没能传到心坎，随机偏落在（%s）", target)
+                note = string.format("啊哦……书并不想听你的……随机偏落在（%s）", target)
             end
         end
     else
@@ -5528,6 +5985,13 @@ function FocusFeedback:init()
         self:_savePoints(pts + 100)
         G_reader_settings:saveSetting(settingKey("v6_debug_100"), true)
         logger.info("FocusFeedback V6: test points +100, total:", pts + 100)
+    end
+    -- V23: 临时补发 +30 积分（一次性，下个版本删除此段）
+    if not G_reader_settings:isTrue(settingKey("v23_cheat_plus30")) then
+        local pts3 = self:_readPoints()
+        self:_savePoints(pts3 + 30)
+        G_reader_settings:saveSetting(settingKey("v23_cheat_plus30"), true)
+        logger.info("FocusFeedback V23: temp points +30, total:", pts3 + 30)
     end
     -- V9: 注册快捷手势动作
     pcall(function()
