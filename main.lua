@@ -5041,24 +5041,39 @@ function FocusFeedback:_outdoorStart(entry)
 
     local nick = self:_nick(entry)
     local function rep(s) return string.gsub(s or "", "xx", tostring(nick)) end
+    -- 去掉 intro 开头的圆圈编号（①②③…⑱）
+    local function stripNum(s)
+        return (s or ""):gsub("^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱]", "")
+    end
     local evt = RETURN_EVENTS[math.random(#RETURN_EVENTS)]
+    -- 与模恐事件链一致：选项文本放进正文，按键只显示大写字母 A/B/C。
+    local letters = { "A", "B", "C", "D", "E", "F", "G" }
+    local full_body = rep(stripNum(evt.intro))
+    for i, opt in ipairs(evt.options) do
+        full_body = full_body .. "\n\n" .. (letters[i] or ("#" .. i)) .. ". " .. rep(opt.text)
+    end
     local btns = {}
     local dialog
-    for _, opt in ipairs(evt.options) do
-        table.insert(btns, {
-            text = rep(opt.text),
-            callback = function()
-                UIManager:close(dialog)
-                self:_outdoorResolve(entry, evt, opt)
-            end,
-        })
+    for i, opt in ipairs(evt.options) do
+        btns[i] = { text = letters[i] or ("#" .. i), callback = function()
+            if dialog then UIManager:close(dialog) end
+            self:_outdoorResolve(entry, evt, opt)
+        end }
     end
     dialog = ButtonDialog:new{
-        title = rep(evt.intro),
-        title_align = "left",
+        title = "", title_align = "center",
         width = Screen:scaleBySize(560),
-        buttons = btns,
+        scrollable_content = true,   -- 文案较长时内容滚动，避免选项被挤出弹窗
+        buttons = { btns },
     }
+    local border_w = Size.border.window
+    local padding_w = Size.padding.default
+    local avail_w = dialog.width - 2 * (border_w + padding_w)
+    local bodyTW = TextBoxWidget:new{ text = full_body or "", face = Font:getFace("cfont", 20), width = avail_w }
+    bodyTW.not_focusable = true
+    local vertical = VerticalGroup:new{ align = "left", bodyTW }
+    vertical.not_focusable = true
+    dialog:addWidget(vertical)
     UIManager:show(dialog)
 end
 
@@ -5080,35 +5095,45 @@ function FocusFeedback:_outdoorResolve(entry, evt, opt)
     if opt.sub then
         local subDlg
         local subBtns = {}
-        for _, ch in ipairs(opt.sub.choices) do
-            table.insert(subBtns, {
-                text = ch.text,
-                callback = function()
-                    UIManager:close(subDlg)
-                    if ch.kind == "favor" then
-                        local c = self:_readCollection()
-                        for _, e in ipairs(c) do
-                            if e.index == entry.index then
-                                local fv = type(e.favor) == "number" and e.favor or 0
-                                e.favor = math.max(-100, math.min(100, fv + ch.value))
-                                break
-                            end
+        local subLetters = { "A", "B", "C", "D", "E", "F", "G" }
+        local sub_body = rep(opt.sub.question)
+        for i, ch in ipairs(opt.sub.choices) do
+            sub_body = sub_body .. "\n\n" .. (subLetters[i] or ("#" .. i)) .. ". " .. rep(ch.text)
+        end
+        for i, ch in ipairs(opt.sub.choices) do
+            subBtns[i] = { text = subLetters[i] or ("#" .. i), callback = function()
+                if subDlg then UIManager:close(subDlg) end
+                if ch.kind == "favor" then
+                    local c = self:_readCollection()
+                    for _, e in ipairs(c) do
+                        if e.index == entry.index then
+                            local fv = type(e.favor) == "number" and e.favor or 0
+                            e.favor = math.max(-100, math.min(100, fv + ch.value))
+                            break
                         end
-                        self:_saveCollection(c)
-                        self:_showMessage("许愿成功！", 5)
-                    else
-                        local dropTxt = self:_outdoorDrop(f)
-                        self:_showMessage("许愿成功！\n\n" .. dropTxt, 5)
                     end
-                end,
-            })
+                    self:_saveCollection(c)
+                    self:_showMessage("许愿成功！", 5)
+                else
+                    local dropTxt = self:_outdoorDrop(f)
+                    self:_showMessage("许愿成功！\n\n" .. dropTxt, 5)
+                end
+            end }
         end
         subDlg = ButtonDialog:new{
-            title = rep(opt.sub.question),
-            title_align = "left",
+            title = "", title_align = "center",
             width = Screen:scaleBySize(560),
-            buttons = subBtns,
+            scrollable_content = true,
+            buttons = { subBtns },
         }
+        local sbw = Size.border.window
+        local spw = Size.padding.default
+        local sa_w = subDlg.width - 2 * (sbw + spw)
+        local sbodyTW = TextBoxWidget:new{ text = sub_body or "", face = Font:getFace("cfont", 20), width = sa_w }
+        sbodyTW.not_focusable = true
+        local svert = VerticalGroup:new{ align = "left", sbodyTW }
+        svert.not_focusable = true
+        subDlg:addWidget(svert)
         UIManager:show(subDlg)
         return
     end
