@@ -19,6 +19,7 @@ local TextBoxWidget = require("ui/widget/textboxwidget")
 local Menu = require("ui/widget/menu")
 local Device = require("device")
 local Screen = Device.screen
+local logger = require("logger")
 
 local SETTING_REL = "v25_relations"
 local SETTING_PERS = "v25_persistent"
