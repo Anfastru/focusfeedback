@@ -55,6 +55,9 @@ local logger = require("logger")
 local _ = require("gettext")
 local Dispatcher = require("dispatcher")
 
+-- 双书关系系统（V25）
+local PairSys = require("pair_system")
+
 -- ========== 主插件类 ==========
 
 
@@ -4012,6 +4015,15 @@ function FocusFeedback:_showCollection()
         end,
     })
 
+    -- 书的关系（V25 双书关系图谱）
+    table.insert(items, {
+        text = "书的关系",
+        mandatory = nil,
+        callback = function()
+            PairSys:showRelationMap(self)
+        end,
+    })
+
     local collection_menu = Menu:new{
         title = "图鉴",
         item_table = items,
@@ -5039,11 +5051,23 @@ function FocusFeedback:_outdoorStart(entry)
     end
     self:_saveCollection(c)
 
+    -- V25：出门前询问是否邀请其他书同行（基础10已扣，邀请/指定另扣）
+    self:_outdoorPartnerAsk(entry)
+end
+
+-- 出门同行流程（V25）：邀请同行(+5) → 指定对象(+5) → 双人事件 或 回退单人出差
+function FocusFeedback:_outdoorPartnerAsk(entry)
+    PairSys:partnerAsk(self, entry)
+end
+
+-- 单人出门事件弹窗（从 _outdoorStart 抽出；不邀请同伴时回退到此）
+function FocusFeedback:_outdoorSoloDialog(entry)
+    if not entry then return end
     local nick = self:_nick(entry)
     local function rep(s) return string.gsub(s or "", "xx", tostring(nick)) end
-    -- 去掉 intro 开头的圆圈编号（①②③…⑱）
+    -- 去掉 intro 开头的圆圈编号（①…⑱ = E2 91 A0-B1，三字节字符，须整字符匹配否则残留乱码字节）
     local function stripNum(s)
-        return (s or ""):gsub("^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱]", "")
+        return (s or ""):gsub("^[\226\145\160-\177]", "")
     end
     local evt = RETURN_EVENTS[math.random(#RETURN_EVENTS)]
     -- 与模恐事件链一致：选项文本放进正文，按键只显示大写字母 A/B/C。
@@ -5087,7 +5111,7 @@ function FocusFeedback:_outdoorResolve(entry, evt, opt)
 
     if not success then
         self:_saveMood(self:_readMood() - 5)
-        self:_showMessage(rep(opt.fail) .. "\n\n心情 -5", 6)
+        self:_showOutdoorResult(rep(opt.fail), "心情 -5")
         return
     end
 
@@ -5113,10 +5137,10 @@ function FocusFeedback:_outdoorResolve(entry, evt, opt)
                         end
                     end
                     self:_saveCollection(c)
-                    self:_showMessage("许愿成功！", 5)
+                    self:_showOutdoorResult("许愿成功！", "")
                 else
                     local dropTxt = self:_outdoorDrop(f)
-                    self:_showMessage("许愿成功！\n\n" .. dropTxt, 5)
+                    self:_showOutdoorResult("许愿成功！", dropTxt)
                 end
             end }
         end
@@ -5139,13 +5163,41 @@ function FocusFeedback:_outdoorResolve(entry, evt, opt)
     end
 
     -- 普通成功：掉档 + 可能特殊纪念品
-    local lines = { rep(opt.succ or "") }
-    table.insert(lines, self:_outdoorDrop(f))
+    local reward = self:_outdoorDrop(f)
     local sp = self:_outdoorSpecial(f, opt)
     if sp then
-        table.insert(lines, "特殊纪念品：" .. sp.name .. "（已入仓库）")
+        reward = reward .. "\n\n" .. "特殊纪念品：" .. sp.name .. "（已入仓库）"
     end
-    self:_showMessage(table.concat(lines, "\n\n"), 7)
+    self:_showOutdoorResult(rep(opt.succ or ""), reward)
+end
+
+-- 出门结算弹窗：自绘 ButtonDialog，无超时倒计时数字；正文=文案，奖励单行紧凑显示在下。
+function FocusFeedback:_showOutdoorResult(body, reward)
+    local dlg = ButtonDialog:new{
+        title = "", title_align = "center",
+        width = Screen:scaleBySize(560),
+        scrollable_content = true,
+        buttons = { { { text = "确定", callback = function()
+            if dlg then UIManager:close(dlg) end
+        end } } },
+    }
+    local border_w = Size.border.window
+    local padding_w = Size.padding.default
+    local avail_w = dlg.width - 2 * (border_w + padding_w)
+    local parts = {}
+    local bodyTW = TextBoxWidget:new{ text = tostring(body or ""), face = Font:getFace("cfont", 20), width = avail_w }
+    bodyTW.not_focusable = true
+    table.insert(parts, bodyTW)
+    if reward and tostring(reward) ~= "" then
+        table.insert(parts, VerticalSpan:new{ width = Size.padding.local_small or Screen:scaleBySize(8) })
+        local rw = TextWidget:new{ text = tostring(reward), face = Font:getFace("cfont", 16) }
+        rw.not_focusable = true
+        table.insert(parts, rw)
+    end
+    local content = VerticalGroup:new{ align = "left", unpack(parts) }
+    content.not_focusable = true
+    dlg:addWidget(content)
+    UIManager:show(dlg)
 end
 
 -- ========== 赠送四叶草（V22）==========
@@ -5957,6 +6009,8 @@ function FocusFeedback:_tick()
     pcall(function() self:_chainCheck() end)
     -- V19: 好感暗线·离线（离线满7h-1 / 连续3天-10 / 超30天停扣 / 摸鱼豁免）
     pcall(function() self:_favorOfflineCheck() end)
+    -- V25: 双书关系（soulmates 判定 + 等级延时提示刷新）
+    pcall(function() PairSys:tick(self) end)
     self:_schedule()
 end
 
@@ -6003,20 +6057,6 @@ function FocusFeedback:init()
     if not G_reader_settings:isTrue(settingKey("v2_collection_cleared")) then
         self:_saveCollection({})
         G_reader_settings:saveSetting(settingKey("v2_collection_cleared"), true)
-    end
-    -- V6: 测试积分（一次性 +100，便于测试商超新物品）
-    if not G_reader_settings:isTrue(settingKey("v6_debug_100")) then
-        local pts = self:_readPoints()
-        self:_savePoints(pts + 100)
-        G_reader_settings:saveSetting(settingKey("v6_debug_100"), true)
-        logger.info("FocusFeedback V6: test points +100, total:", pts + 100)
-    end
-    -- V23: 临时补发 +30 积分（一次性，下个版本删除此段）
-    if not G_reader_settings:isTrue(settingKey("v23_cheat_plus30")) then
-        local pts3 = self:_readPoints()
-        self:_savePoints(pts3 + 30)
-        G_reader_settings:saveSetting(settingKey("v23_cheat_plus30"), true)
-        logger.info("FocusFeedback V23: temp points +30, total:", pts3 + 30)
     end
     -- V9: 注册快捷手势动作
     pcall(function()
@@ -10148,6 +10188,12 @@ function FocusFeedback:_ensureTestBooks()
         })
     end
     self:_saveCollection(c)
+    -- 测试便利：首次注入测试书时赠送 100 积分（仅一次，用标记防重复叠加）
+    local bonus = G_reader_settings:readSetting(settingKey("v4_test_bonus_100"), false)
+    if not bonus and (hasA or hasB) then
+        self:_savePoints((self:_readPoints() or 0) + 100)
+        G_reader_settings:saveSetting(settingKey("v4_test_bonus_100"), true)
+    end
 end
 
 -- 为 collection 中每本成年书（含测试书）更新 last_inbox_ts（首次）
@@ -11662,6 +11708,8 @@ function FocusFeedback:_showInboxLetters()
                     e.last_inbox_ts = now
                     changed = true
                 end
+                -- V25: 旅行日志偶发双人事件（基础5%，随关系等级微增；静默结算不弹窗）
+                pcall(function() PairSys:maybeTravelPair(self, e) end)
                 -- 清理超24h旧日志（每次最多逐条删1条，渐进式）
                 if self:_travelCleanup(e, 1) then changed = true end
             end
