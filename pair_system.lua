@@ -24,6 +24,12 @@ local SETTING_REL = "v25_relations"
 local SETTING_PERS = "v25_persistent"
 local SETTING_NOTICE = "v25_notice"
 
+-- 与 main.lua 相同的设置前缀，供本模块读写持久化
+local SETTINGS_PREFIX = "focus_feedback_"
+local function settingKey(name)
+    return SETTINGS_PREFIX .. name
+end
+
 local TH = { 0, 3.5, 4, 5, 6.5, 8 }        -- TH[k] = 相邻到 |等级|=k 所需点数
 local CAP = 5
 local DAY_SEC = 86400
@@ -569,7 +575,7 @@ function Pair:partnerAsk(ff, entry)
             solo()
         end },
     }
-    dlg = _btnDialog("出门同行", "是否邀请其他书同行？（消耗 5 积分）", { btns }, self)
+    dlg = _btnDialog("出门同行", "是否邀请其他书同行？（消耗 5 积分）", btns, self)
     UIManager:show(dlg)
 end
 
@@ -667,9 +673,9 @@ end
 
 function Pair:_showResult(body)
     local dlg
-    local btns = { { { text = "确定", callback = function()
+    local btns = { { text = "确定", callback = function()
         if dlg then UIManager:close(dlg) end
-    end } } }
+    end } }
     dlg = _btnDialog("双人事件", body, btns, self)
     UIManager:show(dlg)
 end
@@ -700,7 +706,7 @@ function Pair:_runCrush(ff, aEntry, bEntry)
         if current == 1 then body = messages[1]
         elseif current == 2 then body = messages[1]
         else body = messages[2] end
-        dlg = _btnDialog("许愿柳", body, { { { text = "确定", callback = function()
+        dlg = _btnDialog("许愿柳", body, { { text = "确定", callback = function()
             if dlg then UIManager:close(dlg) end
             click = click + 1
             if click >= 8 then
@@ -709,7 +715,7 @@ function Pair:_runCrush(ff, aEntry, bEntry)
                 return
             end
             show(click + 1)
-        end } } }, self)
+        end } }, self)
         UIManager:show(dlg)
     end
     show(1)
@@ -835,6 +841,15 @@ end
 function Pair:tick(ff)
     self:soulcheck(ff)
     self:flushNotices(ff)
+    -- 兜底：周期清理各书超72h旅行日志（不依赖"书之来信"开关/翻页，保证按序淘汰）
+    if ff and ff._travelCleanup then
+        local c = (ff._readCollection and ff:_readCollection()) or {}
+        local changed = false
+        for _, ee in ipairs(c) do
+            if ee.reveal_date and ff._travelCleanup(ff, ee, 1) then changed = true end
+        end
+        if changed and ff._saveCollection then ff:_saveCollection(c) end
+    end
 end
 
 return Pair

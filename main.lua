@@ -11669,6 +11669,10 @@ function FocusFeedback:_showInboxLetters()
     local now = os.time()
     local changed = false
     for _, e in ipairs(c) do
+        -- V25: 无条件清理该书超72h的旅行日志（不依赖来信判断，保证旧日志按序逐条淘汰）
+        if e.reveal_date then
+            if self:_travelCleanup(e, 1) then changed = true end
+        end
         if e.reveal_date and e.last_inbox_ts then
             local gap = now - e.last_inbox_ts
             if gap >= INBOX_MIN_GAP_SEC then  -- 距上次来信至少30分钟才来信
@@ -11710,8 +11714,6 @@ function FocusFeedback:_showInboxLetters()
                 end
                 -- V25: 旅行日志偶发双人事件（基础5%，随关系等级微增；静默结算不弹窗）
                 pcall(function() PairSys:maybeTravelPair(self, e) end)
-                -- 清理超24h旧日志（每次最多逐条删1条，渐进式）
-                if self:_travelCleanup(e, 1) then changed = true end
             end
         end
     end
@@ -12007,6 +12009,8 @@ function FocusFeedback:_travelInlineCheck()
     local changed = false
     for _, e in ipairs(c) do
         if e.reveal_date then   -- 所有已养成（翻开的成年书）各自动态独立
+            -- V25: 无条件清理该书超72h的旅行日志（在线阅读补记也保持按序淘汰）
+            if self:_travelCleanup(e, 1) then changed = true end
             local next = e.travel_inline or (now + 3600)
             if now >= next then
                 local letter = self:_genInboxLetter(e, 3600, now, self:_recentTravelKeys(e, 5))
@@ -12024,7 +12028,6 @@ function FocusFeedback:_travelInlineCheck()
                     self:_recordInboxCd(e, letter, now)   -- 同步冷却，进食/电影/睡觉不能再短时反复
                     e.travel_inline = now + math.random(5400, 7200)  -- 1.5~2小时后再记录一条
                     changed = true
-                    if self:_travelCleanup(e, 1) then changed = true end
                 end
             end
         end
