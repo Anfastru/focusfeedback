@@ -568,9 +568,15 @@ end
 
 -- ============ 弹窗辅助 ============
 local function _btnDialog(title, body, buttons, self_ref)
+    -- 正文统一用显式 TextBoxWidget 渲染（某些 KOReader 构建里传字符串给 info_text 会不显示正文）
+    local body_widget = TextBoxWidget:new{
+        text = body or "",
+        face = Font:getFace("x_small"),
+        width = Screen:scaleBySize(520),
+    }
     local dlg = ButtonDialog:new{
         title = title or "", title_align = "center",
-        info_text = body or "",
+        info_text = body_widget,
         width = Screen:scaleBySize(560),
         buttons = buttons,
     }
