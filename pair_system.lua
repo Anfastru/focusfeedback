@@ -567,7 +567,7 @@ function Pair:partnerAsk(ff, entry)
             solo()
         end },
     }
-    dlg = _btnDialog("出门同行", "是否邀请其他书同行？（消耗 5 积分）", { btns }, self)
+    dlg = _btnDialog("是否邀请其他书同行？", "是否邀请其他书同行？（消耗 5 积分）", { btns }, self)
     UIManager:show(dlg)
 end
 
@@ -591,7 +591,7 @@ function Pair:specifyAsk(ff, entry, others)
             randomPartner()
         end },
     }
-    dlg = _btnDialog("出门同行", "是否指定邀请对象？（消耗 5 积分）", btns, self)
+    dlg = _btnDialog("是否指定同行对象？", "是否指定邀请对象？（消耗 5 积分）", { btns }, self)
     UIManager:show(dlg)
 end
 
