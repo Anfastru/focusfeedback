@@ -373,7 +373,7 @@ function Pair:_favorMod(favor, d)
 end
 
 -- ============ 施加 delta ============
-function Pair:_applyDelta(ff, ia, ib, dAB, dBA, tag)
+function Pair:_applyDelta(ff, ia, ib, dAB, dBA, tag, quiet)
     self:setTag(tag)
     local node, key, r = self:_getRel(ff, ia, ib)
     -- 已有持久关系：点数锁定，不增减、不解除（soulmates 同理）
@@ -395,25 +395,9 @@ function Pair:_applyDelta(ff, ia, ib, dAB, dBA, tag)
     local ab_changed = node.ab ~= old_ab
     local ba_changed = node.ba ~= old_ba
     self:_saveRelations(r)
-    -- 等级变化 → 延时写提示语
-    if ab_changed then self:_queueNotice(ff, ia, ib, "AB", node.ab) end
-    if ba_changed then self:_queueNotice(ff, ia, ib, "BA", node.ba) end
     -- 稳定性检查
     self:_checkStable(ff, ia, ib)
     return node, ab_changed, ba_changed
-end
-
--- 延时提示队列（1 小时后写旅行日志）
-function Pair:_queueNotice(ff, ia, ib, side, lv)
-    local notices = G_reader_settings:readSetting(settingKey(SETTING_NOTICE), {}) or {}
-    local aN = self:_nameIdx(ff, ia)
-    local bN = self:_nameIdx(ff, ib)
-    local tag
-    if side == "AB" then tag = string.format("%s对%s", aN, bN) else tag = string.format("%s对%s", bN, aN) end
-    local word = (lv >= 0 and "亲近" or "隔阂")
-    local text = string.format("%s与%s之间，「%s · %s」似乎悄悄%s了。", aN, bN, tag, LEVEL_NAMES[lv] or tostring(lv), word)
-    table.insert(notices, { due = os.time() + HOUR_DELAY * HOUR_SEC, ia = ia, ib = ib, text = text })
-    G_reader_settings:saveSetting(settingKey(SETTING_NOTICE), notices)
 end
 
 -- ============ 持久关系分化 ============
@@ -720,7 +704,7 @@ function Pair:_runPair(ff, aEntry, bEntry)
     local aN = self:_name(ff, aEntry)
     local bN = self:_name(ff, bEntry)
     local text = self:_composeText(evt, ch, aN, bN)
-    -- 施加 delta（等级大变化由 _applyDelta→_queueNotice 延时提示，不带点数）
+    -- 施加 delta（关系为暗线，不显示、不写提示；等级持久化的分化由 _checkStable 单独处理）
     local node2, ab_changed, ba_changed = self:_applyDelta(ff, ia, ib, ch.AB, ch.BA, ch.attr)
     -- 写双方旅行日志：只记事件本身（含提示语），不刷关系（关系为暗线）
     self:_logPair(ff, ia, ib, text)
@@ -803,19 +787,8 @@ end
 
 -- 延时提示队列刷新
 function Pair:flushNotices(ff)
-    local notices = G_reader_settings:readSetting(settingKey(SETTING_NOTICE), {}) or {}
-    local now = os.time()
-    local left = {}
-    local changed = false
-    for _, n in ipairs(notices) do
-        if n.due and now >= n.due then
-            self:_logPair(ff, n.ia, n.ib, n.text or "")
-            changed = true
-        else
-            table.insert(left, n)
-        end
-    end
-    if changed then G_reader_settings:saveSetting(settingKey(SETTING_NOTICE), left) end
+    -- V26：移除"悄悄亲近/隔阂"提示后不再写入任何关系提示，此函数只负责清空既有遗留队列，避免旧数据再被写入旅行日志
+    G_reader_settings:saveSetting(settingKey(SETTING_NOTICE), {})
 end
 
 -- 关系图谱（"书的关系"菜单）
@@ -891,8 +864,9 @@ function Pair:maybeTravelPair(ff, entry)
         local aN = self:_nameIdx(ff, ia)
         local bN = self:_nameIdx(ff, ib)
         local text = self:_composeText(evt, ch, aN, bN)
-        self:_applyDelta(ff, ia, ib, ch.AB, ch.BA, ch.attr)
-        -- 只记事件本身；关系为暗线（等级大变化由 _applyDelta→_queueNotice 延时提示），不在此刷关系
+        -- 后台偶遇：静默推进，不刷"悄悄亲近/隔阂"提示（仅前台主动出门的双人事件在等级变化时才提示）
+        self:_applyDelta(ff, ia, ib, ch.AB, ch.BA, ch.attr, true)
+        -- 只记事件本身；关系为暗线（不写任何"悄悄亲近/隔阂"提示）
         self:_logPair(ff, ia, ib, text)
     end
 end
