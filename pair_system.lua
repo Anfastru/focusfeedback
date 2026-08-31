@@ -599,7 +599,7 @@ function Pair:specifyAsk(ff, entry, others)
             randomPartner()
         end },
     }
-    dlg = _btnDialog("出门同行", "是否指定邀请对象？（消耗 5 积分）", { btns }, self)
+    dlg = _btnDialog("出门同行", "是否指定邀请对象？（消耗 5 积分）", btns, self)
     UIManager:show(dlg)
 end
 
