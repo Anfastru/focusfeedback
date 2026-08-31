@@ -16,6 +16,10 @@ local Size = require("ui/size")
 local Font = require("ui/font")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local TextBoxWidget = require("ui/widget/textboxwidget")
+local TextWidget = require("ui/widget/textwidget")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local Geom = require("ui/geometry")
+local Blitbuffer = require("ffi/blitbuffer")
 local Menu = require("ui/widget/menu")
 local Device = require("device")
 local Screen = Device.screen
@@ -792,41 +796,439 @@ function Pair:flushNotices(ff)
 end
 
 -- 关系图谱（"书的关系"菜单）
-function Pair:showRelationMap(ff)
+-- ============ V27 自绘星图 ============
+-- 复用 V20 雷达图 / V21 收藏墙已验证的绘制原语与"ButtonDialog 托管 + 底部按钮"模式。
+-- 中心模式：中心=当前查看的书，其他书按关系等级排布在同心环上（正等级近、0 居中、负等级远）。
+-- 全局模式：所有书均匀排布在圆周上，有关系者连线。
+-- 点击节点 → 关系详情（中心模式）或切换为中心模式（全局模式）。
+-- 点数保持暗线，任何地方不显示。
+
+-- UTF-8 安全字节截断（与 main.lua 同款，独立副本，避免跨模块依赖）
+local function clipUTF8(s, maxBytes)
+    s = tostring(s or "")
+    if #s <= maxBytes then return s end
+    local t = string.sub(s, 1, maxBytes)
+    while #t > 0 do
+        local last = string.byte(t, -1)
+        if last and last >= 0x80 and last <= 0xBF then t = string.sub(t, 1, -2)
+        else break end
+    end
+    while #t > 0 do
+        local last = string.byte(t, -1)
+        if last and last >= 0xC0 then t = string.sub(t, 1, -2)
+        else break end
+    end
+    return t .. "…"
+end
+
+local StarMap = WidgetContainer:extend{
+    ff = nil,
+    pair = nil,
+    mode = "center",       -- "center" | "global"
+    center_idx = nil,
+    page = 1,
+    pageSize = 18,
+    width = nil,
+    height = nil,
+    not_focusable = true,
+    is_visible = true,
+}
+
+function StarMap:init()
+    local Win = Screen:getWidth() or 600
+    local Hin = Screen:getHeight() or 800
+    if not self.width or self.width <= 0 then self.width = math.max(200, math.floor(Win * 0.94)) end
+    if not self.height or self.height <= 0 then self.height = math.max(240, math.floor(Hin * 0.72)) end
+    self.dimen = Geom:new{ w = self.width, h = self.height }
+    self.not_focusable = true
+    self.is_visible = true
+    self._absX, self._absY = 0, 0
+    self:_buildLayout()
+end
+
+function StarMap:getSize() return self.dimen end
+function StarMap:getWidth() return self.width end
+function StarMap:getHeight() return self.height end
+function StarMap:getInnerSize() return { w = self.width, h = self.height } end
+
+function StarMap:_buildLayout()
+    local ff = self.ff
+    local pair = self.pair
+    local collection = ff:_readCollection() or {}
+    local nodes = {}
+    if self.mode == "center" then
+        local center = self.center_idx
+        for _, e in ipairs(collection) do
+            if e.index ~= center then
+                local node = pair:_getRel(ff, center, e.index)
+                nodes[#nodes + 1] = { idx = e.index, name = pair:_name(ff, e), lv = node.ab or 0, rel = node.rel }
+            end
+        end
+        table.sort(nodes, function(a, b)
+            if a.lv ~= b.lv then return a.lv > b.lv end
+            return a.name < b.name
+        end)
+    else
+        for _, e in ipairs(collection) do
+            nodes[#nodes + 1] = { idx = e.index, name = pair:_name(ff, e), lv = 0, rel = nil }
+        end
+        table.sort(nodes, function(a, b) return a.name < b.name end)
+    end
+    self._all = nodes
+    self.pages = math.max(1, math.ceil(#nodes / self.pageSize))
+    if self.page < 1 then self.page = 1 elseif self.page > self.pages then self.page = self.pages end
+    local start = (self.page - 1) * self.pageSize
+    local shown = {}
+    for i = 1, self.pageSize do
+        local idx = start + i
+        if idx > #nodes then break end
+        shown[#shown + 1] = nodes[idx]
+    end
+    self._shown = shown
+    -- 位置计算
+    local W, H = self.width, self.height
+    local cx, cy = W / 2, H / 2
+    local R = math.min(W, H) / 2
+    -- 环定义（由近到远）：正等级近、0 居中、负等级远
+    local rings = {
+        { r = R * 0.30, lo = 3, hi = 5 },
+        { r = R * 0.52, lo = 1, hi = 2 },
+        { r = R * 0.74, lo = 0, hi = 0 },
+        { r = R * 0.90, lo = -5, hi = -1 },
+    }
+    local ringBuckets = { {}, {}, {}, {} }
+    for _, n in ipairs(shown) do
+        local lv = n.lv or 0
+        local slot = 3
+        for ri, rg in ipairs(rings) do
+            if lv >= rg.lo and lv <= rg.hi then slot = ri break end
+        end
+        ringBuckets[slot][#ringBuckets[slot] + 1] = n
+    end
+    local nodeR = math.max(6, Screen:scaleBySize(9))
+    self._nodeR = nodeR
+    for ri, bucket in ipairs(ringBuckets) do
+        local cnt = #bucket
+        if cnt > 0 then
+            local r = rings[ri].r
+            local step = 2 * math.pi / cnt
+            for i, n in ipairs(bucket) do
+                local ang = -math.pi / 2 + (i - 1) * step
+                n.x = cx + r * math.cos(ang)
+                n.y = cy + r * math.sin(ang)
+                n.r = nodeR
+            end
+        end
+    end
+    -- 中心节点（中心模式）
+    self._centerNode = nil
+    if self.mode == "center" then
+        local ce = pair:_entryOf(ff, self.center_idx)
+        if ce then
+            self._centerNode = {
+                idx = self.center_idx, name = pair:_name(ff, ce),
+                x = cx, y = cy, r = math.max(8, Screen:scaleBySize(12)),
+            }
+        end
+    end
+    self:_buildLabels()
+end
+
+function StarMap:_buildLabels()
+    local okF, face = pcall(Font.getFace, Font, "cfont", 12)
+    local maxB = math.max(6, math.floor(self.width / 18))
+    for _, n in ipairs(self._shown) do
+        n.label = nil
+        if okF and face then
+            local ok2, tw = pcall(TextWidget.new, TextWidget, {
+                text = clipUTF8(n.name, maxB), face = face, fgcolor = Blitbuffer.COLOR_BLACK,
+            })
+            n.label = ok2 and type(tw) == "table" and tw or nil
+        end
+    end
+    if self._centerNode then
+        self._centerNode.label = nil
+        if okF and face then
+            local ok2, tw = pcall(TextWidget.new, TextWidget, {
+                text = clipUTF8(self._centerNode.name, maxB), face = face, fgcolor = Blitbuffer.COLOR_BLACK,
+            })
+            self._centerNode.label = ok2 and type(tw) == "table" and tw or nil
+        end
+    end
+end
+
+function StarMap:paintTo(bb, x, y)
+    self._absX, self._absY = x or 0, y or 0
+    local ok, err = pcall(self._render, self, bb, x or 0, y or 0)
+    if not ok then
+        logger.warn("starmap render error: " .. tostring(err))
+        pcall(function()
+            bb:paintRect(x or 0, y or 0, self.width, self.height, Blitbuffer.COLOR_WHITE)
+            bb:paintRect(x or 0, y or 0, self.width, self.height, Blitbuffer.COLOR_BLACK, 1)
+        end)
+    end
+end
+
+-- Bresenham 直线（同 RadarChart 的实现）
+function StarMap:_line(bb, x0, y0, x1, y1, color, w)
+    x0, y0 = math.floor(x0 + 0.5), math.floor(y0 + 0.5)
+    x1, y1 = math.floor(x1 + 0.5), math.floor(y1 + 0.5)
+    local dx = math.abs(x1 - x0)
+    local dy = math.abs(y1 - y0)
+    local sx = x0 < x1 and 1 or -1
+    local sy = y0 < y1 and 1 or -1
+    local err = dx - dy
+    w = math.max(1, math.floor(w or 1))
+    local half = math.floor(w / 2)
+    while true do
+        if w <= 1 then bb:setPixelClamped(x0, y0, color)
+        else bb:paintRect(x0 - half, y0 - half, w, w, color) end
+        if x0 == x1 and y0 == y1 then break end
+        local e2 = 2 * err
+        if e2 > -dy then err = err - dy; x0 = x0 + sx end
+        if e2 < dx then err = err + dx; y0 = y0 + sy end
+    end
+end
+
+-- 虚线：沿直线方向按 dash/gap 交替绘制（负关系用）
+function StarMap:_dashLine(bb, x0, y0, x1, y1, color, w, dash, gap)
+    local dx, dy = x1 - x0, y1 - y0
+    local len = math.sqrt(dx * dx + dy * dy)
+    if len < 1 then
+        bb:setPixelClamped(math.floor(x0 + 0.5), math.floor(y0 + 0.5), color)
+        return
+    end
+    local ux, uy = dx / len, dy / len
+    dash = dash or Screen:scaleBySize(4)
+    gap = gap or Screen:scaleBySize(3)
+    local t = 0
+    while t < len do
+        local t2 = math.min(len, t + dash)
+        self:_line(bb, x0 + ux * t, y0 + uy * t, x0 + ux * t2, y0 + uy * t2, color, w)
+        t = t2 + gap
+    end
+end
+
+function StarMap:_render(bb, px, py)
+    local W, H = self.width, self.height
+    bb:paintRect(px, py, W, H, Blitbuffer.COLOR_WHITE)
+    local cx, cy = px + W / 2, py + H / 2
+    local _BLACK = Blitbuffer.COLOR_BLACK
+    local _GRAY = Blitbuffer.COLOR_DARK_GRAY
+    local _LGRAY = Blitbuffer.COLOR_GRAY
+    -- 中心节点（中心模式）
+    if self._centerNode then
+        local cn = self._centerNode
+        local ax, ay = px + cn.x, py + cn.y
+        bb:paintCircle(ax, ay, cn.r, _BLACK, 2)
+        bb:paintCircle(ax, ay, cn.r - 2, Blitbuffer.COLOR_WHITE, 1)
+        if cn.label then
+            local sz = cn.label:getSize()
+            cn.label:paintTo(bb, ax - sz.w / 2, ay + cn.r + 3)
+        end
+    end
+    -- 连线
+    if self.mode == "center" and self._centerNode then
+        local ax, ay = px + self._centerNode.x, py + self._centerNode.y
+        for _, n in ipairs(self._shown) do
+            local lv = n.lv or 0
+            if lv > 0 then
+                -- 正关系：实线，等级越大越粗
+                self:_line(bb, ax, ay, px + n.x, py + n.y, _BLACK, math.max(1, Screen:scaleBySize(lv)))
+            elseif lv < 0 then
+                -- 负关系：虚线，等级越大越粗
+                self:_dashLine(bb, ax, ay, px + n.x, py + n.y, _GRAY, math.max(1, Screen:scaleBySize(-lv)))
+            else
+                -- 0 级：细浅灰实线
+                self:_line(bb, ax, ay, px + n.x, py + n.y, _LGRAY, 1)
+            end
+        end
+    elseif self.mode == "global" then
+        local r = self.pair:_readRelations() or {}
+        local shownIdx = {}
+        for _, n in ipairs(self._shown) do shownIdx[n.idx] = true end
+        for key, node in pairs(r) do
+            local ia, ib = self.pair:_parseKey(key)
+            if ia and ib and shownIdx[ia] and shownIdx[ib] then
+                local na, nb
+                for _, n in ipairs(self._shown) do
+                    if n.idx == ia then na = n end
+                    if n.idx == ib then nb = n end
+                end
+                if na and nb then
+                    -- 取双向中主导方向（带符号）决定正负与粗细
+                    local a, b = node.ab or 0, node.ba or 0
+                    local lv = math.abs(a) >= math.abs(b) and a or b
+                    if lv > 0 then
+                        self:_line(bb, px + na.x, py + na.y, px + nb.x, py + nb.y, _GRAY, math.max(1, Screen:scaleBySize(lv)))
+                    elseif lv < 0 then
+                        self:_dashLine(bb, px + na.x, py + na.y, px + nb.x, py + nb.y, _GRAY, math.max(1, Screen:scaleBySize(-lv)))
+                    else
+                        self:_line(bb, px + na.x, py + na.y, px + nb.x, py + nb.y, _LGRAY, 1)
+                    end
+                end
+            end
+        end
+    end
+    -- 节点
+    for _, n in ipairs(self._shown) do
+        local ax, ay = px + n.x, py + n.y
+        if n.rel then
+            bb:paintCircle(ax, ay, n.r + 3, _BLACK, 1)
+        end
+        bb:paintCircle(ax, ay, n.r, _BLACK, 1)
+        bb:paintCircle(ax, ay, n.r - 2, Blitbuffer.COLOR_WHITE, 1)
+        if n.label then
+            local sz = n.label:getSize()
+            n.label:paintTo(bb, ax - sz.w / 2, ay + n.r + 3)
+        end
+    end
+    -- 图例（底部）
+    local okF, face = pcall(Font.getFace, Font, "cfont", 10)
+    if okF and face then
+        local legend = self.mode == "center" and "近=亲近 · 远=疏远 · 点击节点看详情" or "全书关系网 · 点击节点进入该书星图"
+        local ok2, tw = pcall(TextWidget.new, TextWidget, { text = legend, face = face, fgcolor = _GRAY })
+        if ok2 and type(tw) == "table" then
+            local sz = tw:getSize()
+            tw:paintTo(bb, px + (W - sz.w) / 2, py + H - sz.h - 4)
+        end
+    end
+end
+
+-- 节点点击命中检测（供 dialog.onTap 转发）
+function StarMap:handleTap(ges)
+    local pos = ges and ges.pos
+    if not pos then return false end
+    local x, y = pos.x, pos.y
+    local ax, ay = self._absX or 0, self._absY or 0
+    for _, n in ipairs(self._shown) do
+        if n.x and n.y then
+            local nx, ny = ax + n.x, ay + n.y
+            local dx, dy = x - nx, y - ny
+            local rr = (n.r or 8) + 8
+            if dx * dx + dy * dy <= rr * rr then
+                if self._onNodeTap then self._onNodeTap(n.idx) end
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- 打开星图：center_entry 为空 → 全局模式；否则以该书为中心
+function Pair:showStarMap(ff, center_entry)
     local collection = ff:_readCollection()
     if #collection < 2 then
         ff:_showMessage("至少需要两本养成书才会产生书与书的关系。", 4)
         return
     end
-    local items = {}
-    local r = self:_readRelations() or {}
-    for key, node in pairs(r) do
-        local ia, ib = self:_parseKey(key)
-        if ia and ib then
-            local aE = self:_entryOf(ff, ia)
-            local bE = self:_entryOf(ff, ib)
-            if aE and bE then
-                local aN = self:_name(ff, aE)
-                local bN = self:_name(ff, bE)
-                local line = string.format("%s ⇄ %s   |  %s→%s %s / %s→%s %s",
-                    aN, bN,
-                    aN, bN, LEVEL_NAMES[node.ab or 0] or tostring(node.ab or 0),
-                    bN, aN, LEVEL_NAMES[node.ba or 0] or tostring(node.ba or 0))
-                if node.rel then line = line .. "  ·  [" .. (PNAMES[node.rel] or node.rel) .. "]" end
-                items[#items + 1] = {
-                    text = line,
-                    callback = function() end,
-                }
+    local function open(page, cidx, cmode)
+        local border_w = Size.border.window
+        local padding_w = Size.padding.default
+        local dialog_width = Screen:scaleBySize(560)
+        local avail_w = math.max(200, dialog_width - 2 * (border_w + padding_w))
+        local avail_h = math.max(240, math.floor(Screen:getHeight() * 0.72))
+        local sm = StarMap:new{
+            ff = ff, pair = self,
+            mode = cmode or "global",
+            center_idx = cidx,
+            page = page or 1,
+            width = avail_w, height = avail_h,
+        }
+        if not (sm and sm.dimen) then
+            ff:_showMessage("星图打开失败，请稍后再试。", 4)
+            return
+        end
+        local pages = math.max(1, sm.pages or 1)
+        local dialog
+        sm._onNodeTap = function(idx)
+            if sm.mode == "global" then
+                UIManager:close(dialog)
+                open(1, idx, "center")
+            else
+                self:_showBookRelDetail(ff, cidx, idx)
             end
         end
+        local title = "书的关系星图"
+        if cmode == "center" and cidx then
+            title = string.format("《%s》的星图", self:_name(ff, self:_entryOf(ff, cidx)))
+        end
+        dialog = ButtonDialog:new{
+            title = title,
+            title_align = "center",
+            width = dialog_width,
+            scrollable_content = false,
+            buttons = {
+                {
+                    { text = "上一页", enabled = page > 1,
+                      callback = function()
+                          UIManager:close(dialog)
+                          open(page - 1, cidx, cmode)
+                      end },
+                    { text = "下一页", enabled = page < pages,
+                      callback = function()
+                          UIManager:close(dialog)
+                          open(page + 1, cidx, cmode)
+                      end },
+                    { text = "关闭",
+                      callback = function()
+                          UIManager:close(dialog)
+                      end },
+                },
+            },
+        }
+        -- 节点点击：覆盖 dialog.onTap，先让星图处理命中，再回退默认
+        local origTap = dialog.onTap
+        dialog.onTap = function(dlg, ges)
+            if sm:handleTap(ges) then return true end
+            if origTap then return origTap(dlg, ges) end
+            return false
+        end
+        local okAdd, addErr = pcall(function() dialog:addWidget(sm) end)
+        if not okAdd then
+            logger.warn("starmap addWidget error: " .. tostring(addErr))
+            ff:_showMessage("星图打开失败，请稍后再试。", 4)
+            return
+        end
+        local okShow, errShow = pcall(function() UIManager:show(dialog) end)
+        if not okShow then
+            logger.warn("show starmap error: " .. tostring(errShow))
+        end
     end
-    if #items == 0 then
-        ff:_showMessage("还没有书与书之间的关系。\n带两本书一起出门，或让它们偶遇吧。", 5)
-        return
+    open(1, center_entry and center_entry.index or nil, center_entry and "center" or "global")
+end
+
+function Pair:showRelationMap(ff)
+    -- V27：改为自绘星图（全局模式）
+    self:showStarMap(ff, nil)
+end
+
+-- 按单本书展示它与其他所有养成书的关系（含 0 级），点击可看详情
+function Pair:showBookRelations(ff, entry)
+    -- V27：改为以该书为中心的自绘星图（中心模式）
+    if not entry then return end
+    self:showStarMap(ff, entry)
+end
+
+-- 单对关系的详情弹窗（只显示等级与持久关系类型，点数保持暗线不外露）
+function Pair:_showBookRelDetail(ff, ia, ib)
+    local aE = self:_entryOf(ff, ia)
+    local bE = self:_entryOf(ff, ib)
+    if not aE or not bE then return end
+    local node, _, _ = self:_getRel(ff, ia, ib)
+    local aN = self:_name(ff, aE)
+    local bN = self:_name(ff, bE)
+    local lvAB = node.ab or 0
+    local lvBA = node.ba or 0
+    local body = string.format("%s → %s：%s\n%s → %s：%s",
+        aN, bN, LEVEL_NAMES[lvAB] or tostring(lvAB),
+        bN, aN, LEVEL_NAMES[lvBA] or tostring(lvBA))
+    if node.rel then
+        body = body .. string.format("\n\n已形成关系：[%s]（%s）",
+            PNAMES[node.rel] or node.rel, node.rel_side == "BA" and ("%s 更主动"):format(bN) or ("%s 更主动"):format(aN))
     end
-    table.sort(items, function(a, b) return a.text < b.text end)
-    local m = Menu:new{ title = "书的关系", item_table = items, width = Screen:getWidth(), is_borderless = true, is_popout = false }
-    UIManager:show(m)
+    local dlg = _btnDialog("关系详情", body, { { { text = "确定", callback = function() end } } }, nil)
+    UIManager:show(dlg)
 end
 
 -- 旅行日志偶发双人事件：某本书有新旅行记录时调用。基础5%，随其对任意书的关系等级微增

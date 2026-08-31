@@ -4015,7 +4015,7 @@ function FocusFeedback:_showCollection()
         end,
     })
 
-    -- 书的关系（V25 双书关系图谱）
+    -- 书的关系（V25 图谱入口，临时保留，后续改作自绘星图）
     table.insert(items, {
         text = "书的关系",
         mandatory = nil,
@@ -4081,6 +4081,12 @@ function FocusFeedback:_showBookDetailMenu(entry)
             text = "书的信息",
             callback = function()
                 self:_showBookInfo(entry)
+            end,
+        },
+        {
+            text = "书的关系",
+            callback = function()
+                PairSys:showBookRelations(self, entry)
             end,
         },
     }
