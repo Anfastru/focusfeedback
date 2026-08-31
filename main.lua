@@ -7701,6 +7701,7 @@ function FocusFeedback:_doUpdate(base_url, remote_version)
             "book_data.lua",
             "sentence_pool.lua",
             "bookmark_quotes.lua",
+            "pair_system.lua",
         }
 
         local plugin_dir = self:_getPluginDir()
