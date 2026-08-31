@@ -6006,6 +6006,7 @@ function FocusFeedback:_tick()
     -- 每个环节独立保护，避免任一异常吞掉来信检查
     pcall(function() self:_ensureTestBooks() end)
     pcall(function() self:_refundOnce() end)
+    pcall(function() self:_grantLegacy() end)
     pcall(function() self:_inboxInit() end)
     pcall(function()
         local ok, err = pcall(function() self:_showInboxLetters() end)
@@ -10221,6 +10222,26 @@ function FocusFeedback:_refundOnce()
     if done then return end
     self:_savePoints((self:_readPoints() or 0) + 60)
     G_reader_settings:saveSetting(key, true)
+end
+
+-- 自愈补发：+100 测试积分 与 +60 误扣补偿。
+-- 根因：旧版一次性发放用的是布尔标志（v4_test_bonus_100 / v4_refund_60），
+-- 若在旧版某次运行中该标志已被置位但积分并未真正写入（标志脱同步），布尔判断会永远跳过补发，
+-- 导致用户始终收不到这两笔积分。这里改用从未使用过的新键重新补发一次，
+-- 保证一定到账且不会重复叠加。
+function FocusFeedback:_grantLegacy()
+    -- +100 测试积分（此前未到账，补发一次）
+    local k100 = settingKey("v4_grant_100_v3")
+    if not G_reader_settings:readSetting(k100, false) then
+        self:_savePoints((self:_readPoints() or 0) + 100)
+        G_reader_settings:saveSetting(k100, true)
+    end
+    -- +60 误扣补偿（此前未到账，补发一次）
+    local k60 = settingKey("v4_grant_60_v3")
+    if not G_reader_settings:readSetting(k60, false) then
+        self:_savePoints((self:_readPoints() or 0) + 60)
+        G_reader_settings:saveSetting(k60, true)
+    end
 end
 
 function FocusFeedback:_inboxInit()
