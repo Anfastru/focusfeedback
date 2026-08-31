@@ -797,11 +797,13 @@ end
 
 -- 关系图谱（"书的关系"菜单）
 -- ============ V27 自绘星图 ============
--- 自包含全屏 widget：自己处理点击；绘制顺序=背景→同心环轨道→连线(到节点边缘)→实心节点→标签。
+-- ButtonDialog 托管 + 自绘内容：标题/按钮由 ButtonDialog 提供，星图内容自绘。
+-- 绘制顺序=背景→同心环轨道→连线(到节点边缘)→节点→标签。
 -- 中心模式：中心=当前查看的书，其他书按关系等级排布在同心环上（正近、0 居中、负远）。
 -- 全局模式：所有书均匀排布在圆周上，有关系者连线。
 -- 连线规则：正实线、负虚线、等级越大越粗（但整体偏细）。
--- 点击节点 → 关系详情（中心模式）或切换为中心模式（全局模式）。
+-- 交互：节点点击（经 dialog.onTapClose 转发，命中才消费）→ 关系详情（中心模式）或切换为中心模式（全局模式）；
+--       另有"查看"按钮兜底列出当前页的书。
 -- 点数保持暗线，任何地方不显示。
 
 -- UTF-8 安全字节截断（与 main.lua 同款，独立副本，避免跨模块依赖）
@@ -829,18 +831,23 @@ local StarMap = WidgetContainer:extend{
     center_idx = nil,
     page = 1,
     pageSize = 18,
+    width = nil,
+    height = nil,
     not_focusable = true,
     is_visible = true,
 }
 
 function StarMap:init()
-    self.W = Screen:getWidth() or 600
-    self.H = Screen:getHeight() or 800
+    local Win = Screen:getWidth() or 600
+    local Hin = Screen:getHeight() or 800
+    if not self.width or self.width <= 0 then self.width = math.max(200, math.floor(Win * 0.9)) end
+    if not self.height or self.height <= 0 then self.height = math.max(200, math.floor(Hin * 0.6)) end
+    self.W = self.width
+    self.H = self.height
     self.dimen = Geom:new{ w = self.W, h = self.H }
     self.not_focusable = true
     self.is_visible = true
-    self._titleH = Screen:scaleBySize(44)
-    self._barH = Screen:scaleBySize(56)
+    self._absX, self._absY = 0, 0
     self:_buildLayout()
 end
 
@@ -848,14 +855,6 @@ function StarMap:getSize() return self.dimen end
 function StarMap:getWidth() return self.W end
 function StarMap:getHeight() return self.H end
 function StarMap:getInnerSize() return { w = self.W, h = self.H } end
-
-function StarMap:_titleText()
-    if self.mode == "center" and self.center_idx then
-        local ce = self.pair:_entryOf(self.ff, self.center_idx)
-        if ce then return string.format("《%s》的星图", self.pair:_name(self.ff, ce)) end
-    end
-    return "书的关系星图"
-end
 
 function StarMap:_buildLayout()
     local ff = self.ff
@@ -893,11 +892,9 @@ function StarMap:_buildLayout()
     self._shown = shown
     -- 星图区域
     local W, H = self.W, self.H
-    local top = self._titleH
-    local bottom = H - self._barH
     local cx = W / 2
-    local cy = top + (bottom - top) / 2
-    local R = math.min(W / 2, (bottom - top) / 2) - Screen:scaleBySize(14)
+    local cy = H / 2
+    local R = math.min(W / 2, H / 2) - Screen:scaleBySize(14)
     self._cx, self._cy, self._R = cx, cy, R
     -- 环定义（由近到远）：正等级近、0 居中、负等级远
     local rings = {
@@ -1044,7 +1041,6 @@ function StarMap:paintTo(bb, x, y)
         logger.warn("starmap render error: " .. tostring(err))
         pcall(function()
             bb:paintRect(x or 0, y or 0, self.W, self.H, Blitbuffer.COLOR_WHITE)
-            bb:paintRect(x or 0, y or 0, self.W, self.H, Blitbuffer.COLOR_BLACK, 1)
         end)
     end
 end
@@ -1087,13 +1083,13 @@ function StarMap:_render(bb, px, py)
             end
         end
     end
-    -- 3. 节点（实心，覆盖线头）
+    -- 3. 节点（描边圆，线画到边缘）
     for _, n in ipairs(self._shown) do
         local ax, ay = px + n.x, py + n.y
         if n.rel then
             bb:paintCircle(ax, ay, n.r + 3, _BLACK, 1)
         end
-        bb:paintCircle(ax, ay, n.r, _BLACK)
+        bb:paintCircle(ax, ay, n.r, _BLACK, 1)
         if n.label then
             local sz = n.label:getSize()
             n.label:paintTo(bb, ax - sz.w / 2, ay + n.r + 3)
@@ -1104,57 +1100,9 @@ function StarMap:_render(bb, px, py)
         local cn = self._centerNode
         local ax, ay = px + cn.x, py + cn.y
         bb:paintCircle(ax, ay, cn.r, _BLACK, 2)
-        bb:paintCircle(ax, ay, cn.r - 2, Blitbuffer.COLOR_WHITE)
         if cn.label then
             local sz = cn.label:getSize()
             cn.label:paintTo(bb, ax - sz.w / 2, ay + cn.r + 3)
-        end
-    end
-    -- 4. 标题栏
-    bb:paintRect(px, py, W, self._titleH, Blitbuffer.COLOR_WHITE)
-    bb:paintRect(px, py + self._titleH - 1, W, 1, _LGRAY)
-    local okF, face = pcall(Font.getFace, Font, "cfont", 16)
-    if okF and face then
-        local ok2, tw = pcall(TextWidget.new, TextWidget, {
-            text = self:_titleText(), face = face, fgcolor = _BLACK,
-        })
-        if ok2 and type(tw) == "table" then
-            local sz = tw:getSize()
-            tw:paintTo(bb, px + (W - sz.w) / 2, py + (self._titleH - sz.h) / 2)
-        end
-    end
-    -- 右上角关闭按钮 ✕
-    local closeR = Screen:scaleBySize(16)
-    local closeCx = px + W - closeR - Screen:scaleBySize(12)
-    local closeCy = py + self._titleH / 2
-    self._closeX, self._closeY = closeCx, closeCy
-    bb:paintRect(closeCx - closeR, closeCy - closeR, closeR * 2, closeR * 2, _LGRAY, 1)
-    self:_line(bb, closeCx - closeR + 4, closeCy - closeR + 4, closeCx + closeR - 4, closeCy + closeR - 4, _BLACK, 1)
-    self:_line(bb, closeCx + closeR - 4, closeCy - closeR + 4, closeCx - closeR + 4, closeCy + closeR - 4, _BLACK, 1)
-    -- 5. 底部按钮栏
-    local barY = py + H - self._barH
-    bb:paintRect(px, barY, W, self._barH, Blitbuffer.COLOR_WHITE)
-    bb:paintRect(px, barY, W, 1, _LGRAY)
-    local bw = W / 3
-    local btnH = self._barH - Screen:scaleBySize(8)
-    local btnY = barY + Screen:scaleBySize(4)
-    local okF2, face2 = pcall(Font.getFace, Font, "cfont", 14)
-    local labels = { "上一页", "下一页", "关闭" }
-    for i = 1, 3 do
-        local bx = px + (i - 1) * bw
-        local enabled = true
-        if i == 1 then enabled = self.page > 1 end
-        if i == 2 then enabled = self.page < self.pages end
-        bb:paintRect(bx + Screen:scaleBySize(6), btnY, bw - Screen:scaleBySize(12), btnH, _LGRAY, 1)
-        if okF2 and face2 then
-            local ok3, tw = pcall(TextWidget.new, TextWidget, {
-                text = labels[i], face = face2,
-                fgcolor = enabled and _BLACK or _LGRAY,
-            })
-            if ok3 and type(tw) == "table" then
-                local sz = tw:getSize()
-                tw:paintTo(bb, bx + (bw - sz.w) / 2, btnY + (btnH - sz.h) / 2)
-            end
         end
     end
     -- 图例（星图区域底部，含页码）
@@ -1174,39 +1122,16 @@ function StarMap:_render(bb, px, py)
     end
 end
 
--- 点击处理（自包含 widget，直接接收 onTap）
-function StarMap:onTap(ges)
+-- 节点点击命中检测（供 dialog.onTapClose 转发，命中才消费）
+function StarMap:handleTap(ges)
     local pos = ges and ges.pos
     if not pos then return false end
-    local ax0, ay0 = self._absX or 0, self._absY or 0
-    local x, y = pos.x - ax0, pos.y - ay0
-    -- 右上角关闭
-    if self._closeX and self._closeY then
-        local cr = Screen:scaleBySize(20)
-        if math.abs(x - self._closeX) <= cr and math.abs(y - self._closeY) <= cr then
-            UIManager:close(self)
-            return true
-        end
-    end
-    -- 底部按钮
-    if y >= self.H - self._barH then
-        local bw = self.W / 3
-        local i = math.floor(x / bw) + 1
-        if i == 1 and self.page > 1 then
-            UIManager:close(self)
-            self.pair:showStarMapAt(self.ff, self.center_idx, self.mode, self.page - 1)
-        elseif i == 2 and self.page < self.pages then
-            UIManager:close(self)
-            self.pair:showStarMapAt(self.ff, self.center_idx, self.mode, self.page + 1)
-        elseif i == 3 then
-            UIManager:close(self)
-        end
-        return true
-    end
-    -- 节点
+    local x, y = pos.x, pos.y
+    local ax, ay = self._absX or 0, self._absY or 0
     for _, n in ipairs(self._shown) do
         if n.x and n.y then
-            local dx, dy = x - n.x, y - n.y
+            local nx, ny = ax + n.x, ay + n.y
+            local dx, dy = x - nx, y - ny
             local rr = (n.r or 8) + 10
             if dx * dx + dy * dy <= rr * rr then
                 if self._onNodeTap then self._onNodeTap(n.idx) end
@@ -1215,12 +1140,6 @@ function StarMap:onTap(ges)
         end
     end
     return false
-end
-
--- 返回键关闭
-function StarMap:onCloseWidget()
-    UIManager:close(self)
-    return true
 end
 
 -- 打开星图：center_entry 为空 → 全局模式；否则以该书为中心
@@ -1234,28 +1153,132 @@ function Pair:showStarMapAt(ff, cidx, cmode, page)
         ff:_showMessage("至少需要两本养成书才会产生书与书的关系。", 4)
         return
     end
-    local sm = StarMap:new{
-        ff = ff, pair = self,
-        mode = cmode or "global",
-        center_idx = cidx,
-        page = page or 1,
-    }
-    if not (sm and sm.dimen) then
+    local dialog_width = Screen:scaleBySize(560)
+    -- 星图内容可用宽度（与 ButtonDialog 的 title_group_width 近似）
+    local avail_w = math.max(200, dialog_width - 2 * Size.border.window - 2 * Size.padding.button
+        - 2 * (Size.padding.default + Size.margin.default))
+    local avail_h = math.max(200, math.floor(Screen:getHeight() * 0.6))
+    -- 先建星图以取得页数（供按钮 enabled 判断）
+    local sm
+    local okNew, newErr = pcall(function()
+        sm = StarMap:new{
+            ff = ff, pair = self,
+            mode = cmode or "global",
+            center_idx = cidx,
+            page = page or 1,
+            width = avail_w, height = avail_h,
+        }
+    end)
+    if not okNew or not (sm and sm.dimen) then
+        logger.warn("starmap build error: " .. tostring(newErr))
         ff:_showMessage("星图打开失败，请稍后再试。", 4)
         return
     end
+    local pages = math.max(1, sm.pages or 1)
+    local dialog
+    local title = "书的关系星图"
+    if cmode == "center" and cidx then
+        title = string.format("《%s》的星图", self:_name(ff, self:_entryOf(ff, cidx)))
+    end
     sm._onNodeTap = function(idx)
         if sm.mode == "global" then
-            UIManager:close(sm)
+            UIManager:close(dialog)
             self:showStarMapAt(ff, idx, "center", 1)
         else
             self:_showBookRelDetail(ff, cidx, idx)
         end
     end
-    local okShow, errShow = pcall(function() UIManager:show(sm) end)
+    local okDlg, dlgErr = pcall(function()
+        dialog = ButtonDialog:new{
+            title = title,
+            title_align = "center",
+            width = dialog_width,
+            scrollable_content = false,
+            buttons = {
+                {
+                    { text = "上一页", enabled = page > 1,
+                      callback = function()
+                          UIManager:close(dialog)
+                          self:showStarMapAt(ff, cidx, cmode, page - 1)
+                      end },
+                    { text = "下一页", enabled = page < pages,
+                      callback = function()
+                          UIManager:close(dialog)
+                          self:showStarMapAt(ff, cidx, cmode, page + 1)
+                      end },
+                },
+                {
+                    { text = "查看",
+                      callback = function()
+                          self:_showStarMapBookMenu(ff, sm, dialog)
+                      end },
+                    { text = "关闭",
+                      callback = function()
+                          UIManager:close(dialog)
+                      end },
+                },
+            },
+        }
+        -- 节点点击：覆盖 onTapClose（ButtonDialog 实际接收的手势），命中节点才消费
+        -- 整体 pcall 兜底：任何节点点击/回调异常都不允许击穿事件循环导致白屏
+        local origTapClose = dialog.onTapClose
+        dialog.onTapClose = function(dlg, ges)
+            local okTap, tapErr = pcall(function()
+                if sm and sm:handleTap(ges) then return true end
+                if origTapClose then return origTapClose(dlg, ges) end
+                return true
+            end)
+            if not okTap then
+                logger.warn("starmap tap error: " .. tostring(tapErr))
+                return true
+            end
+            return tapErr
+        end
+        dialog:addWidget(sm)
+    end)
+    if not okDlg then
+        logger.warn("starmap dialog error: " .. tostring(dlgErr))
+        ff:_showMessage("星图打开失败，请稍后再试。", 4)
+        return
+    end
+    local okShow, errShow = pcall(function() UIManager:show(dialog) end)
     if not okShow then
         logger.warn("show starmap error: " .. tostring(errShow))
+        ff:_showMessage("星图打开失败，请稍后再试。", 4)
     end
+end
+
+-- "查看"按钮兜底：列出当前页的书，点击看详情/切换中心
+function Pair:_showStarMapBookMenu(ff, sm, dialog)
+    local shown = sm and sm._shown or {}
+    local cmode = sm and sm.mode or "global"
+    local cidx = sm and sm.center_idx or nil
+    local items = {}
+    for _, n in ipairs(shown) do
+        local line = n.name
+        if cmode == "center" then
+            line = string.format("%s（%s）", n.name, LEVEL_NAMES[n.lv or 0] or tostring(n.lv or 0))
+            if n.rel then line = line .. " [" .. (PNAMES[n.rel] or n.rel) .. "]" end
+        end
+        items[#items + 1] = {
+            text = line,
+            callback = function()
+                UIManager:close(m)
+                if cmode == "center" then
+                    self:_showBookRelDetail(ff, cidx, n.idx)
+                else
+                    if dialog then UIManager:close(dialog) end
+                    self:showStarMapAt(ff, n.idx, "center", 1)
+                end
+            end,
+        }
+    end
+    if #items == 0 then
+        ff:_showMessage("当前页没有书。", 3)
+        return
+    end
+    local m = Menu:new{ title = "选择书", item_table = items, width = Screen:getWidth(), is_borderless = true, is_popout = false }
+    UIManager:show(m)
 end
 
 function Pair:showRelationMap(ff)
