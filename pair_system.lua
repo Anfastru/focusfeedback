@@ -568,16 +568,15 @@ end
 
 -- ============ 弹窗辅助 ============
 local function _btnDialog(title, body, buttons, self_ref)
-    -- 正文统一用显式 TextBoxWidget 渲染（某些 KOReader 构建里传字符串给 info_text 会不显示正文）
-    local body_widget = TextBoxWidget:new{
-        text = body or "",
-        face = Font:getFace("x_small"),
-        width = Screen:scaleBySize(520),
-    }
+    -- 这台 KOReader 的 info_text 渲染已损坏（字符串->空白、控件->绘制崩溃）。
+    -- 照 main.lua 已验证可行的方式：把正文并入多行 title（参考 _showItemIntro）。
+    local merged = title or ""
+    if body and body ~= "" then
+        merged = merged .. "\n\n" .. body
+    end
     local dlg = ButtonDialog:new{
-        title = title or "", title_align = "center",
-        info_text = body_widget,
-        width = Screen:scaleBySize(560),
+        title = merged,
+        title_align = "center",
         buttons = buttons,
     }
     return dlg
