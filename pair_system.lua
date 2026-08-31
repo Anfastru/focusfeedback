@@ -224,7 +224,7 @@ function Pair:_getRel(ff, i, j)
         r[key] = node
         self:_saveRelations(r)
     end
-    return node, key
+    return node, key, r
 end
 
 function Pair:_parseKey(key)
@@ -337,7 +337,7 @@ end
 -- ============ 施加 delta ============
 function Pair:_applyDelta(ff, ia, ib, dAB, dBA, tag)
     self:setTag(tag)
-    local node, key = self:_getRel(ff, ia, ib)
+    local node, key, r = self:_getRel(ff, ia, ib)
     -- 已有持久关系：点数锁定，不增减、不解除（soulmates 同理）
     if node.rel ~= nil then return node, false, false end
     local aEntry = self:_entryOf(ff, ia)
@@ -559,6 +559,11 @@ function Pair:partnerAsk(ff, entry)
     local btns = {
         { text = "是", callback = function()
             if dlg then UIManager:close(dlg) end
+            -- 预留：邀请(+5)后还需至少 10 分用于出发（否则选完书出发时会"0事件"却白扣分）
+            if ff:_readPoints() - 5 < 10 then
+                self:_msg(ff, "积分不足：邀请同行需预留 10 积分用于出发。")
+                return
+            end
             self:_charge(ff, 5, "邀请同行")
             self:specifyAsk(ff, entry, others)
         end },
@@ -583,6 +588,11 @@ function Pair:specifyAsk(ff, entry, others)
     local btns = {
         { text = "是", callback = function()
             if dlg then UIManager:close(dlg) end
+            -- 预留：指定(+5)后还需至少 10 分用于出发
+            if ff:_readPoints() - 5 < 10 then
+                self:_msg(ff, "积分不足：指定同行需预留 10 积分用于出发。")
+                return
+            end
             self:_charge(ff, 5, "指定对象")
             self:pickPartner(ff, entry, others)
         end },
@@ -601,6 +611,7 @@ function Pair:pickPartner(ff, entry, others)
         items[#items + 1] = {
             text = self:_name(ff, e),
             callback = function()
+                if logger then logger.warn("Pair:pickPartner PICK", entry.index, e.index) end
                 self:_runPair(ff, entry, e)
             end,
         }
@@ -634,10 +645,12 @@ function Pair:_buildPool(ff, ia, ib)
 end
 
 function Pair:_runPair(ff, aEntry, bEntry)
+    if logger then logger.warn("Pair:_runPair ENTER", aEntry and aEntry.index, bEntry and bEntry.index) end
     if not aEntry or not bEntry then return end
     -- 真正出发时扣除基础 10 分（主书结算时扣，弹窗/取消不扣）
     local pnow = ff:_readPoints()
     if pnow < 10 then
+        if logger then logger.warn("Pair:_runPair POINTSUFF", pnow) end
         if ff._showMessage then ff:_showMessage("积分不足，出门需要 10 积分。", 4) end
         return
     end
@@ -647,6 +660,7 @@ function Pair:_runPair(ff, aEntry, bEntry)
     -- 单恋彩蛋：主体书是单恋方时，小概率触发许愿柳
     if node.rel == "crush" and node.rel_side == ia then
         if math.random() < 0.08 then
+            if logger then logger.warn("Pair:_runPair CRUSH") end
             self:_runCrush(ff, aEntry, bEntry)
             return
         end
@@ -654,6 +668,7 @@ function Pair:_runPair(ff, aEntry, bEntry)
     local pool = self:_buildPool(ff, ia, ib)
     local evt = pool[math.random(1, #pool)]
     local ch = evt.chapters[math.random(1, #evt.chapters)]
+    if logger then logger.warn("Pair:_runPair EVT", evt.id, ch.text) end
     local aN = self:_name(ff, aEntry)
     local bN = self:_name(ff, bEntry)
     local text = (ch.text or ""):gsub("A", aN):gsub("B", bN)
@@ -667,16 +682,20 @@ function Pair:_runPair(ff, aEntry, bEntry)
     self:_logPair(ff, ia, ib, "关系：" .. sub1 .. "  ·  " .. sub2)
     -- 结果弹窗
     local body = text .. "\n\n" .. sub1 .. "\n" .. sub2
+    if logger then logger.warn("Pair:_runPair BEFORE_SHOW") end
     self:_showResult(body)
+    if logger then logger.warn("Pair:_runPair AFTER_SHOW") end
 end
 
 function Pair:_showResult(body)
+    if logger then logger.warn("Pair:_showResult ENTER", body) end
     local dlg
     local btns = { { text = "确定", callback = function()
         if dlg then UIManager:close(dlg) end
     end } }
     dlg = _btnDialog("双人事件", body, { btns }, self)
     UIManager:show(dlg)
+    if logger then logger.warn("Pair:_showResult SHOWN") end
 end
 
 -- ============ 许愿柳彩蛋（单恋限定） ============
