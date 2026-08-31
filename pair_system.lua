@@ -171,6 +171,43 @@ local EVENTS = {
   } },
 }
 
+-- 提示语表（按事件 id）
+local EVENT_HINTS = {
+    ["1_restaurant"] = "A邀请B一起去餐厅吃饭，",
+    ["2_museum"] = "A邀请B一起去博物馆参观，",
+    ["3_mall"] = "A邀请B一起去购物中心逛街，",
+    ["4_badminton"] = "A邀请B一起去打羽毛球，",
+    ["5_bbq"] = "A邀请B一起去户外烧烤，",
+    ["6_wolf"] = "A邀请B一起去玩狼人杀，",
+    ["7_walk"] = "A邀请B一起去散步，",
+    ["8_cake"] = "A邀请B一起去吃蛋糕，",
+    ["9_perler"] = "A邀请B一起去拼豆店，",
+    ["10_snow"] = "A邀请B一起去爬雪山，",
+    ["11_movie"] = "A邀请B一起去看电影，",
+    ["12_travel"] = "A邀请B一起去旅行，",
+    ["13_fall"] = "它们并肩走着，",
+    ["14_milktea"] = "A邀请B一起去喝奶茶，",
+    ["15_journal"] = "A邀请B一起去逛手账集市，",
+    ["16_race"] = "A邀请B一起去赛跑，",
+    ["17_livehouse"] = "A邀请B一起去livehouse，",
+    ["18_cook"] = "A邀请B一起做饭，",
+    ["19_forward"] = "A邀请B一起去参加男生女生向前冲，",
+    ["20_haunted"] = "A邀请B一起去鬼屋探险，",
+    ["21_haunt"] = "A邀请B一起去灵异地点探险，",
+    ["22_climb"] = "A邀请B一起去攀岩，",
+}
+
+-- 合成事件文案：提示语 + 正文字段（已替换A/B占位符）
+function Pair:_composeText(evt, ch, aN, bN)
+    local hint = EVENT_HINTS[evt.id] or ""
+    local body = (ch.text or ""):gsub("A", aN):gsub("B", bN)
+    if hint == "" or hint == nil then
+        return body
+    end
+    -- 若 body 已以句号/感叹号等结尾，且 hint 以逗号结尾，可拼接
+    return (hint:gsub("A", aN):gsub("B", bN)) .. body
+end
+
 -- 宿敌关系限定
 local EVENTS_ENEMY = {
   { id = "e1", name = "登门", chapters = { { text = "A邀请B来自己家玩。结果刚打开门，就被B捅了一刀。", AB = 0, BA = -2 } } },
@@ -608,16 +645,18 @@ end
 
 function Pair:pickPartner(ff, entry, others)
     local items = {}
+    local m  -- 在回调前声明，供闭包引用；点按后关闭选择菜单，避免结果弹窗被盖住
     for _, e in ipairs(others) do
         items[#items + 1] = {
             text = self:_name(ff, e),
             callback = function()
+                if m then UIManager:close(m) end
                 if logger then logger.warn("Pair:pickPartner PICK", entry.index, e.index) end
                 self:_runPair(ff, entry, e)
             end,
         }
     end
-    local m = Menu:new{
+    m = Menu:new{
         title = "选择同行的书",
         item_table = items,
         width = Screen:getWidth(),
@@ -672,29 +711,25 @@ function Pair:_runPair(ff, aEntry, bEntry)
     if logger then logger.warn("Pair:_runPair EVT", evt.id, ch.text) end
     local aN = self:_name(ff, aEntry)
     local bN = self:_name(ff, bEntry)
-    local text = (ch.text or ""):gsub("A", aN):gsub("B", bN)
-    -- 施加 delta
+    local text = self:_composeText(evt, ch, aN, bN)
+    -- 施加 delta（等级大变化由 _applyDelta→_queueNotice 延时提示，不带点数）
     local node2, ab_changed, ba_changed = self:_applyDelta(ff, ia, ib, ch.AB, ch.BA, ch.attr)
-    -- 写双方旅行日志
-    local ab_lv, ba_lv = node2.ab or 0, node2.ba or 0
-    local sub1 = string.format("%s对%s：%s（%s）", aN, bN, LEVEL_NAMES[ab_lv] or tostring(ab_lv), (ch.AB > 0 and "+" or tostring(ch.AB or 0)))
-    local sub2 = string.format("%s对%s：%s（%s）", bN, aN, LEVEL_NAMES[ba_lv] or tostring(ba_lv), (ch.BA > 0 and "+" or tostring(ch.BA or 0)))
+    -- 写双方旅行日志：只记事件本身（含提示语），不刷关系（关系为暗线）
     self:_logPair(ff, ia, ib, text)
-    self:_logPair(ff, ia, ib, "关系：" .. sub1 .. "  ·  " .. sub2)
-    -- 结果弹窗
-    local body = text .. "\n\n" .. sub1 .. "\n" .. sub2
+    -- 结果弹窗：标题用通用"双人事件"，正文=提示语+正文字段；不显示关系等级与点数
+    local body = text
     if logger then logger.warn("Pair:_runPair BEFORE_SHOW") end
-    self:_showResult(body)
+    self:_showResult("双人事件", body)
     if logger then logger.warn("Pair:_runPair AFTER_SHOW") end
 end
 
-function Pair:_showResult(body)
-    if logger then logger.warn("Pair:_showResult ENTER", body) end
+function Pair:_showResult(title, body)
+    if logger then logger.warn("Pair:_showResult ENTER", title, body) end
     local dlg
     local btns = { { text = "确定", callback = function()
         if dlg then UIManager:close(dlg) end
     end } }
-    dlg = _btnDialog("双人事件", body, { btns }, self)
+    dlg = _btnDialog(title or "双人事件", body, { btns }, self)
     UIManager:show(dlg)
     if logger then logger.warn("Pair:_showResult SHOWN") end
 end
@@ -847,12 +882,10 @@ function Pair:maybeTravelPair(ff, entry)
         local ch = evt.chapters[math.random(1, #evt.chapters)]
         local aN = self:_nameIdx(ff, ia)
         local bN = self:_nameIdx(ff, ib)
-        local text = (ch.text or ""):gsub("A", aN):gsub("B", bN)
+        local text = self:_composeText(evt, ch, aN, bN)
         self:_applyDelta(ff, ia, ib, ch.AB, ch.BA, ch.attr)
+        -- 只记事件本身；关系为暗线（等级大变化由 _applyDelta→_queueNotice 延时提示），不在此刷关系
         self:_logPair(ff, ia, ib, text)
-        local sub1 = string.format("%s对%s：%s", aN, bN, LEVEL_NAMES[(self:_getRel(ff, ia, ib)).ab or 0] or "")
-        local sub2 = string.format("%s对%s：%s", bN, aN, LEVEL_NAMES[(self:_getRel(ff, ia, ib)).ba or 0] or "")
-        self:_logPair(ff, ia, ib, "关系：" .. sub1 .. "  ·  " .. sub2)
     end
 end
 
