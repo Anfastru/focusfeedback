@@ -567,7 +567,7 @@ function Pair:partnerAsk(ff, entry)
             solo()
         end },
     }
-    dlg = _btnDialog("出门同行", "是否邀请其他书同行？（消耗 5 积分）", btns, self)
+    dlg = _btnDialog("出门同行", "是否邀请其他书同行？（消耗 5 积分）", { btns }, self)
     UIManager:show(dlg)
 end
 
@@ -668,7 +668,7 @@ function Pair:_showResult(body)
     local btns = { { text = "确定", callback = function()
         if dlg then UIManager:close(dlg) end
     end } }
-    dlg = _btnDialog("双人事件", body, btns, self)
+    dlg = _btnDialog("双人事件", body, { btns }, self)
     UIManager:show(dlg)
 end
 
