@@ -797,9 +797,10 @@ end
 
 -- 关系图谱（"书的关系"菜单）
 -- ============ V27 自绘星图 ============
--- 复用 V20 雷达图 / V21 收藏墙已验证的绘制原语与"ButtonDialog 托管 + 底部按钮"模式。
--- 中心模式：中心=当前查看的书，其他书按关系等级排布在同心环上（正等级近、0 居中、负等级远）。
+-- 自包含全屏 widget：自己处理点击；绘制顺序=背景→同心环轨道→连线(到节点边缘)→实心节点→标签。
+-- 中心模式：中心=当前查看的书，其他书按关系等级排布在同心环上（正近、0 居中、负远）。
 -- 全局模式：所有书均匀排布在圆周上，有关系者连线。
+-- 连线规则：正实线、负虚线、等级越大越粗（但整体偏细）。
 -- 点击节点 → 关系详情（中心模式）或切换为中心模式（全局模式）。
 -- 点数保持暗线，任何地方不显示。
 
@@ -828,28 +829,33 @@ local StarMap = WidgetContainer:extend{
     center_idx = nil,
     page = 1,
     pageSize = 18,
-    width = nil,
-    height = nil,
     not_focusable = true,
     is_visible = true,
 }
 
 function StarMap:init()
-    local Win = Screen:getWidth() or 600
-    local Hin = Screen:getHeight() or 800
-    if not self.width or self.width <= 0 then self.width = math.max(200, math.floor(Win * 0.94)) end
-    if not self.height or self.height <= 0 then self.height = math.max(240, math.floor(Hin * 0.72)) end
-    self.dimen = Geom:new{ w = self.width, h = self.height }
+    self.W = Screen:getWidth() or 600
+    self.H = Screen:getHeight() or 800
+    self.dimen = Geom:new{ w = self.W, h = self.H }
     self.not_focusable = true
     self.is_visible = true
-    self._absX, self._absY = 0, 0
+    self._titleH = Screen:scaleBySize(44)
+    self._barH = Screen:scaleBySize(56)
     self:_buildLayout()
 end
 
 function StarMap:getSize() return self.dimen end
-function StarMap:getWidth() return self.width end
-function StarMap:getHeight() return self.height end
-function StarMap:getInnerSize() return { w = self.width, h = self.height } end
+function StarMap:getWidth() return self.W end
+function StarMap:getHeight() return self.H end
+function StarMap:getInnerSize() return { w = self.W, h = self.H } end
+
+function StarMap:_titleText()
+    if self.mode == "center" and self.center_idx then
+        local ce = self.pair:_entryOf(self.ff, self.center_idx)
+        if ce then return string.format("《%s》的星图", self.pair:_name(self.ff, ce)) end
+    end
+    return "书的关系星图"
+end
 
 function StarMap:_buildLayout()
     local ff = self.ff
@@ -885,10 +891,14 @@ function StarMap:_buildLayout()
         shown[#shown + 1] = nodes[idx]
     end
     self._shown = shown
-    -- 位置计算
-    local W, H = self.width, self.height
-    local cx, cy = W / 2, H / 2
-    local R = math.min(W, H) / 2
+    -- 星图区域
+    local W, H = self.W, self.H
+    local top = self._titleH
+    local bottom = H - self._barH
+    local cx = W / 2
+    local cy = top + (bottom - top) / 2
+    local R = math.min(W / 2, (bottom - top) / 2) - Screen:scaleBySize(14)
+    self._cx, self._cy, self._R = cx, cy, R
     -- 环定义（由近到远）：正等级近、0 居中、负等级远
     local rings = {
         { r = R * 0.30, lo = 3, hi = 5 },
@@ -896,6 +906,7 @@ function StarMap:_buildLayout()
         { r = R * 0.74, lo = 0, hi = 0 },
         { r = R * 0.90, lo = -5, hi = -1 },
     }
+    self._rings = rings
     local ringBuckets = { {}, {}, {}, {} }
     for _, n in ipairs(shown) do
         local lv = n.lv or 0
@@ -936,7 +947,7 @@ end
 
 function StarMap:_buildLabels()
     local okF, face = pcall(Font.getFace, Font, "cfont", 12)
-    local maxB = math.max(6, math.floor(self.width / 18))
+    local maxB = math.max(6, math.floor(self.W / 18))
     for _, n in ipairs(self._shown) do
         n.label = nil
         if okF and face then
@@ -957,16 +968,18 @@ function StarMap:_buildLabels()
     end
 end
 
-function StarMap:paintTo(bb, x, y)
-    self._absX, self._absY = x or 0, y or 0
-    local ok, err = pcall(self._render, self, bb, x or 0, y or 0)
-    if not ok then
-        logger.warn("starmap render error: " .. tostring(err))
-        pcall(function()
-            bb:paintRect(x or 0, y or 0, self.width, self.height, Blitbuffer.COLOR_WHITE)
-            bb:paintRect(x or 0, y or 0, self.width, self.height, Blitbuffer.COLOR_BLACK, 1)
-        end)
-    end
+-- 线条粗细：等级越大越粗但整体偏细（1→1, 2→1, 3→2, 4→2, 5→3）
+local function lineW(lv)
+    return math.max(1, math.floor((math.abs(lv) + 1) / 2))
+end
+
+-- 从 (x0,y0) 到 (x1,y1)，两端各缩进 r0/r1（画到节点边缘，不穿过节点）
+local function edgePoints(x0, y0, x1, y1, r0, r1)
+    local dx, dy = x1 - x0, y1 - y0
+    local len = math.sqrt(dx * dx + dy * dy)
+    if len < 1 then return x0, y0, x1, y1 end
+    local ux, uy = dx / len, dy / len
+    return x0 + ux * r0, y0 + uy * r0, x1 - ux * r1, y1 - uy * r1
 end
 
 -- Bresenham 直线（同 RadarChart 的实现）
@@ -1009,39 +1022,50 @@ function StarMap:_dashLine(bb, x0, y0, x1, y1, color, w, dash, gap)
     end
 end
 
-function StarMap:_render(bb, px, py)
-    local W, H = self.width, self.height
-    bb:paintRect(px, py, W, H, Blitbuffer.COLOR_WHITE)
-    local cx, cy = px + W / 2, py + H / 2
+-- 画一条关系线（正实线 / 负虚线 / 0 细灰线），两端缩进到节点边缘
+function StarMap:_drawRelLine(bb, x0, y0, x1, y1, lv, r0, r1)
     local _BLACK = Blitbuffer.COLOR_BLACK
     local _GRAY = Blitbuffer.COLOR_DARK_GRAY
     local _LGRAY = Blitbuffer.COLOR_GRAY
-    -- 中心节点（中心模式）
-    if self._centerNode then
+    local ax0, ay0, ax1, ay1 = edgePoints(x0, y0, x1, y1, r0 or 0, r1 or 0)
+    if lv > 0 then
+        self:_line(bb, ax0, ay0, ax1, ay1, _BLACK, lineW(lv))
+    elseif lv < 0 then
+        self:_dashLine(bb, ax0, ay0, ax1, ay1, _GRAY, lineW(lv))
+    else
+        self:_line(bb, ax0, ay0, ax1, ay1, _LGRAY, 1)
+    end
+end
+
+function StarMap:paintTo(bb, x, y)
+    self._absX, self._absY = x or 0, y or 0
+    local ok, err = pcall(self._render, self, bb, x or 0, y or 0)
+    if not ok then
+        logger.warn("starmap render error: " .. tostring(err))
+        pcall(function()
+            bb:paintRect(x or 0, y or 0, self.W, self.H, Blitbuffer.COLOR_WHITE)
+            bb:paintRect(x or 0, y or 0, self.W, self.H, Blitbuffer.COLOR_BLACK, 1)
+        end)
+    end
+end
+
+function StarMap:_render(bb, px, py)
+    local W, H = self.W, self.H
+    local _BLACK = Blitbuffer.COLOR_BLACK
+    local _GRAY = Blitbuffer.COLOR_DARK_GRAY
+    local _LGRAY = Blitbuffer.COLOR_GRAY
+    bb:paintRect(px, py, W, H, Blitbuffer.COLOR_WHITE)
+    local cx, cy, R = self._cx, self._cy, self._R
+    -- 1. 同心环轨道（参考圆）
+    for _, rg in ipairs(self._rings or {}) do
+        bb:paintCircle(px + cx, py + cy, math.floor(rg.r), _LGRAY, 1)
+    end
+    -- 2. 连线（画到节点边缘，节点之后覆盖线头）
+    if self.mode == "center" and self._centerNode then
         local cn = self._centerNode
         local ax, ay = px + cn.x, py + cn.y
-        bb:paintCircle(ax, ay, cn.r, _BLACK, 2)
-        bb:paintCircle(ax, ay, cn.r - 2, Blitbuffer.COLOR_WHITE, 1)
-        if cn.label then
-            local sz = cn.label:getSize()
-            cn.label:paintTo(bb, ax - sz.w / 2, ay + cn.r + 3)
-        end
-    end
-    -- 连线
-    if self.mode == "center" and self._centerNode then
-        local ax, ay = px + self._centerNode.x, py + self._centerNode.y
         for _, n in ipairs(self._shown) do
-            local lv = n.lv or 0
-            if lv > 0 then
-                -- 正关系：实线，等级越大越粗
-                self:_line(bb, ax, ay, px + n.x, py + n.y, _BLACK, math.max(1, Screen:scaleBySize(lv)))
-            elseif lv < 0 then
-                -- 负关系：虚线，等级越大越粗
-                self:_dashLine(bb, ax, ay, px + n.x, py + n.y, _GRAY, math.max(1, Screen:scaleBySize(-lv)))
-            else
-                -- 0 级：细浅灰实线
-                self:_line(bb, ax, ay, px + n.x, py + n.y, _LGRAY, 1)
-            end
+            self:_drawRelLine(bb, ax, ay, px + n.x, py + n.y, n.lv or 0, cn.r + 1, n.r + 1)
         end
     elseif self.mode == "global" then
         local r = self.pair:_readRelations() or {}
@@ -1056,56 +1080,134 @@ function StarMap:_render(bb, px, py)
                     if n.idx == ib then nb = n end
                 end
                 if na and nb then
-                    -- 取双向中主导方向（带符号）决定正负与粗细
                     local a, b = node.ab or 0, node.ba or 0
                     local lv = math.abs(a) >= math.abs(b) and a or b
-                    if lv > 0 then
-                        self:_line(bb, px + na.x, py + na.y, px + nb.x, py + nb.y, _GRAY, math.max(1, Screen:scaleBySize(lv)))
-                    elseif lv < 0 then
-                        self:_dashLine(bb, px + na.x, py + na.y, px + nb.x, py + nb.y, _GRAY, math.max(1, Screen:scaleBySize(-lv)))
-                    else
-                        self:_line(bb, px + na.x, py + na.y, px + nb.x, py + nb.y, _LGRAY, 1)
-                    end
+                    self:_drawRelLine(bb, px + na.x, py + na.y, px + nb.x, py + nb.y, lv, na.r + 1, nb.r + 1)
                 end
             end
         end
     end
-    -- 节点
+    -- 3. 节点（实心，覆盖线头）
     for _, n in ipairs(self._shown) do
         local ax, ay = px + n.x, py + n.y
         if n.rel then
             bb:paintCircle(ax, ay, n.r + 3, _BLACK, 1)
         end
-        bb:paintCircle(ax, ay, n.r, _BLACK, 1)
-        bb:paintCircle(ax, ay, n.r - 2, Blitbuffer.COLOR_WHITE, 1)
+        bb:paintCircle(ax, ay, n.r, _BLACK)
         if n.label then
             local sz = n.label:getSize()
             n.label:paintTo(bb, ax - sz.w / 2, ay + n.r + 3)
         end
     end
-    -- 图例（底部）
-    local okF, face = pcall(Font.getFace, Font, "cfont", 10)
+    -- 中心节点（中心模式）
+    if self._centerNode then
+        local cn = self._centerNode
+        local ax, ay = px + cn.x, py + cn.y
+        bb:paintCircle(ax, ay, cn.r, _BLACK, 2)
+        bb:paintCircle(ax, ay, cn.r - 2, Blitbuffer.COLOR_WHITE)
+        if cn.label then
+            local sz = cn.label:getSize()
+            cn.label:paintTo(bb, ax - sz.w / 2, ay + cn.r + 3)
+        end
+    end
+    -- 4. 标题栏
+    bb:paintRect(px, py, W, self._titleH, Blitbuffer.COLOR_WHITE)
+    bb:paintRect(px, py + self._titleH - 1, W, 1, _LGRAY)
+    local okF, face = pcall(Font.getFace, Font, "cfont", 16)
     if okF and face then
-        local legend = self.mode == "center" and "近=亲近 · 远=疏远 · 点击节点看详情" or "全书关系网 · 点击节点进入该书星图"
-        local ok2, tw = pcall(TextWidget.new, TextWidget, { text = legend, face = face, fgcolor = _GRAY })
+        local ok2, tw = pcall(TextWidget.new, TextWidget, {
+            text = self:_titleText(), face = face, fgcolor = _BLACK,
+        })
         if ok2 and type(tw) == "table" then
             local sz = tw:getSize()
-            tw:paintTo(bb, px + (W - sz.w) / 2, py + H - sz.h - 4)
+            tw:paintTo(bb, px + (W - sz.w) / 2, py + (self._titleH - sz.h) / 2)
+        end
+    end
+    -- 右上角关闭按钮 ✕
+    local closeR = Screen:scaleBySize(16)
+    local closeCx = px + W - closeR - Screen:scaleBySize(12)
+    local closeCy = py + self._titleH / 2
+    self._closeX, self._closeY = closeCx, closeCy
+    bb:paintRect(closeCx - closeR, closeCy - closeR, closeR * 2, closeR * 2, _LGRAY, 1)
+    self:_line(bb, closeCx - closeR + 4, closeCy - closeR + 4, closeCx + closeR - 4, closeCy + closeR - 4, _BLACK, 1)
+    self:_line(bb, closeCx + closeR - 4, closeCy - closeR + 4, closeCx - closeR + 4, closeCy + closeR - 4, _BLACK, 1)
+    -- 5. 底部按钮栏
+    local barY = py + H - self._barH
+    bb:paintRect(px, barY, W, self._barH, Blitbuffer.COLOR_WHITE)
+    bb:paintRect(px, barY, W, 1, _LGRAY)
+    local bw = W / 3
+    local btnH = self._barH - Screen:scaleBySize(8)
+    local btnY = barY + Screen:scaleBySize(4)
+    local okF2, face2 = pcall(Font.getFace, Font, "cfont", 14)
+    local labels = { "上一页", "下一页", "关闭" }
+    for i = 1, 3 do
+        local bx = px + (i - 1) * bw
+        local enabled = true
+        if i == 1 then enabled = self.page > 1 end
+        if i == 2 then enabled = self.page < self.pages end
+        bb:paintRect(bx + Screen:scaleBySize(6), btnY, bw - Screen:scaleBySize(12), btnH, _LGRAY, 1)
+        if okF2 and face2 then
+            local ok3, tw = pcall(TextWidget.new, TextWidget, {
+                text = labels[i], face = face2,
+                fgcolor = enabled and _BLACK or _LGRAY,
+            })
+            if ok3 and type(tw) == "table" then
+                local sz = tw:getSize()
+                tw:paintTo(bb, bx + (bw - sz.w) / 2, btnY + (btnH - sz.h) / 2)
+            end
+        end
+    end
+    -- 图例（星图区域底部，含页码）
+    local okF3, face3 = pcall(Font.getFace, Font, "cfont", 10)
+    if okF3 and face3 then
+        local legend = string.format("第 %d/%d 页 · ", self.page, self.pages)
+        if self.mode == "center" then
+            legend = legend .. "近=亲近 远=疏远 · 实线=好感 虚线=恶感"
+        else
+            legend = legend .. "全书关系网 · 点击节点进入该书星图"
+        end
+        local ok4, tw = pcall(TextWidget.new, TextWidget, { text = legend, face = face3, fgcolor = _GRAY })
+        if ok4 and type(tw) == "table" then
+            local sz = tw:getSize()
+            tw:paintTo(bb, px + (W - sz.w) / 2, py + cy + R + Screen:scaleBySize(6))
         end
     end
 end
 
--- 节点点击命中检测（供 dialog.onTap 转发）
-function StarMap:handleTap(ges)
+-- 点击处理（自包含 widget，直接接收 onTap）
+function StarMap:onTap(ges)
     local pos = ges and ges.pos
     if not pos then return false end
-    local x, y = pos.x, pos.y
-    local ax, ay = self._absX or 0, self._absY or 0
+    local ax0, ay0 = self._absX or 0, self._absY or 0
+    local x, y = pos.x - ax0, pos.y - ay0
+    -- 右上角关闭
+    if self._closeX and self._closeY then
+        local cr = Screen:scaleBySize(20)
+        if math.abs(x - self._closeX) <= cr and math.abs(y - self._closeY) <= cr then
+            UIManager:close(self)
+            return true
+        end
+    end
+    -- 底部按钮
+    if y >= self.H - self._barH then
+        local bw = self.W / 3
+        local i = math.floor(x / bw) + 1
+        if i == 1 and self.page > 1 then
+            UIManager:close(self)
+            self.pair:showStarMapAt(self.ff, self.center_idx, self.mode, self.page - 1)
+        elseif i == 2 and self.page < self.pages then
+            UIManager:close(self)
+            self.pair:showStarMapAt(self.ff, self.center_idx, self.mode, self.page + 1)
+        elseif i == 3 then
+            UIManager:close(self)
+        end
+        return true
+    end
+    -- 节点
     for _, n in ipairs(self._shown) do
         if n.x and n.y then
-            local nx, ny = ax + n.x, ay + n.y
-            local dx, dy = x - nx, y - ny
-            local rr = (n.r or 8) + 8
+            local dx, dy = x - n.x, y - n.y
+            local rr = (n.r or 8) + 10
             if dx * dx + dy * dy <= rr * rr then
                 if self._onNodeTap then self._onNodeTap(n.idx) end
                 return true
@@ -1115,87 +1217,45 @@ function StarMap:handleTap(ges)
     return false
 end
 
+-- 返回键关闭
+function StarMap:onCloseWidget()
+    UIManager:close(self)
+    return true
+end
+
 -- 打开星图：center_entry 为空 → 全局模式；否则以该书为中心
 function Pair:showStarMap(ff, center_entry)
+    self:showStarMapAt(ff, center_entry and center_entry.index or nil, center_entry and "center" or "global", 1)
+end
+
+function Pair:showStarMapAt(ff, cidx, cmode, page)
     local collection = ff:_readCollection()
     if #collection < 2 then
         ff:_showMessage("至少需要两本养成书才会产生书与书的关系。", 4)
         return
     end
-    local function open(page, cidx, cmode)
-        local border_w = Size.border.window
-        local padding_w = Size.padding.default
-        local dialog_width = Screen:scaleBySize(560)
-        local avail_w = math.max(200, dialog_width - 2 * (border_w + padding_w))
-        local avail_h = math.max(240, math.floor(Screen:getHeight() * 0.72))
-        local sm = StarMap:new{
-            ff = ff, pair = self,
-            mode = cmode or "global",
-            center_idx = cidx,
-            page = page or 1,
-            width = avail_w, height = avail_h,
-        }
-        if not (sm and sm.dimen) then
-            ff:_showMessage("星图打开失败，请稍后再试。", 4)
-            return
-        end
-        local pages = math.max(1, sm.pages or 1)
-        local dialog
-        sm._onNodeTap = function(idx)
-            if sm.mode == "global" then
-                UIManager:close(dialog)
-                open(1, idx, "center")
-            else
-                self:_showBookRelDetail(ff, cidx, idx)
-            end
-        end
-        local title = "书的关系星图"
-        if cmode == "center" and cidx then
-            title = string.format("《%s》的星图", self:_name(ff, self:_entryOf(ff, cidx)))
-        end
-        dialog = ButtonDialog:new{
-            title = title,
-            title_align = "center",
-            width = dialog_width,
-            scrollable_content = false,
-            buttons = {
-                {
-                    { text = "上一页", enabled = page > 1,
-                      callback = function()
-                          UIManager:close(dialog)
-                          open(page - 1, cidx, cmode)
-                      end },
-                    { text = "下一页", enabled = page < pages,
-                      callback = function()
-                          UIManager:close(dialog)
-                          open(page + 1, cidx, cmode)
-                      end },
-                    { text = "关闭",
-                      callback = function()
-                          UIManager:close(dialog)
-                      end },
-                },
-            },
-        }
-        -- 节点点击：覆盖 dialog.onTap，先让星图处理命中，再回退默认
-        local origTap = dialog.onTap
-        dialog.onTap = function(dlg, ges)
-            if sm:handleTap(ges) then return true end
-            if origTap then return origTap(dlg, ges) end
-            return false
-        end
-        local okAdd, addErr = pcall(function() dialog:addWidget(sm) end)
-        if not okAdd then
-            logger.warn("starmap addWidget error: " .. tostring(addErr))
-            ff:_showMessage("星图打开失败，请稍后再试。", 4)
-            return
-        end
-        local okShow, errShow = pcall(function() UIManager:show(dialog) end)
-        if not okShow then
-            logger.warn("show starmap error: " .. tostring(errShow))
+    local sm = StarMap:new{
+        ff = ff, pair = self,
+        mode = cmode or "global",
+        center_idx = cidx,
+        page = page or 1,
+    }
+    if not (sm and sm.dimen) then
+        ff:_showMessage("星图打开失败，请稍后再试。", 4)
+        return
+    end
+    sm._onNodeTap = function(idx)
+        if sm.mode == "global" then
+            UIManager:close(sm)
+            self:showStarMapAt(ff, idx, "center", 1)
+        else
+            self:_showBookRelDetail(ff, cidx, idx)
         end
     end
-    open(1, center_entry and center_entry.index or nil, center_entry and "center" or "global")
+    local okShow, errShow = pcall(function() UIManager:show(sm) end)
+    if not okShow then
+        logger.warn("show starmap error: " .. tostring(errShow))
+    end
 end
 
 function Pair:showRelationMap(ff)
