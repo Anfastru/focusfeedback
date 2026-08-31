@@ -652,7 +652,10 @@ function Pair:pickPartner(ff, entry, others)
             callback = function()
                 if m then UIManager:close(m) end
                 if logger then logger.warn("Pair:pickPartner PICK", entry.index, e.index) end
-                self:_runPair(ff, entry, e)
+                -- 延迟到下一帧再触发：避免在菜单项点击的手势帧里同步 show 导致结果弹窗被 KOReader 栈覆盖而不可见
+                UIManager:scheduleIn(0.1, function()
+                    self:_runPair(ff, entry, e)
+                end)
             end,
         }
     end
