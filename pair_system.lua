@@ -532,18 +532,10 @@ end
 local function _btnDialog(title, body, buttons, self_ref)
     local dlg = ButtonDialog:new{
         title = title or "", title_align = "center",
+        info_text = body or "",
         width = Screen:scaleBySize(560),
-        scrollable_content = true,
         buttons = buttons,
     }
-    local border_w = Size.border.window
-    local padding_w = Size.padding.default
-    local avail_w = dlg.width - 2 * (border_w + padding_w)
-    local bodyTW = TextBoxWidget:new{ text = body or "", face = Font:getFace("cfont", 20), width = avail_w }
-    bodyTW.not_focusable = true
-    local vertical = VerticalGroup:new{ align = "left", bodyTW }
-    vertical.not_focusable = true
-    dlg:addWidget(vertical)
     return dlg
 end
 
