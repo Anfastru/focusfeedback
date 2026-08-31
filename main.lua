@@ -5040,7 +5040,7 @@ function FocusFeedback:_outdoorStart(entry)
         self:_showMessage("积分不足，出门需要 10 积分。", 4)
         return
     end
-    self:_savePoints(pts - 10)
+    -- 基础 10 分不在弹窗前扣除，改为真正出发时（单人 _outdoorResolve / 双人 _runPair）再扣
     local c = self:_readCollection()
     for _, e in ipairs(c) do
         if e.index == entry.index then
@@ -5104,6 +5104,13 @@ end
 -- 出门结算：契合分判定成败 → 成功掉档/特殊，失败扣心情
 function FocusFeedback:_outdoorResolve(entry, evt, opt)
     if not opt then return end
+    -- 真正出发时扣除基础 10 分（V25：改为结算时扣，弹窗/取消不扣）
+    local pnow = self:_readPoints()
+    if pnow < 10 then
+        self:_showMessage("积分不足，出门需要 10 积分。", 4)
+        return
+    end
+    self:_savePoints(pnow - 10)
     local nick = self:_nick(entry)
     local function rep(s) return string.gsub(s or "", "xx", tostring(nick)) end
     local f = self:_outdoorFit(entry, opt.attr)
@@ -5998,6 +6005,7 @@ function FocusFeedback:_tick()
     -- V15.1: 书之来信（成年书测试书注入 + 离线来信检查）
     -- 每个环节独立保护，避免任一异常吞掉来信检查
     pcall(function() self:_ensureTestBooks() end)
+    pcall(function() self:_refundOnce() end)
     pcall(function() self:_inboxInit() end)
     pcall(function()
         local ok, err = pcall(function() self:_showInboxLetters() end)
@@ -10171,7 +10179,15 @@ function FocusFeedback:_ensureTestBooks()
         if e.test_book == "A" then hasA = true end
         if e.test_book == "B" then hasB = true end
     end
-    if hasA and hasB then return end
+    if hasA and hasB then
+        -- 两本测试书均存在：仅在此次检测前从未发过+100时补发（兜底，通常在下方新增分支已处理）
+        local bonusA = G_reader_settings:readSetting(settingKey("v4_test_bonus_100"), false)
+        if not bonusA then
+            self:_savePoints((self:_readPoints() or 0) + 100)
+            G_reader_settings:saveSetting(settingKey("v4_test_bonus_100"), true)
+        end
+        return
+    end
     -- 测试书 A：属性均衡且中高（便于测"均衡且偏高"）
     if not hasA then
         table.insert(c, {
@@ -10189,15 +10205,24 @@ function FocusFeedback:_ensureTestBooks()
         })
     end
     self:_saveCollection(c)
-    -- 测试便利：首次注入测试书时赠送 100 积分（仅一次，用标记防重复叠加）
+    -- 测试便利：首次注入测试书时赠送 100 积分
     local bonus = G_reader_settings:readSetting(settingKey("v4_test_bonus_100"), false)
-    if not bonus and (hasA or hasB) then
+    if not bonus then
         self:_savePoints((self:_readPoints() or 0) + 100)
         G_reader_settings:saveSetting(settingKey("v4_test_bonus_100"), true)
     end
 end
 
 -- 为 collection 中每本成年书（含测试书）更新 last_inbox_ts（首次）
+function FocusFeedback:_refundOnce()
+    -- 一次性补偿 60 积分（此前"没出门却扣了积分"，仅补偿一次，防重复叠加）
+    local key = settingKey("v4_refund_60")
+    local done = G_reader_settings:readSetting(key, false)
+    if done then return end
+    self:_savePoints((self:_readPoints() or 0) + 60)
+    G_reader_settings:saveSetting(key, true)
+end
+
 function FocusFeedback:_inboxInit()
     local c = self:_readCollection()
     local changed = false

@@ -635,6 +635,13 @@ end
 
 function Pair:_runPair(ff, aEntry, bEntry)
     if not aEntry or not bEntry then return end
+    -- 真正出发时扣除基础 10 分（主书结算时扣，弹窗/取消不扣）
+    local pnow = ff:_readPoints()
+    if pnow < 10 then
+        if ff._showMessage then ff:_showMessage("积分不足，出门需要 10 积分。", 4) end
+        return
+    end
+    ff:_savePoints(pnow - 10)
     local ia, ib = aEntry.index, bEntry.index
     local node = self:_getRel(ff, ia, ib)
     -- 单恋彩蛋：主体书是单恋方时，小概率触发许愿柳
