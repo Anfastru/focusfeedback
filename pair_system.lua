@@ -920,11 +920,15 @@ function StarMap:_buildLayout()
         if cnt > 0 then
             local r = rings[ri].r
             local step = 2 * math.pi / cnt
+            -- 每环起始相位错开（上→右→下→左），避免各等级环的首节点都堆在正上方，
+            -- 让关系线向全周方向散开，每个节点的线都清楚指向它自己
+            local base = -math.pi / 2 + (ri - 1) * (math.pi / 2)
             for i, n in ipairs(bucket) do
-                local ang = -math.pi / 2 + (i - 1) * step
+                local ang = base + (i - 1) * step
                 n.x = cx + r * math.cos(ang)
                 n.y = cy + r * math.sin(ang)
                 n.r = nodeR
+                n.ang = ang
             end
         end
     end
@@ -965,7 +969,7 @@ function StarMap:_buildLabels()
     end
 end
 
--- 线条粗细：等级越大越粗但整体偏细（1→1, 2→1, 3→2, 4→2, 5→3）
+-- 线条粗细：等级越大越粗但整体偏细（1→1, 2→1, 3→2, 4→2, 5→3）—— 与原版一致
 local function lineW(lv)
     return math.max(1, math.floor((math.abs(lv) + 1) / 2))
 end
@@ -979,7 +983,7 @@ local function edgePoints(x0, y0, x1, y1, r0, r1)
     return x0 + ux * r0, y0 + uy * r0, x1 - ux * r1, y1 - uy * r1
 end
 
--- Bresenham 直线（同 RadarChart 的实现）
+-- Bresenham 直线（同 RadarChart 的实现）；统一用 paintRect 绘制，墨水屏上更稳更清晰
 function StarMap:_line(bb, x0, y0, x1, y1, color, w)
     x0, y0 = math.floor(x0 + 0.5), math.floor(y0 + 0.5)
     x1, y1 = math.floor(x1 + 0.5), math.floor(y1 + 0.5)
@@ -991,8 +995,7 @@ function StarMap:_line(bb, x0, y0, x1, y1, color, w)
     w = math.max(1, math.floor(w or 1))
     local half = math.floor(w / 2)
     while true do
-        if w <= 1 then bb:setPixelClamped(x0, y0, color)
-        else bb:paintRect(x0 - half, y0 - half, w, w, color) end
+        bb:paintRect(x0 - half, y0 - half, w, w, color)
         if x0 == x1 and y0 == y1 then break end
         local e2 = 2 * err
         if e2 > -dy then err = err - dy; x0 = x0 + sx end
@@ -1005,7 +1008,8 @@ function StarMap:_dashLine(bb, x0, y0, x1, y1, color, w, dash, gap)
     local dx, dy = x1 - x0, y1 - y0
     local len = math.sqrt(dx * dx + dy * dy)
     if len < 1 then
-        bb:setPixelClamped(math.floor(x0 + 0.5), math.floor(y0 + 0.5), color)
+        local ww = math.max(1, math.floor(w or 1))
+        bb:paintRect(math.floor(x0 + 0.5), math.floor(y0 + 0.5), ww, ww, color)
         return
     end
     local ux, uy = dx / len, dy / len
@@ -1030,6 +1034,7 @@ function StarMap:_drawRelLine(bb, x0, y0, x1, y1, lv, r0, r1)
     elseif lv < 0 then
         self:_dashLine(bb, ax0, ay0, ax1, ay1, _GRAY, lineW(lv))
     else
+        -- 0 级：浅灰细线（与原版一致），醒目度低但清晰区分于正/负关系
         self:_line(bb, ax0, ay0, ax1, ay1, _LGRAY, 1)
     end
 end
@@ -1061,7 +1066,7 @@ function StarMap:_render(bb, px, py)
         local cn = self._centerNode
         local ax, ay = px + cn.x, py + cn.y
         for _, n in ipairs(self._shown) do
-            self:_drawRelLine(bb, ax, ay, px + n.x, py + n.y, n.lv or 0, cn.r + 1, n.r + 1)
+            self:_drawRelLine(bb, ax, ay, px + n.x, py + n.y, n.lv or 0, cn.r, n.r)
         end
     elseif self.mode == "global" then
         local r = self.pair:_readRelations() or {}
@@ -1078,31 +1083,47 @@ function StarMap:_render(bb, px, py)
                 if na and nb then
                     local a, b = node.ab or 0, node.ba or 0
                     local lv = math.abs(a) >= math.abs(b) and a or b
-                    self:_drawRelLine(bb, px + na.x, py + na.y, px + nb.x, py + nb.y, lv, na.r + 1, nb.r + 1)
+                    self:_drawRelLine(bb, px + na.x, py + na.y, px + nb.x, py + nb.y, lv, na.r, nb.r)
                 end
             end
         end
     end
-    -- 3. 节点（描边圆，线画到边缘）
+    -- 3. 节点（实心圆，与空心参考环明显区分；标签沿径向置于外侧）
     for _, n in ipairs(self._shown) do
         local ax, ay = px + n.x, py + n.y
+        bb:paintCircle(ax, ay, n.r, _BLACK, n.r)  -- 实心填充
         if n.rel then
-            bb:paintCircle(ax, ay, n.r + 3, _BLACK, 1)
+            bb:paintCircle(ax, ay, n.r + 3, _BLACK, 1)  -- 持久关系外圈
         end
-        bb:paintCircle(ax, ay, n.r, _BLACK, 1)
         if n.label then
             local sz = n.label:getSize()
-            n.label:paintTo(bb, ax - sz.w / 2, ay + n.r + 3)
+            local ang = n.ang or -math.pi / 2
+            local cosA, sinA = math.cos(ang), math.sin(ang)
+            -- 标签中心沿径向偏移，偏移量含标签自身半尺寸，保证标签整体在节点外侧（不盖住节点）
+            local half = (math.abs(cosA) * sz.w + math.abs(sinA) * sz.h) / 2
+            local off = n.r + 4 + half
+            local lx = ax + cosA * off
+            local ly = ay + sinA * off
+            -- 超出星图边界则翻转到节点内侧（朝圆心），避免标签被夹到边缘显得"乱飞"
+            local minx, maxx = px + sz.w / 2, px + self.W - sz.w / 2
+            local miny, maxy = py + sz.h / 2, py + self.H - sz.h / 2
+            if lx < minx or lx > maxx or ly < miny or ly > maxy then
+                lx = ax - cosA * off
+                ly = ay - sinA * off
+                if lx < minx then lx = minx elseif lx > maxx then lx = maxx end
+                if ly < miny then ly = miny elseif ly > maxy then ly = maxy end
+            end
+            n.label:paintTo(bb, lx - sz.w / 2, ly - sz.h / 2)
         end
     end
     -- 中心节点（中心模式）
     if self._centerNode then
         local cn = self._centerNode
         local ax, ay = px + cn.x, py + cn.y
-        bb:paintCircle(ax, ay, cn.r, _BLACK, 2)
+        bb:paintCircle(ax, ay, cn.r, _BLACK, cn.r)  -- 实心填充
         if cn.label then
             local sz = cn.label:getSize()
-            cn.label:paintTo(bb, ax - sz.w / 2, ay + cn.r + 3)
+            cn.label:paintTo(bb, ax - sz.w / 2, ay + cn.r + 4)
         end
     end
     -- 图例（星图区域底部，含页码）
@@ -1153,11 +1174,17 @@ function Pair:showStarMapAt(ff, cidx, cmode, page)
         ff:_showMessage("至少需要两本养成书才会产生书与书的关系。", 4)
         return
     end
+    local screen_w = Screen:getWidth() or 600
+    local screen_h = Screen:getHeight() or 800
     local dialog_width = Screen:scaleBySize(560)
+    -- 对话框宽度不得超过屏幕（含边距），避免星图被裁切导致节点"飞出"屏幕
+    local max_dialog_w = screen_w - Screen:scaleBySize(8)
+    if dialog_width > max_dialog_w then dialog_width = max_dialog_w end
     -- 星图内容可用宽度（与 ButtonDialog 的 title_group_width 近似）
     local avail_w = math.max(200, dialog_width - 2 * Size.border.window - 2 * Size.padding.button
         - 2 * (Size.padding.default + Size.margin.default))
-    local avail_h = math.max(200, math.floor(Screen:getHeight() * 0.6))
+    -- 星图高度：为标题栏与两行按钮预留空间，避免整体超出屏幕被裁切
+    local avail_h = math.max(200, math.floor(screen_h * 0.55))
     -- 先建星图以取得页数（供按钮 enabled 判断）
     local sm
     local okNew, newErr = pcall(function()
@@ -1310,7 +1337,10 @@ function Pair:_showBookRelDetail(ff, ia, ib)
         body = body .. string.format("\n\n已形成关系：[%s]（%s）",
             PNAMES[node.rel] or node.rel, node.rel_side == "BA" and ("%s 更主动"):format(bN) or ("%s 更主动"):format(aN))
     end
-    local dlg = _btnDialog("关系详情", body, { { { text = "确定", callback = function() end } } }, nil)
+    local dlg
+    dlg = _btnDialog("关系详情", body, { { { text = "确定", callback = function()
+        if dlg then UIManager:close(dlg) end
+    end } } }, nil)
     UIManager:show(dlg)
 end
 
