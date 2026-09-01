@@ -926,7 +926,7 @@ function StarMap:_buildLayout()
             local step = 2 * math.pi / cnt
             -- 每环起始相位错开（上→右→下→左），避免各等级环的首节点都堆在正上方，
             -- 让关系线向全周方向散开，每个节点的线都清楚指向它自己
-            local base = -math.pi / 2 + (ri - 1) * (math.pi / 2)
+            local base = -math.pi / 2 + (ri - 1) * (math.pi / 2) + math.pi / 4
             for i, n in ipairs(bucket) do
                 n.ang = base + (i - 1) * step
                 n.ringR = ringR   -- 仅存极坐标，绘制时依据实际圆心换算绝对坐标（见 _render）
