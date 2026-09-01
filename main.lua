@@ -58,6 +58,9 @@ local Dispatcher = require("dispatcher")
 -- 双书关系系统（V25）
 local PairSys = require("pair_system")
 
+-- 专注计时（V26 番茄钟）
+local FocusTimer = require("focus_timer")
+
 -- ========== 主插件类 ==========
 
 
@@ -7171,6 +7174,13 @@ function FocusFeedback:_showStats()
     self:_showMessage(msg, 6)
 end
 
+function FocusFeedback:_showFocusTimer(menu)
+    -- 全屏专注计时（番茄钟）
+    pcall(function()
+        FocusTimer.open(self)
+    end)
+end
+
 function FocusFeedback:addToMainMenu(menu_items)
     -- V1 菜单
     menu_items.focus_feedback = {
@@ -7197,17 +7207,15 @@ function FocusFeedback:addToMainMenu(menu_items)
                 end,
             },
             {
-                text_func = function()
-                    return self.enabled and "暂停专注计时" or "开启专注计时"
-                end,
-                callback = function(menu)
-                    self:_toggleEnabled(menu)
-                end,
-            },
-            {
                 text = "标记读完当前书",
                 callback = function()
                     self:_triggerEndBookRating()
+                end,
+            },
+            {
+                text = "番茄钟",
+                callback = function(menu)
+                    self:_showFocusTimer(menu)
                 end,
             },
             {
@@ -7341,6 +7349,14 @@ function FocusFeedback:addToMainMenu(menu_items)
                 text = "清零今日统计",
                 callback = function(menu)
                     self:_resetToday(menu)
+                end,
+            },
+            {
+                text_func = function()
+                    return self.enabled and "暂停专注计时" or "开启专注计时"
+                end,
+                callback = function(menu)
+                    self:_toggleEnabled(menu)
                 end,
             },
             {
@@ -7717,6 +7733,7 @@ function FocusFeedback:_doUpdate(base_url, remote_version)
             "sentence_pool.lua",
             "bookmark_quotes.lua",
             "pair_system.lua",
+            "focus_timer.lua",
         }
 
         local plugin_dir = self:_getPluginDir()
