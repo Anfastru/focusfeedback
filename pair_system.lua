@@ -824,6 +824,10 @@ local function clipUTF8(s, maxBytes)
     return t .. "…"
 end
 
+-- 星图坐标自检开关：置 true 时在 koreader 的 log 里打印实际盒子尺寸与每个节点的坐标，
+-- 用来核对“节点画在哪里 / 线指向哪里 / 圆周画在哪”是否来自同一组数
+local SM_DEBUG = true
+
 local StarMap = WidgetContainer:extend{
     ff = nil,
     pair = nil,
@@ -1057,6 +1061,12 @@ function StarMap:_render(bb, px, py)
     local _LGRAY = Blitbuffer.COLOR_GRAY
     bb:paintRect(px, py, W, H, Blitbuffer.COLOR_WHITE)
     local cx, cy, R = self._cx, self._cy, self._R
+    if SM_DEBUG then
+        logger.info("SM: box=" .. tostring(W) .. "x" .. tostring(H)
+            .. " paintAt=(" .. tostring(px) .. "," .. tostring(py) .. ")"
+            .. " center=(" .. tostring(cx) .. "," .. tostring(cy) .. ") R=" .. tostring(R)
+            .. " mode=" .. tostring(self.mode))
+    end
     -- 1. 同心环轨道（参考圆）
     for _, rg in ipairs(self._rings or {}) do
         bb:paintCircle(px + cx, py + cy, math.floor(rg.r), _LGRAY, 1)
@@ -1091,6 +1101,10 @@ function StarMap:_render(bb, px, py)
     -- 3. 节点（实心圆，与空心参考环明显区分；标签沿径向置于外侧）
     for _, n in ipairs(self._shown) do
         local ax, ay = px + n.x, py + n.y
+        if SM_DEBUG then
+            logger.info("SM node: " .. tostring(n.name) .. " paintedAt=(" .. tostring(ax) .. "," .. tostring(ay)
+                .. ") lineTo=(" .. tostring(px + n.x) .. "," .. tostring(py + n.y) .. ") lv=" .. tostring(n.lv or 0))
+        end
         bb:paintCircle(ax, ay, n.r, _BLACK, n.r)  -- 实心填充
         if n.rel then
             bb:paintCircle(ax, ay, n.r + 3, _BLACK, 1)  -- 持久关系外圈
@@ -1183,8 +1197,10 @@ function Pair:showStarMapAt(ff, cidx, cmode, page)
     -- 星图内容可用宽度（与 ButtonDialog 的 title_group_width 近似）
     local avail_w = math.max(200, dialog_width - 2 * Size.border.window - 2 * Size.padding.button
         - 2 * (Size.padding.default + Size.margin.default))
-    -- 星图高度：为标题栏与两行按钮预留空间，避免整体超出屏幕被裁切
-    local avail_h = math.max(200, math.floor(screen_h * 0.55))
+    -- 星图高度：为标题栏与两行按钮预留空间，避免整体超出屏幕被裁切。
+    -- 刻意取小（0.42 屏高），保证标题+星图+图例+两行按钮的总高必然小于屏高，
+    -- 防止对话框把组件压缩到小于其声明尺寸，从而让节点溢出到圆周之外。
+    local avail_h = math.max(120, math.floor(screen_h * 0.42))
     -- 先建星图以取得页数（供按钮 enabled 判断）
     local sm
     local okNew, newErr = pcall(function()
