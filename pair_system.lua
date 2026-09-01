@@ -922,17 +922,15 @@ function StarMap:_buildLayout()
     for ri, bucket in ipairs(ringBuckets) do
         local cnt = #bucket
         if cnt > 0 then
-            local r = rings[ri].r
+            local ringR = rings[ri].r
             local step = 2 * math.pi / cnt
             -- 每环起始相位错开（上→右→下→左），避免各等级环的首节点都堆在正上方，
             -- 让关系线向全周方向散开，每个节点的线都清楚指向它自己
             local base = -math.pi / 2 + (ri - 1) * (math.pi / 2)
             for i, n in ipairs(bucket) do
-                local ang = base + (i - 1) * step
-                n.x = cx + r * math.cos(ang)
-                n.y = cy + r * math.sin(ang)
-                n.r = nodeR
-                n.ang = ang
+                n.ang = base + (i - 1) * step
+                n.ringR = ringR   -- 仅存极坐标，绘制时依据实际圆心换算绝对坐标（见 _render）
+                n.r = nodeR       -- 节点像素半径（视觉与线缩进共用）
             end
         end
     end
@@ -1032,7 +1030,11 @@ function StarMap:_drawRelLine(bb, x0, y0, x1, y1, lv, r0, r1)
     local _BLACK = Blitbuffer.COLOR_BLACK
     local _GRAY = Blitbuffer.COLOR_DARK_GRAY
     local _LGRAY = Blitbuffer.COLOR_GRAY
-    local ax0, ay0, ax1, ay1 = edgePoints(x0, y0, x1, y1, r0 or 0, r1 or 0)
+    -- 让线头多伸进节点一小段（over 像素），实心节点随后压住线头，
+    -- 杜绝“线接不上节点”的可见缝隙
+    local over = 2
+    local ax0, ay0, ax1, ay1 = edgePoints(x0, y0, x1, y1,
+        math.max(0, (r0 or 0) - over), math.max(0, (r1 or 0) - over))
     if lv > 0 then
         self:_line(bb, ax0, ay0, ax1, ay1, _BLACK, lineW(lv))
     elseif lv < 0 then
@@ -1060,7 +1062,11 @@ function StarMap:_render(bb, px, py)
     local _GRAY = Blitbuffer.COLOR_DARK_GRAY
     local _LGRAY = Blitbuffer.COLOR_GRAY
     bb:paintRect(px, py, W, H, Blitbuffer.COLOR_WHITE)
-    local cx, cy, R = self._cx, self._cy, self._R
+    -- 圆心：始终取"当前实际绘制盒子"的正中心。节点/线/环都以它为准即时换算，
+    -- 三者永远共享同一个圆心，杜绝"节点在 A、线却朝 B"的相互分离。
+    local cx = px + W / 2
+    local cy = py + H / 2
+    local R = self._R
     if SM_DEBUG then
         logger.info("SM: box=" .. tostring(W) .. "x" .. tostring(H)
             .. " paintAt=(" .. tostring(px) .. "," .. tostring(py) .. ")"
@@ -1069,14 +1075,19 @@ function StarMap:_render(bb, px, py)
     end
     -- 1. 同心环轨道（参考圆）
     for _, rg in ipairs(self._rings or {}) do
-        bb:paintCircle(px + cx, py + cy, math.floor(rg.r), _LGRAY, 1)
+        bb:paintCircle(cx, cy, math.floor(rg.r), _LGRAY, 1)
     end
     -- 2. 连线（画到节点边缘，节点之后覆盖线头）
+    local function nodeAbs(n)
+        return cx + (n.ringR or 0) * math.cos(n.ang or 0),
+               cy + (n.ringR or 0) * math.sin(n.ang or 0)
+    end
     if self.mode == "center" and self._centerNode then
         local cn = self._centerNode
-        local ax, ay = px + cn.x, py + cn.y
+        local ax, ay = cx, cy
         for _, n in ipairs(self._shown) do
-            self:_drawRelLine(bb, ax, ay, px + n.x, py + n.y, n.lv or 0, cn.r, n.r)
+            local nx, ny = nodeAbs(n)
+            self:_drawRelLine(bb, ax, ay, nx, ny, n.lv or 0, cn.r, n.r)
         end
     elseif self.mode == "global" then
         local r = self.pair:_readRelations() or {}
@@ -1093,17 +1104,19 @@ function StarMap:_render(bb, px, py)
                 if na and nb then
                     local a, b = node.ab or 0, node.ba or 0
                     local lv = math.abs(a) >= math.abs(b) and a or b
-                    self:_drawRelLine(bb, px + na.x, py + na.y, px + nb.x, py + nb.y, lv, na.r, nb.r)
+                    local ax0, ay0 = nodeAbs(na)
+                    local ax1, ay1 = nodeAbs(nb)
+                    self:_drawRelLine(bb, ax0, ay0, ax1, ay1, lv, na.r, nb.r)
                 end
             end
         end
     end
     -- 3. 节点（实心圆，与空心参考环明显区分；标签沿径向置于外侧）
     for _, n in ipairs(self._shown) do
-        local ax, ay = px + n.x, py + n.y
+        local ax, ay = nodeAbs(n)
         if SM_DEBUG then
             logger.info("SM node: " .. tostring(n.name) .. " paintedAt=(" .. tostring(ax) .. "," .. tostring(ay)
-                .. ") lineTo=(" .. tostring(px + n.x) .. "," .. tostring(py + n.y) .. ") lv=" .. tostring(n.lv or 0))
+                .. ") lv=" .. tostring(n.lv or 0) .. " ringR=" .. tostring(n.ringR or 0) .. " ang=" .. tostring(math.floor((n.ang or 0) * 180 / math.pi)))
         end
         bb:paintCircle(ax, ay, n.r, _BLACK, n.r)  -- 实心填充
         if n.rel then
@@ -1133,11 +1146,22 @@ function StarMap:_render(bb, px, py)
     -- 中心节点（中心模式）
     if self._centerNode then
         local cn = self._centerNode
-        local ax, ay = px + cn.x, py + cn.y
+        local ax, ay = cx, cy
         bb:paintCircle(ax, ay, cn.r, _BLACK, cn.r)  -- 实心填充
         if cn.label then
             local sz = cn.label:getSize()
             cn.label:paintTo(bb, ax - sz.w / 2, ay + cn.r + 4)
+        end
+    end
+    -- 3.5 校准标记（仅调试用，SM_DEBUG=true 时显示）：
+    -- 环心画大十字、每个节点圆心画小十字；若十字与实心点/线端不重合，即为锚点或朝向问题，否则纯属屏幕显示帧的问题
+    if SM_DEBUG then
+        bb:paintRect(cx - 24, cy - 1, 49, 3, _BLACK)
+        bb:paintRect(cx - 1, cy - 24, 3, 49, _BLACK)
+        for _, n in ipairs(self._shown) do
+            local ax, ay = nodeAbs(n)
+            bb:paintRect(ax - 8, ay - 1, 16, 3, _BLACK)
+            bb:paintRect(ax - 1, ay - 8, 3, 16, _BLACK)
         end
     end
     -- 图例（星图区域底部，含页码）
@@ -1152,7 +1176,7 @@ function StarMap:_render(bb, px, py)
         local ok4, tw = pcall(TextWidget.new, TextWidget, { text = legend, face = face3, fgcolor = _GRAY })
         if ok4 and type(tw) == "table" then
             local sz = tw:getSize()
-            tw:paintTo(bb, px + (W - sz.w) / 2, py + cy + R + Screen:scaleBySize(6))
+            tw:paintTo(bb, px + (W - sz.w) / 2, cy + R + Screen:scaleBySize(6))
         end
     end
 end
@@ -1163,9 +1187,12 @@ function StarMap:handleTap(ges)
     if not pos then return false end
     local x, y = pos.x, pos.y
     local ax, ay = self._absX or 0, self._absY or 0
+    local cx = ax + self.W / 2
+    local cy = ay + self.H / 2
     for _, n in ipairs(self._shown) do
-        if n.x and n.y then
-            local nx, ny = ax + n.x, ay + n.y
+        if n.ringR then
+            local nx = cx + n.ringR * math.cos(n.ang or 0)
+            local ny = cy + n.ringR * math.sin(n.ang or 0)
             local dx, dy = x - nx, y - ny
             local rr = (n.r or 8) + 10
             if dx * dx + dy * dy <= rr * rr then
@@ -1284,7 +1311,11 @@ function Pair:showStarMapAt(ff, cidx, cmode, page)
         ff:_showMessage("星图打开失败，请稍后再试。", 4)
         return
     end
-    local okShow, errShow = pcall(function() UIManager:show(dialog) end)
+    local okShow, errShow = pcall(function()
+        UIManager:show(dialog)
+        -- 整屏刷新一次，清掉连续开/合星图可能留下的墨水屏残影（否则会“多出”节点）
+        UIManager:setDirty(dialog, "full")
+    end)
     if not okShow then
         logger.warn("show starmap error: " .. tostring(errShow))
         ff:_showMessage("星图打开失败，请稍后再试。", 4)
