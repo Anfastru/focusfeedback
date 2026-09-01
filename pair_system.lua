@@ -824,9 +824,9 @@ local function clipUTF8(s, maxBytes)
     return t .. "…"
 end
 
--- 星图坐标自检开关：置 true 时在 koreader 的 log 里打印实际盒子尺寸与每个节点的坐标，
--- 用来核对“节点画在哪里 / 线指向哪里 / 圆周画在哪”是否来自同一组数
-local SM_DEBUG = true
+-- 星图坐标自检开关：置 true 时打印盒尺寸与节点坐标并绘制校准十字。
+-- 现已关闭（十字已删除）；如需复检节点/线是否同位，临时置 true 即可。
+local SM_DEBUG = false
 
 local StarMap = WidgetContainer:extend{
     ff = nil,
@@ -1005,6 +1005,33 @@ function StarMap:_line(bb, x0, y0, x1, y1, color, w)
     end
 end
 
+-- 节点/中心节点/持久外圈统一改用与校准十字同款的 paintRect 逐行绘制：
+-- 圆心=(cx,cy) 像素级精确（不依赖 paintCircle 的圆心语义），保证"画在哪"与十字、连线完全一致
+function StarMap:_fillDot(bb, cx, cy, r, color)
+    local rr = math.max(0, math.floor(r or 0))
+    for dy = -rr, rr do
+        local hw = math.floor(math.sqrt(math.max(0, rr * rr - dy * dy)))
+        if hw >= 0 then
+            bb:paintRect(cx - hw, cy + dy, hw * 2 + 1, 1, color)
+        end
+    end
+end
+
+-- 空心圆环（宽度 w），同样以 (cx,cy) 为圆心
+function StarMap:_ring(bb, cx, cy, r, w, color)
+    r = math.max(0, math.floor(r or 0))
+    w = math.max(1, math.floor(w or 1))
+    local ri = math.max(0, r - w)
+    for dy = -r, r do
+        local hwo = math.floor(math.sqrt(math.max(0, r * r - dy * dy)))
+        local hwi = ri > 0 and math.floor(math.sqrt(math.max(0, ri * ri - dy * dy))) or 0
+        if hwo > hwi then
+            bb:paintRect(cx - hwo, cy + dy, hwo - hwi, 1, color)
+            bb:paintRect(cx + hwi, cy + dy, hwo - hwi, 1, color)
+        end
+    end
+end
+
 -- 虚线：沿直线方向按 dash/gap 交替绘制（负关系用）
 function StarMap:_dashLine(bb, x0, y0, x1, y1, color, w, dash, gap)
     local dx, dy = x1 - x0, y1 - y0
@@ -1118,9 +1145,9 @@ function StarMap:_render(bb, px, py)
             logger.info("SM node: " .. tostring(n.name) .. " paintedAt=(" .. tostring(ax) .. "," .. tostring(ay)
                 .. ") lv=" .. tostring(n.lv or 0) .. " ringR=" .. tostring(n.ringR or 0) .. " ang=" .. tostring(math.floor((n.ang or 0) * 180 / math.pi)))
         end
-        bb:paintCircle(ax, ay, n.r, _BLACK, n.r)  -- 实心填充
+        self:_fillDot(bb, ax, ay, n.r, _BLACK)  -- 实心填充（paintRect 逐行，圆心像素级精确）
         if n.rel then
-            bb:paintCircle(ax, ay, n.r + 3, _BLACK, 1)  -- 持久关系外圈
+            self:_ring(bb, ax, ay, n.r + 3, 1, _BLACK)  -- 持久关系外圈
         end
         if n.label then
             local sz = n.label:getSize()
@@ -1143,25 +1170,14 @@ function StarMap:_render(bb, px, py)
             n.label:paintTo(bb, lx - sz.w / 2, ly - sz.h / 2)
         end
     end
-    -- 中心节点（中心模式）
+    -- 中心节点（中心模式，用与十字同款的精确填充）
     if self._centerNode then
         local cn = self._centerNode
         local ax, ay = cx, cy
-        bb:paintCircle(ax, ay, cn.r, _BLACK, cn.r)  -- 实心填充
+        self:_fillDot(bb, ax, ay, cn.r, _BLACK)  -- 实心填充
         if cn.label then
             local sz = cn.label:getSize()
             cn.label:paintTo(bb, ax - sz.w / 2, ay + cn.r + 4)
-        end
-    end
-    -- 3.5 校准标记（仅调试用，SM_DEBUG=true 时显示）：
-    -- 环心画大十字、每个节点圆心画小十字；若十字与实心点/线端不重合，即为锚点或朝向问题，否则纯属屏幕显示帧的问题
-    if SM_DEBUG then
-        bb:paintRect(cx - 24, cy - 1, 49, 3, _BLACK)
-        bb:paintRect(cx - 1, cy - 24, 3, 49, _BLACK)
-        for _, n in ipairs(self._shown) do
-            local ax, ay = nodeAbs(n)
-            bb:paintRect(ax - 8, ay - 1, 16, 3, _BLACK)
-            bb:paintRect(ax - 1, ay - 8, 3, 16, _BLACK)
         end
     end
     -- 图例（星图区域底部，含页码）
