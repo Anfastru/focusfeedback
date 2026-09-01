@@ -58,8 +58,7 @@ local Dispatcher = require("dispatcher")
 -- 双书关系系统（V25）
 local PairSys = require("pair_system")
 
--- 专注计时（V26 番茄钟）
-local FocusTimer = require("focus_timer")
+-- 专注计时（V26 番茄钟）：延迟加载，见 _showFocusTimer，避免顶层 require 失败拖垮整个插件
 
 -- ========== 主插件类 ==========
 
@@ -7175,9 +7174,14 @@ function FocusFeedback:_showStats()
 end
 
 function FocusFeedback:_showFocusTimer(menu)
-    -- 全屏专注计时（番茄钟）
+    -- 全屏专注计时（番茄钟）：延迟加载，即使模块缺失/报错也不拖垮整个插件
+    local ok, mod = pcall(require, "focus_timer")
+    if not ok then
+        self:_showMessage("番茄钟模块加载失败：\n请确认插件目录包含 focus_timer.lua", 5)
+        return
+    end
     pcall(function()
-        FocusTimer.open(self)
+        mod.open(self)
     end)
 end
 
