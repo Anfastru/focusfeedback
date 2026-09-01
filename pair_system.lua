@@ -35,7 +35,8 @@ local function settingKey(name)
     return SETTINGS_PREFIX .. name
 end
 
-local TH = { 0, 3.5, 4, 5, 6.5, 8 }        -- TH[k] = 相邻到 |等级|=k 所需点数
+local TH = { 0, 5, 7, 10, 15, 22 }        -- TH[k] = 相邻到 |等级|=k 所需点数（V26 抬到约2倍）
+local TH_NEG = { 0, 3.5, 4, 5, 6.5, 8 }    -- 负向保留旧短门槛：宿敌仍够得着（否则-5两边也各需59点,永远到不了）
 local CAP = 5
 local DAY_SEC = 86400
 local HOUR_SEC = 3600
@@ -53,6 +54,17 @@ local PNAMES = { lover = "恋人", qpr = "QPR", crush = "追随者", rival = "�
 
 local Pair = {}
 Pair.config = { STABLE_DAY_FREE = STABLE_DAY_FREE, STABLE_DAY_HELD = STABLE_DAY_HELD, SOULMATE_DAY = SOULMATE_DAY }
+
+-- 旧情复燃专属等级名（前恋人/前QPR 从 +2 重新累积时的档位名）
+local EX_LEVEL_NAMES = { [3] = "有点想旧情复燃", [4] = "好想你", [5] = "准备旧情复燃" }
+-- 取关系档位名：处于"前恋人/前QPR"状态的节点，其 +2 显示前恋人/前QPR，+3~+5 用复燃专属名
+function Pair:_levelName(node, lv)
+    if node and node.ex_type and lv >= 2 then
+        if lv == 2 then return (node.ex_type == "qpr") and "前QPR" or "前恋人" end
+        if EX_LEVEL_NAMES[lv] then return EX_LEVEL_NAMES[lv] end
+    end
+    return LEVEL_NAMES[lv] or tostring(lv)
+end
 
 -- ============ 事件数据 ============
 -- chapters：{ text, attr=标签, AB, BA }。AB=A对B增减 / BA=B对A增减。
@@ -236,6 +248,25 @@ local EVENTS_LOVER = {
   { id = "l10", name = "怪叫", chapters = { { text = "A和B在大声怪叫。", AB = 1, BA = 1 } } },
 }
 
+-- 双向负事件：双方同时掉点数（AB、BA 均为负）。
+-- 设计：事件本身能出现在主动出门与随机旅行日志里；但为避免"人人反目"，
+-- 这类互负章节只在"该对已偏负或性格冲突"时会高频注入，中性/相合的对很少抽到。
+-- 供 _pickChapter 在 bias<0 时按概率并入候选做方向加权。
+local NEG_EVENTS = {
+  { id = "n1", name = "旅游吵架", chapters = { { text = "A邀请B去旅游，结果因为规划问题大吵一架。", AB = -2, BA = -2 } } },
+  { id = "n2", name = "穿搭嘲讽", chapters = { { text = "A走在路上碰见了B，觉得B的穿搭好难看，忍不住出言嘲讽，没想到B也是这么想的……两本书当街吵了一架。", AB = -2, BA = -2 } } },
+  { id = "n3", name = "奶茶账", chapters = { { text = "A和B一起点了两杯奶茶，B居然让A原价AA给它。A并不接受，它们吵架了。", AB = -2, BA = -2 } } },
+  { id = "n4", name = "踩脚", chapters = { { text = "A和B一起乘公交车，B踩到了A的脚并拒不道歉。", AB = -1, BA = -1 } } },
+  { id = "n5", name = "猎杀计划", chapters = { { text = "A满怀怨恨地制定了一个猎杀B的计划，但心中一个念头令它战惊：纵然出于爱意，它也无法做得比这更好。", AB = -3, BA = -3 } } },
+  { id = "n6", name = "嘲笑", chapters = { { text = "A在朋友圈发" .. "淡" .. "人忧郁文案，B截图转发和朋友嘲笑了它十分钟。", AB = -2, BA = -2 } } },
+  { id = "n7", name = "共感娃娃", chapters = { { text = "A捡到了B的共感娃娃，然后把娃娃的脊椎捏碎了。", AB = -2, BA = -2 } } },
+  { id = "n8", name = "打击乐", chapters = { { text = "A睡着了，B开始了今日份打击乐练习。", AB = -1, BA = -1 } } },
+  { id = "n9", name = "碎纸屑", chapters = { { text = "A打算吃饭，B开始了今日份碎纸屑清理练习。", AB = -1, BA = -1 } } },
+  { id = "n10", name = "呛水", chapters = { { text = "A喝水的时候，B突然把水杯抬起来试图呛死A。", AB = -2, BA = -2 } } },
+  { id = "n11", name = "插座洒水", chapters = { { text = "A使用电器的时候，B在插座上偷偷洒水。", AB = -2, BA = -2 } } },
+  { id = "n12", name = "合照", chapters = { { text = "A的房子着火了，B开心地在远处给自己和火拍了一张合照。", AB = -3, BA = -3 } } },
+}
+
 -- 单恋(追随者)限定 —— 只有主体书是单恋方时触发
 local CRUSH_EVENT = {
   id = "wish_willow", name = "许愿柳",
@@ -262,7 +293,7 @@ function Pair:_getRel(ff, i, j)
     local key = self:_relKey(i, j)
     local node = r[key]
     if not node then
-        node = { ab = 0, ba = 0, abp = 0, bap = 0, s0 = 0, s1 = 0, s2 = 0, rel = nil, rel_side = nil, pair_ts = nil }
+        node = { ab = 0, ba = 0, abp = 0, bap = 0, s0 = 0, s1 = 0, s2 = 0, rel = nil, rel_side = nil, pair_ts = nil, ex_type = nil, ex_s0 = 0 }
         r[key] = node
         self:_saveRelations(r)
     end
@@ -298,7 +329,10 @@ function Pair:_moveAxis(lv, pt, delta)
         local tar = lv + ds
         if math.abs(tar) > CAP then break end
         local ta, tb = math.abs(lv), math.abs(tar)
-        local thr = TH[math.max(ta, tb)] or 8
+        -- 正负阈值分开：正向用 V26 慢门槛(关系发展克制)，负向用旧短门槛(宿敌可达)→ 只允许一边往 5 走
+        local thr
+        if ds > 0 then thr = TH[math.max(ta, tb)] or 22
+        else thr = TH_NEG[math.max(ta, tb)] or 8 end
         local remaining = thr - math.abs(pt)
         if remaining < 0 then remaining = 0 end
         if math.abs(delta) <= remaining then
@@ -347,6 +381,10 @@ function Pair:_modDelta(attrs, tag, d)
         return d
     end
     if d > 0 then
+        -- 对称：高辩证同样容易"转正为负"（杠精书把好好的事往坏处想）
+        local pn = 0.02 + bz / 100 * 0.05
+        if pn > 0.08 then pn = 0.08 end
+        if math.random() < pn then return -d end
         if emo >= 60 then d = d + 0.5
         elseif emo >= 40 then d = d + 0.2 end
     end
@@ -418,6 +456,25 @@ function Pair:_checkStable(ff, ia, ib)
     local held = self:_bookHasPersistent(ff, ia) or self:_bookHasPersistent(ff, ib)
     local stable_day = (held and STABLE_DAY_HELD or STABLE_DAY_FREE) * DAY_SEC
 
+    -- 旧情复燃：前恋人/前QPR(rel 已清、仅 ex_type 标记)从 +2 重新积累
+    if node.ex_type then
+        local both5 = (ab == 5 and ba == 5)
+        if ab < 2 or ba < 2 then            -- 跌出复燃带(含负向) → 旧情作废，退回普通关系
+            node.ex_type = nil; node.ex_s0 = 0
+        elseif both5 then
+            if node.ex_s0 == 0 then node.ex_s0 = now end
+            if now - node.ex_s0 >= stable_day then
+                self:_rekindle(ff, ia, ib, node)
+                self:_saveRelations(self:_readRelations())
+                return
+            end
+        else
+            node.ex_s0 = 0
+        end
+        self:_saveRelations(self:_readRelations())
+        return
+    end
+
     if ab == 5 and ba == 5 then
         if node.s0 == 0 then node.s0 = now end
         if now - node.s0 >= stable_day then
@@ -476,6 +533,53 @@ function Pair:_breakPersistent(ff, ia, ib)
     G_reader_settings:saveSetting(settingKey(SETTING_PERS), p)
 end
 
+-- 撬墙脚：当 ia 与 ib 确立新恋人/QPR 时，把 ia、ib 各自与其他书(非对方)仍存留的旧恋人/QPR
+-- 转为"前恋人/前QPR"(ex_type)、关系点数重置双向 +2、解除旧占有。文本为"关系被打断，羁绊未了"。
+function Pair:_poachBreakOld(ff, ia, ib)
+    local r = self:_readRelations() or {}
+    local p = G_reader_settings:readSetting(settingKey(SETTING_PERS), {}) or {}
+    local changed, pchanged = false, false
+    for key, node in pairs(r) do
+        local i, j = self:_parseKey(key)
+        local endpoint, oldPartner
+        if i == ia or i == ib then endpoint, oldPartner = i, j
+        elseif j == ia or j == ib then endpoint, oldPartner = j, i
+        else endpoint = nil end
+        if endpoint and oldPartner ~= ia and oldPartner ~= ib
+            and node and (node.rel == "lover" or node.rel == "qpr") then
+            local oldtype = node.rel
+            node.rel = nil; node.rel_side = nil; node.pair_ts = nil
+            node.ex_type = oldtype; node.ex_s0 = 0
+            node.ab, node.ba = 2, 2
+            node.abp, node.bap = 0, 0
+            p[tostring(oldPartner)] = nil
+            changed = true; pchanged = true
+            local aN = self:_nameIdx(ff, endpoint)
+            local bN = self:_nameIdx(ff, oldPartner)
+            self:_logPair(ff, endpoint, oldPartner,
+                string.format("%s与%s的%s关系被一场新缘分打断，但羁绊未了——如今只以'%s'相称。",
+                    aN, bN, (oldtype == "lover" and "恋人" or "QPR"),
+                    (oldtype == "lover" and "前恋人" or "前QPR")))
+        end
+    end
+    if changed then self:_saveRelations(r) end
+    if pchanged then G_reader_settings:saveSetting(settingKey(SETTING_PERS), p) end
+end
+
+-- 旧情复燃：前恋人/前QPR 双向保持 +5 达到稳定期后，随机重生成 恋人 或 QPR(类型重新随机)
+function Pair:_rekindle(ff, ia, ib, node)
+    local typ = (math.random() < 0.5) and "lover" or "qpr"
+    node.rel = typ; node.pair_ts = os.time()
+    node.ex_type = nil; node.ex_s0 = 0
+    self:_setPersistent(ff, ia, ib, typ, ia)
+    local aN = self:_nameIdx(ff, ia)
+    local bN = self:_nameIdx(ff, ib)
+    local copyname = (typ == "lover") and "恋人" or "QPR对象"
+    self:_logPair(ff, ia, ib,
+        string.format("美好的往昔还历历在目，分开后的日子里，%s和%s无时无刻不在思念彼此。终于，它们旧情复燃，成为了%s。", aN, bN, copyname))
+    self:_msg(ff, string.format("（%s）%s 与 %s 旧情复燃，成为了%s。", os.date("%m-%d %H:%M"), aN, bN, copyname))
+end
+
 function Pair:_differentiate(ff, ia, ib, kind, node, dir)
     local aN = self:_nameIdx(ff, ia)
     local bN = self:_nameIdx(ff, ib)
@@ -484,6 +588,7 @@ function Pair:_differentiate(ff, ia, ib, kind, node, dir)
         if node.rel ~= "soulmate" then
             local typ = (math.random() < 0.5) and "lover" or "qpr"
             node.rel = typ; node.pair_ts = os.time()
+            self:_poachBreakOld(ff, ia, ib)
             self:_setPersistent(ff, ia, ib, typ, ia)
             local copy
             if typ == "lover" then
@@ -668,6 +773,77 @@ function Pair:_charge(ff, n, why)
 end
 
 -- ============ 双人事件引擎 ============
+-- ============ 关系方向与选章（负向关系系统） ============
+-- 三条零和对轴（与 main.lua 的 ATTR_OPP 一致）：正端-反端 构成"性格向量"
+local TRAIT_AXES = { { "审美", "知识" }, { "情感", "逻辑" }, { "阅历", "辩证" } }
+-- 双向负事件注入概率 / 方向加权强度（已用模拟校准：宿敌稀有但可及，不会烂大街）
+local NEG_INJ_P = 0.30
+local NEG_ALPHA = 1.6
+
+-- 性格向量第 k 轴：(正端 - 反端)
+function Pair:_traitAxis(attrs, k)
+    local hi, lo = TRAIT_AXES[k][1], TRAIT_AXES[k][2]
+    return ((attrs and attrs[hi]) or 0) - ((attrs and attrs[lo]) or 0)
+end
+
+-- 两本书性格相合/冲突：三轴点积归一 -> [-1,1]（>0 相合，<0 冲突）
+function Pair:_compat(ff, aEntry, bEntry)
+    local aA = self:_attrsOf(ff, aEntry)
+    local bA = self:_attrsOf(ff, bEntry)
+    local dp = 0
+    for k = 1, 3 do dp = dp + self:_traitAxis(aA, k) * self:_traitAxis(bA, k) end
+    local c = dp / 30000
+    if c > 1 then c = 1 elseif c < -1 then c = -1 end
+    return c
+end
+
+-- 方向偏置 = 负向惯性(净关系方向) + 性格相合/冲突，归一到 [-1,1]
+function Pair:_pairBias(ff, ia, ib)
+    local node = self:_getRel(ff, ia, ib)
+    local net = (node.ab or 0) + (node.ba or 0)
+    local b = 0
+    if net > 0 then b = b + 0.45 elseif net < 0 then b = b - 0.45 end
+    -- 性格相合越强越容易发展正向（compat 系数 0.45，经模拟校准：相合对结成恋人约为冲突对的 2 倍）
+    b = b + 0.45 * self:_compat(ff, self:_entryOf(ff, ia), self:_entryOf(ff, ib))
+    if b > 1 then b = 1 elseif b < -1 then b = -1 end
+    return b
+end
+
+-- 方向加权选章（主动出门与随机旅行日志共用）：
+-- 候选 = 通用池(+持久关系池)；该对 偏负/性格冲突(bias<0) 时按概率并入双向负事件池。
+-- 权重 = exp(bias * sign(AB+BA) * NEG_ALPHA)，使关系沿当前方向滚。
+function Pair:_pickChapter(ff, ia, ib)
+    local bias = self:_pairBias(ff, ia, ib)
+    local pool = self:_buildPool(ff, ia, ib)
+    local cand = {}
+    local function add(evs)
+        for _, ev in ipairs(evs) do
+            for _, ch in ipairs(ev.chapters) do
+                cand[#cand + 1] = { ev = ev, ch = ch }
+            end
+        end
+    end
+    add(pool)
+    if bias < 0 and math.random() < NEG_INJ_P then add(NEG_EVENTS) end
+    local tot = 0
+    local ws = {}
+    for i, it in ipairs(cand) do
+        local s = (it.ch.AB or 0) + (it.ch.BA or 0)
+        local w
+        if s > 0 then w = math.exp(bias * NEG_ALPHA)
+        elseif s < 0 then w = math.exp(-bias * NEG_ALPHA)
+        else w = 0.35 end
+        ws[i] = w; tot = tot + w
+    end
+    local x = math.random() * tot
+    for i, it in ipairs(cand) do
+        x = x - ws[i]
+        if x <= 0 then return it.ev, it.ch end
+    end
+    local last = cand[#cand]
+    return last.ev, last.ch
+end
+
 function Pair:_buildPool(ff, ia, ib)
     local node, key = self:_getRel(ff, ia, ib)
     local pool = {}
@@ -701,15 +877,20 @@ function Pair:_runPair(ff, aEntry, bEntry)
             return
         end
     end
-    local pool = self:_buildPool(ff, ia, ib)
-    local evt = pool[math.random(1, #pool)]
-    local ch = evt.chapters[math.random(1, #evt.chapters)]
+    local evt, ch = self:_pickChapter(ff, ia, ib)
     if logger then logger.warn("Pair:_runPair EVT", evt.id, ch.text) end
     local aN = self:_name(ff, aEntry)
     local bN = self:_name(ff, bEntry)
     local text = self:_composeText(evt, ch, aN, bN)
     -- 施加 delta（关系为暗线，不显示、不写提示；等级持久化的分化由 _checkStable 单独处理）
-    local node2, ab_changed, ba_changed = self:_applyDelta(ff, ia, ib, ch.AB, ch.BA, ch.attr)
+    -- 同一对·同一自然日出门衰减：第1次全额、第2次×2/3、第3次起×1/2（只作用于出门获得的关系点数，不碰积分成本）
+    local dAB, dBA = ch.AB or 0, ch.BA or 0
+    local goday = math.floor(os.time() / DAY_SEC)
+    if (node.goday or 0) ~= goday then node.goday = goday; node.gocnt = 0 end
+    node.gocnt = (node.gocnt or 0) + 1
+    local factor = (node.gocnt == 2) and (2 / 3) or ((node.gocnt >= 3) and 0.5 or 1)
+    if factor ~= 1 then dAB = dAB * factor; dBA = dBA * factor end
+    local node2, ab_changed, ba_changed = self:_applyDelta(ff, ia, ib, dAB, dBA, ch.attr)
     -- 写双方旅行日志：只记事件本身（含提示语），不刷关系（关系为暗线）
     self:_logPair(ff, ia, ib, text)
     -- 结果弹窗：标题用通用"双人事件"，正文=提示语+正文字段；不显示关系等级与点数
@@ -870,7 +1051,7 @@ function StarMap:_buildLayout()
         for _, e in ipairs(collection) do
             if e.index ~= center then
                 local node = pair:_getRel(ff, center, e.index)
-                nodes[#nodes + 1] = { idx = e.index, name = pair:_name(ff, e), lv = node.ab or 0, rel = node.rel }
+                nodes[#nodes + 1] = { idx = e.index, name = pair:_name(ff, e), lv = node.ab or 0, rel = node.rel, ex_type = node.ex_type }
             end
         end
         table.sort(nodes, function(a, b)
@@ -1347,7 +1528,7 @@ function Pair:_showStarMapBookMenu(ff, sm, dialog)
     for _, n in ipairs(shown) do
         local line = n.name
         if cmode == "center" then
-            line = string.format("%s（%s）", n.name, LEVEL_NAMES[n.lv or 0] or tostring(n.lv or 0))
+            line = string.format("%s（%s）", n.name, self:_levelName(n, n.lv or 0))
             if n.rel then line = line .. " [" .. (PNAMES[n.rel] or n.rel) .. "]" end
         end
         items[#items + 1] = {
@@ -1394,8 +1575,8 @@ function Pair:_showBookRelDetail(ff, ia, ib)
     local lvAB = node.ab or 0
     local lvBA = node.ba or 0
     local body = string.format("%s → %s：%s\n%s → %s：%s",
-        aN, bN, LEVEL_NAMES[lvAB] or tostring(lvAB),
-        bN, aN, LEVEL_NAMES[lvBA] or tostring(lvBA))
+        aN, bN, self:_levelName(node, lvAB),
+        bN, aN, self:_levelName(node, lvBA))
     if node.rel then
         body = body .. string.format("\n\n已形成关系：[%s]（%s）",
             PNAMES[node.rel] or node.rel, node.rel_side == "BA" and ("%s 更主动"):format(bN) or ("%s 更主动"):format(aN))
@@ -1436,9 +1617,7 @@ function Pair:maybeTravelPair(ff, entry)
     if math.random() < p then
         -- 后台偶发：静默结算（写双方旅行日志、推进关系点数），不弹窗打扰
         local ia, ib = entry.index, best.index
-        local pool = self:_buildPool(ff, ia, ib)
-        local evt = pool[math.random(1, #pool)]
-        local ch = evt.chapters[math.random(1, #evt.chapters)]
+        local evt, ch = self:_pickChapter(ff, ia, ib)
         local aN = self:_nameIdx(ff, ia)
         local bN = self:_nameIdx(ff, ib)
         local text = self:_composeText(evt, ch, aN, bN)
